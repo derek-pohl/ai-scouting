@@ -895,6 +895,7 @@ class BallTracker:
         self.ferry_tracker = ferry_tracker  # Reference to ferry tracker
         self.frame_width = frame_width  # Stored for edge-robot detection
         self.frame_height = frame_height  # Stored for edge-robot detection
+        self.possession_memory_frames = max(2, int(round(self.fps * 0.30)))
         
         # Track balls: {ball_id: {'pos': (x, y, r), 'prev_pos': (x, y, r), 'shot_by': robot_label, ...}}
         self.tracked_balls = {}
@@ -1148,6 +1149,24 @@ class BallTracker:
                 best_label = label
         
         return best_label
+
+    def _get_shot_origin_robot(self, overlapping_robot: str, last_overlap_robot: str,
+                               last_overlap_frame: int, last_near_robot: str) -> str:
+        """
+        Choose which robot should own a newly detected shot.
+
+        We prefer a recent true overlap/possession signal over nearest-robot fallback
+        so airborne balls don't get reassigned to a robot behind the shooter.
+        """
+        if overlapping_robot:
+            return overlapping_robot
+
+        if last_overlap_robot and last_overlap_frame is not None:
+            frames_since_overlap = self.current_frame - last_overlap_frame
+            if frames_since_overlap <= self.possession_memory_frames:
+                return last_overlap_robot
+
+        return last_near_robot
     
     def get_predicted_positions(self) -> list:
         """
@@ -1423,6 +1442,8 @@ class BallTracker:
                 candidate_shot = old_data.get('candidate_shot')
                 overlapping_robot = old_data.get('overlapping_robot')
                 last_near_robot = old_data.get('last_near_robot')
+                last_overlap_robot = old_data.get('last_overlap_robot')
+                last_overlap_frame = old_data.get('last_overlap_frame')
                 was_ever_in_goal = old_data.get('last_seen_in_goal', False)
                 
             elif ball_id is None:
@@ -1439,6 +1460,8 @@ class BallTracker:
                     'shot_evaluated': False,
                     'overlapping_robot': cur_overlap,
                     'last_near_robot': cur_overlap or cur_nearest,
+                    'last_overlap_robot': cur_overlap,
+                    'last_overlap_frame': self.current_frame if cur_overlap else None,
                     'candidate_shot': None,
                     'last_seen_in_goal': False
                 }
@@ -1455,6 +1478,8 @@ class BallTracker:
                 candidate_shot = old_data.get('candidate_shot')
                 overlapping_robot = old_data.get('overlapping_robot')
                 last_near_robot = old_data.get('last_near_robot')
+                last_overlap_robot = old_data.get('last_overlap_robot')
+                last_overlap_frame = old_data.get('last_overlap_frame')
                 was_ever_in_goal = old_data.get('last_seen_in_goal', False)
             
             # Check for shot initiation (upward movement >= min_upward_pixels)
@@ -1463,9 +1488,14 @@ class BallTracker:
 
             
             # If not currently a shot/candidate, check if we should start tracking a shot
-            # Use overlapping robot first, fall back to last_near_robot for reliability
+            # Prefer recent true possession/overlap over nearest-robot fallback.
             if not shot_by and not candidate_shot:
-                nearby_robot = overlapping_robot or last_near_robot
+                nearby_robot = self._get_shot_origin_robot(
+                    overlapping_robot,
+                    last_overlap_robot,
+                    last_overlap_frame,
+                    last_near_robot
+                )
                 if y_change >= self.min_upward_pixels and nearby_robot:
                     # Start candidate tracking
                     candidate_shot = {
@@ -1539,6 +1569,8 @@ class BallTracker:
             
             cur_overlap = self._ball_overlaps_robot(x, y, r)
             cur_nearest = self._find_nearest_alliance_robot(x, y)
+            updated_last_overlap_robot = cur_overlap or last_overlap_robot
+            updated_last_overlap_frame = self.current_frame if cur_overlap else last_overlap_frame
             # Update last_near_robot: prefer overlap, then nearest, then keep previous
             updated_near = cur_overlap or cur_nearest or last_near_robot
             
@@ -1550,6 +1582,8 @@ class BallTracker:
                 'shot_evaluated': shot_evaluated,
                 'overlapping_robot': cur_overlap,
                 'last_near_robot': updated_near,
+                'last_overlap_robot': updated_last_overlap_robot,
+                'last_overlap_frame': updated_last_overlap_frame,
                 'candidate_shot': candidate_shot,
                 'last_seen_in_goal': ever_in_goal
             }
