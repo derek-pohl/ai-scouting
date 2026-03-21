@@ -138,7 +138,7 @@ class RobotLabelTracker:
                     # Low confidence or still unknown - need LLM
                     tracked_labels.append(label)
                     needs_llm.append(True)
-            else:
+            if False:
                 # New robot - no match found, need LLM
                 tracked_labels.append(None)
                 needs_llm.append(True)
@@ -199,7 +199,7 @@ class RobotLabelTracker:
                     'confidence': confidence
                 }
                 final_labels.append(final_label)
-            else:
+            if False:
                 # New robot
                 robot_id = self.next_id
                 self.next_id += 1
@@ -2091,6 +2091,76 @@ class CenterCameraCalibrator:
 # --- Calibration UI Helper Functions ---
 
 CALIBRATION_POINT_LABELS = list(CenterCameraCalibrator.REFERENCE_POINTS.keys())
+NO_SCAN_POINT_LABELS = ["BZ1", "BZ2", "BZ3", "BZ4", "RZ1", "RZ2", "RZ3", "RZ4"]
+ALL_CALIBRATION_POINT_LABELS = CALIBRATION_POINT_LABELS + NO_SCAN_POINT_LABELS
+CALIBRATION_REQUIRED_POINTS = len(CALIBRATION_POINT_LABELS)
+CALIBRATION_TOTAL_POINTS = len(ALL_CALIBRATION_POINT_LABELS)
+
+
+def _get_calibration_status_text(num_points: int) -> str:
+    """Return the next-step instruction for calibration / no-scan clicks."""
+    if num_points <= 0:
+        return "**Click point B1** (1 of 8)"
+
+    if num_points < CALIBRATION_REQUIRED_POINTS:
+        next_label = CALIBRATION_POINT_LABELS[num_points]
+        return f"**Click point {next_label}** ({num_points + 1} of 8)"
+
+    if num_points == CALIBRATION_REQUIRED_POINTS:
+        return (
+            "**Calibration points set!** Optional: click **BZ1** to start the blue no-scan box "
+            "(9 of 16), or click 'Process Video' now."
+        )
+
+    if num_points < CALIBRATION_TOTAL_POINTS:
+        next_label = ALL_CALIBRATION_POINT_LABELS[num_points]
+        return f"**Click point {next_label}** ({num_points + 1} of 16)"
+
+    return "**Calibration + no-scan boxes set!** Click 'Process Video' to start."
+
+
+def _split_calibration_and_exclusion_points(clicked_points: list) -> tuple:
+    """Split UI clicks into homography points and optional robot no-scan polygons."""
+    points = list(clicked_points or [])
+    calibration_points = points[:CALIBRATION_REQUIRED_POINTS]
+    extra_points = points[CALIBRATION_REQUIRED_POINTS:CALIBRATION_TOTAL_POINTS]
+
+    polygons = []
+    for idx in range(0, len(extra_points), 4):
+        polygon = extra_points[idx:idx + 4]
+        if len(polygon) == 4:
+            polygons.append(polygon)
+
+    return calibration_points, polygons
+
+
+def _scale_polygon_points(points: list, src_size: tuple, dst_size: tuple) -> list:
+    """Scale polygon points from UI image coordinates to frame coordinates."""
+    if not points or not src_size or not dst_size:
+        return []
+
+    src_w, src_h = src_size
+    dst_w, dst_h = dst_size
+    if src_w <= 0 or src_h <= 0 or dst_w <= 0 or dst_h <= 0:
+        return []
+
+    scaled = []
+    for px, py in points:
+        sx = int(round((px / src_w) * dst_w))
+        sy = int(round((py / src_h) * dst_h))
+        scaled.append((sx, sy))
+    return scaled
+
+
+def _extract_robot_exclusion_polygons(clicked_points: list, image_size: tuple,
+                                      frame_width: int, frame_height: int) -> list:
+    """Return completed no-scan polygons scaled to the actual video frame."""
+    _, polygons = _split_calibration_and_exclusion_points(clicked_points)
+    return [
+        _scale_polygon_points(poly, image_size, (frame_width, frame_height))
+        for poly in polygons
+        if len(poly) == 4
+    ]
 
 
 def _redraw_calibration_image(base_image: Image.Image, clicked_points: list) -> Image.Image:
@@ -2105,8 +2175,13 @@ def _redraw_calibration_image(base_image: Image.Image, clicked_points: list) -> 
     except:
         font = ImageFont.load_default()
     
+    _, exclusion_polygons = _split_calibration_and_exclusion_points(clicked_points)
+
+    for polygon in exclusion_polygons:
+        draw.line(polygon + [polygon[0]], fill=(255, 220, 0), width=3)
+
     for i, (px, py) in enumerate(clicked_points):
-        label = CALIBRATION_POINT_LABELS[i] if i < len(CALIBRATION_POINT_LABELS) else f"P{i}"
+        label = ALL_CALIBRATION_POINT_LABELS[i] if i < len(ALL_CALIBRATION_POINT_LABELS) else f"P{i}"
         color = (0, 200, 255) if label.startswith('B') else (255, 100, 100)
         radius = 8
         draw.ellipse([px - radius, py - radius, px + radius, py + radius], fill=color, outline=(255, 255, 255), width=2)
@@ -3160,8 +3235,8 @@ _BUMPER_WHITE_LOWER = np.array([0, 0, 160])
 _BUMPER_WHITE_UPPER = np.array([180, 60, 255])
 
 # Minimum contour area / color pixels for bumper detection (reject small noise)
-_BUMPER_MIN_AREA = 120
-_BUMPER_MIN_COLOR_PIXELS = 90
+_BUMPER_MIN_AREA = 90
+_BUMPER_MIN_COLOR_PIXELS = 65
 _BUMPER_MERGE_GAP_X = 90
 _BUMPER_MERGE_GAP_Y = 45
 
@@ -3530,8 +3605,24 @@ def detect_people_yolo(frame_bgr: np.ndarray, confidence: float = 0.35) -> tuple
     return person_mask, person_count
 
 
+def _build_robot_exclusion_mask(polygons: list, frame_width: int, frame_height: int) -> np.ndarray:
+    """Build a binary allow-mask where user no-scan polygons are zeroed out."""
+    mask = np.ones((frame_height, frame_width), dtype=np.uint8) * 255
+    if not polygons:
+        return mask
+
+    for polygon in polygons:
+        if len(polygon) < 3:
+            continue
+        pts = np.array(polygon, dtype=np.int32)
+        cv2.fillPoly(mask, [pts], 0)
+
+    return mask
+
+
 def detect_robots_by_bumper_color(frame_bgr: np.ndarray, person_mask: np.ndarray = None,
-                                  field_pixel_mask: np.ndarray = None) -> tuple:
+                                  field_pixel_mask: np.ndarray = None,
+                                  robot_exclusion_polygons: list = None) -> tuple:
     """
     Detect robots by finding red and blue bumper regions using HSV color matching.
     
@@ -3543,6 +3634,7 @@ def detect_robots_by_bumper_color(frame_bgr: np.ndarray, person_mask: np.ndarray
         frame_bgr: OpenCV BGR image (center camera frame)
         person_mask: Optional binary mask of detected people (255 = person, 0 = not)
         field_pixel_mask: Optional per-pixel exclusion mask from compute_field_pixel_mask().
+        robot_exclusion_polygons: Optional list of user-drawn no-scan polygons in frame coordinates.
         
     Returns:
         Tuple of (bounding_boxes_json, red_mask, blue_mask):
@@ -3559,6 +3651,7 @@ def detect_robots_by_bumper_color(frame_bgr: np.ndarray, person_mask: np.ndarray
     roi_x2 = max(0, min(roi_x2, w_full))
     roi_y2 = max(0, min(roi_y2, h_full))
     field_region = frame_bgr[roi_y1:roi_y2, roi_x1:roi_x2]
+    robot_exclusion_mask_full = _build_robot_exclusion_mask(robot_exclusion_polygons, w_full, h_full)
     
     # Use dynamic field pixel mask if available
     fh, fw = field_region.shape[:2]
@@ -3569,6 +3662,9 @@ def detect_robots_by_bumper_color(frame_bgr: np.ndarray, person_mask: np.ndarray
         active_exc_mask = cv2.erode(active_exc_mask, _BUMPER_STRUCTURE_MARGIN_KERNEL, iterations=1)
     else:
         active_exc_mask = np.ones((fh, fw), dtype=np.uint8) * 255
+
+    exclusion_roi = robot_exclusion_mask_full[roi_y1:roi_y2, roi_x1:roi_x2][:fh, :fw]
+    active_exc_mask = cv2.bitwise_and(active_exc_mask, exclusion_roi)
     
     # HSV color ranges
     lower_red1 = np.array([0, 80, 80])
@@ -4018,6 +4114,7 @@ def process_single_video(video_path: str, camera_side: str = "blue", target_fps:
     
     # Center Camera Auto-Calibrator (uses user-clicked points for homography)
     center_calibrator = None
+    robot_exclusion_polygons = []
     if camera_side == "center":
         # Reset any previous calibration
         center_camera_to_map_coords.calibration_homography = None
@@ -4025,12 +4122,19 @@ def process_single_video(video_path: str, camera_side: str = "blue", target_fps:
         center_camera_to_map_coords.dynamic_homography = None
         center_calibrator = CenterCameraCalibrator(fps=ball_fps, gather_duration_sec=5.0, display_duration_sec=5.0)
         
-        if calibration_points and len(calibration_points) >= 4 and calibration_image_size:
+        if calibration_points and calibration_image_size:
+            robot_exclusion_polygons = _extract_robot_exclusion_polygons(
+                calibration_points, calibration_image_size, width, height
+            )
+
+        calibration_homography_points = (calibration_points or [])[:CALIBRATION_REQUIRED_POINTS]
+
+        if calibration_homography_points and len(calibration_homography_points) >= 4 and calibration_image_size:
             img_w, img_h = calibration_image_size
             if progress is not None:
                 progress(0, desc="Computing calibration homography from clicked points...")
             H, H_inv, found_points = CenterCameraCalibrator.compute_homography_from_points(
-                calibration_points, img_w, img_h
+                calibration_homography_points, img_w, img_h
             )
             if H is not None:
                 print(f"[Pre-Calibration] Click calibration success. Homography computed from {len(found_points)} points.")
@@ -4043,7 +4147,7 @@ def process_single_video(video_path: str, camera_side: str = "blue", target_fps:
             else:
                 print("[Pre-Calibration] Homography computation failed. Using default calibration.")
         else:
-            print(f"[Pre-Calibration] No calibration points provided ({len(calibration_points) if calibration_points else 0} points). Using default calibration.")
+            print(f"[Pre-Calibration] No calibration points provided ({len(calibration_homography_points) if calibration_homography_points else 0} points). Using default calibration.")
 
     # Store latest robot detection for use with ball frames
     current_bboxes_json = "[]"
@@ -4109,7 +4213,12 @@ def process_single_video(video_path: str, camera_side: str = "blue", target_fps:
                 bounding_boxes_json = "[]"
             else:
                 # Center camera: bumper color detection + LLM labeling
-                _, current_bumper_red_mask, current_bumper_blue_mask, raw_bboxes = detect_robots_by_bumper_color(frame, person_mask=current_person_mask, field_pixel_mask=field_pixel_mask)
+                _, current_bumper_red_mask, current_bumper_blue_mask, raw_bboxes = detect_robots_by_bumper_color(
+                    frame,
+                    person_mask=current_person_mask,
+                    field_pixel_mask=field_pixel_mask,
+                    robot_exclusion_polygons=robot_exclusion_polygons
+                )
                 
                 # Get frame dimensions for crop clamping
                 img_height, img_width = frame.shape[:2]
@@ -5184,6 +5293,10 @@ def create_demo():
                 
                 # --- Center Camera Calibration ---
                 gr.Markdown("### Center Camera Calibration")
+                gr.Markdown(
+                    "After the 8 field points, you can optionally click 2 rotated no-scan boxes: "
+                    "BZ1->BZ4 for the blue-side box, then RZ1->RZ4 for the red-side box."
+                )
                 gr.Markdown("Click the 8 field landmarks in order (B1→B4, R1→R4) on the frame below.")
                 
                 calibration_base_image = gr.State(None)  # Original clean frame
@@ -5372,7 +5485,7 @@ def create_demo():
             if frame is None:
                 return None, None, [], None, "Failed to extract frame from video"
             img_size = frame.size  # (width, height)
-            return frame, frame, [], img_size, "**Click point B1** (1 of 8)"
+            return frame, frame, [], img_size, _get_calibration_status_text(0)
         
         composite_video_input.change(
             fn=handle_video_upload,
@@ -5385,15 +5498,19 @@ def create_demo():
                 return None, clicked_points, "Upload a video first"
             x, y = evt.index
             n = len(clicked_points)
-            label = CALIBRATION_POINT_LABELS[n] if n < len(CALIBRATION_POINT_LABELS) else f"P{n}"
+            if n >= CALIBRATION_TOTAL_POINTS:
+                annotated = _redraw_calibration_image(base_image, clicked_points)
+                return annotated, clicked_points, _get_calibration_status_text(n)
+            label = ALL_CALIBRATION_POINT_LABELS[n] if n < len(ALL_CALIBRATION_POINT_LABELS) else f"P{n}"
             img_w, img_h = base_image.size
             print(f"[Calibration UI] Click #{n+1} ({label}): raw=({x}, {y}), base_image_size=({img_w}x{img_h})")
             clicked_points = list(clicked_points) + [(x, y)]
             n = len(clicked_points)
             annotated = _redraw_calibration_image(base_image, clicked_points)
-            if n >= 8:
+            status = _get_calibration_status_text(n)
+            if False and n >= 8:
                 status = "**All 8 points set!** ✅ Click 'Process Video' to start."
-            else:
+            if False:
                 next_label = CALIBRATION_POINT_LABELS[n]
                 status = f"**Click point {next_label}** ({n + 1} of 8)"
             return annotated, clicked_points, status
@@ -5413,6 +5530,7 @@ def create_demo():
                 annotated = base_image
             else:
                 annotated = _redraw_calibration_image(base_image, clicked_points)
+            return annotated, clicked_points, _get_calibration_status_text(n) + " — Undid last point"
             next_label = CALIBRATION_POINT_LABELS[n]
             return annotated, clicked_points, f"**Click point {next_label}** ({n + 1} of 8) — Undid last point"
         
