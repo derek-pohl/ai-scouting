@@ -3169,6 +3169,27 @@ _BUMPER_MERGE_GAP_Y = 45
 _BUMPER_FIELD_ROI = (0, 315, 1918, 705)
 
 
+def _bumper_far_corner_sensitivity(x1: int, y1: int, x2: int, y2: int,
+                                   roi_x1: int, roi_y1: int,
+                                   roi_x2: int, roi_y2: int) -> float:
+    """
+    Return a 0-1 sensitivity boost for distant robots near the top-left/top-right
+    of the calibrated field ROI, where robots appear smaller.
+    """
+    roi_w = max(1, roi_x2 - roi_x1)
+    roi_h = max(1, roi_y2 - roi_y1)
+
+    cx = (x1 + x2) / 2.0
+    cy = (y1 + y2) / 2.0
+    nx = (cx - roi_x1) / roi_w
+    ny = (cy - roi_y1) / roi_h
+
+    top_factor = float(np.clip((0.55 - ny) / 0.55, 0.0, 1.0))
+    side_distance = abs(nx - 0.5)
+    side_factor = float(np.clip((side_distance - 0.18) / 0.32, 0.0, 1.0))
+    return top_factor * side_factor
+
+
 def _get_calibrated_field_roi() -> tuple:
     """Return _BUMPER_FIELD_ROI adjusted by the calibration homography.
 
@@ -3623,20 +3644,32 @@ def detect_robots_by_bumper_color(frame_bgr: np.ndarray, person_mask: np.ndarray
 
         for contour in contours:
             area = cv2.contourArea(contour)
-            if area < _BUMPER_MIN_AREA:
-                continue
-            
             x, y, w, h = cv2.boundingRect(contour)
+            sensitivity = _bumper_far_corner_sensitivity(
+                x, y, x + w, y + h, roi_x1, roi_y1, roi_x2, roi_y2
+            )
+            min_area = _BUMPER_MIN_AREA * (1.0 - 0.45 * sensitivity)
+            min_color_pixels = _BUMPER_MIN_COLOR_PIXELS * (1.0 - 0.45 * sensitivity)
+
+            if area < min_area:
+                continue
             
             # Verify this contour actually contains original color pixels (not just white)
             roi_slice = color_mask[y:y+h, x:x+w]
             color_pixels = cv2.countNonZero(roi_slice)
-            if color_pixels < _BUMPER_MIN_COLOR_PIXELS:
+            if color_pixels < min_color_pixels:
                 continue
 
             candidate_boxes.append((x, y, x + w, y + h))
 
         for x1, y1, x2, y2 in _merge_bumper_boxes(candidate_boxes):
+            sensitivity = _bumper_far_corner_sensitivity(
+                x1, y1, x2, y2, roi_x1, roi_y1, roi_x2, roi_y2
+            )
+            min_color_pixels = _BUMPER_MIN_COLOR_PIXELS * (1.0 - 0.45 * sensitivity)
+            fill_ratio_min = max(0.008, 0.015 * (1.0 - 0.35 * sensitivity))
+            allowed_ratio_min = max(0.45, 0.55 - 0.10 * sensitivity)
+            soft_allowed_ratio_min = max(0.65, 0.75 - 0.10 * sensitivity)
             roi_slice = color_mask[y1:y2, x1:x2]
             color_pixels = cv2.countNonZero(roi_slice)
             box_area = max(1, (x2 - x1) * (y2 - y1))
@@ -3646,13 +3679,13 @@ def detect_robots_by_bumper_color(frame_bgr: np.ndarray, person_mask: np.ndarray
             allowed_ratio = allowed_pixels / box_area
 
             # Keep robot-sized, color-supported regions while still rejecting sparse noise.
-            if color_pixels < _BUMPER_MIN_COLOR_PIXELS:
+            if color_pixels < min_color_pixels:
                 continue
-            if fill_ratio < 0.015 and color_pixels < (_BUMPER_MIN_COLOR_PIXELS * 2):
+            if fill_ratio < fill_ratio_min and color_pixels < (min_color_pixels * 2):
                 continue
-            if allowed_ratio < 0.55:
+            if allowed_ratio < allowed_ratio_min:
                 continue
-            if allowed_ratio < 0.75 and color_pixels < (_BUMPER_MIN_COLOR_PIXELS * 3):
+            if allowed_ratio < soft_allowed_ratio_min and color_pixels < (min_color_pixels * 3):
                 continue
 
             raw_bboxes.append((x1, y1, x2, y2))
