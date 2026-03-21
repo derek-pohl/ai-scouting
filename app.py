@@ -24,7 +24,7 @@ load_dotenv()
 
 # YOLO person segmentation model (always loaded - used to exclude humans from bumper color detection)
 YOLO_PERSON_MODEL = None
-YOLO_PERSON_MODEL_PATH = Path(__file__).parent / "yolo26n-seg.pt"
+YOLO_PERSON_MODEL_PATH = Path(__file__).parent / "yolo26s-seg.pt"
 try:
     from ultralytics import YOLO as _YOLO_CLS
     if YOLO_PERSON_MODEL_PATH.exists():
