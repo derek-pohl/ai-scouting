@@ -3281,6 +3281,45 @@ def _merge_bumper_boxes(boxes: list,
     return merged
 
 
+def _has_large_internal_horizontal_gap(mask_slice: np.ndarray,
+                                       min_gap_px: int = 24,
+                                       min_gap_fraction: float = 0.30) -> bool:
+    """
+    Detect merged boxes that actually contain two disconnected side blobs with a
+    wide empty middle section.
+
+    Real robot bumpers can have white team-number gaps, but the bridged contour
+    mask should keep those connected. Large empty interior spans usually mean we
+    merged unrelated fragments across open space.
+    """
+    if mask_slice is None or mask_slice.size == 0:
+        return False
+
+    col_has_signal = np.any(mask_slice > 0, axis=0)
+    active_cols = np.flatnonzero(col_has_signal)
+    if active_cols.size < 2:
+        return False
+
+    left = int(active_cols[0])
+    right = int(active_cols[-1])
+    span_width = right - left + 1
+    if span_width < (min_gap_px * 2):
+        return False
+
+    interior = col_has_signal[left:right + 1]
+    longest_gap = 0
+    current_gap = 0
+    for has_signal in interior:
+        if has_signal:
+            current_gap = 0
+            continue
+        current_gap += 1
+        if current_gap > longest_gap:
+            longest_gap = current_gap
+
+    return longest_gap >= min_gap_px and (longest_gap / span_width) >= min_gap_fraction
+
+
 
 def compute_field_pixel_mask(video_path: str, start_seconds: float = 0,
                              sample_fps: float = 3.0,
@@ -3326,6 +3365,7 @@ def compute_field_pixel_mask(video_path: str, start_seconds: float = 0,
     # Accumulators (float32 to avoid overflow for long videos)
     red_blue_count = np.zeros((roi_h, roi_w), dtype=np.float32)
     grey_count = np.zeros((roi_h, roi_w), dtype=np.float32)
+    yellow_count = np.zeros((roi_h, roi_w), dtype=np.float32)
     frame_count = 0
 
     # Wide HSV ranges to catch field element shades but NOT yellow balls.
@@ -3343,6 +3383,10 @@ def compute_field_pixel_mask(video_path: str, start_seconds: float = 0,
     # Any hue is OK since saturation is nearly zero for true greys.
     lower_grey = np.array([0, 0, 70])
     upper_grey = np.array([180, 35, 190])
+    # Yellow fuel can temporarily cover carpet, so persistent yellow should also
+    # protect those pixels from being classified as static field structure.
+    lower_yellow = np.array([15, 60, 40])
+    upper_yellow = np.array([85, 255, 255])
     # Fraction of frames a pixel must be grey to be protected from exclusion
     grey_protect_threshold = 0.10
 
@@ -3386,12 +3430,14 @@ def compute_field_pixel_mask(video_path: str, start_seconds: float = 0,
 
             # Grey carpet pixels
             grey_pix = cv2.inRange(hsv, lower_grey, upper_grey)
+            yellow_pix = cv2.inRange(hsv, lower_yellow, upper_yellow)
 
             # Accumulate (only the overlapping region in case of size mismatch)
             ah = min(fh, roi_h)
             aw = min(fw, roi_w)
             red_blue_count[:ah, :aw] += (combined[:ah, :aw] > 0).astype(np.float32)
             grey_count[:ah, :aw] += (grey_pix[:ah, :aw] > 0).astype(np.float32)
+            yellow_count[:ah, :aw] += (yellow_pix[:ah, :aw] > 0).astype(np.float32)
             frame_count += 1
 
         current_frame += 1
@@ -3408,10 +3454,15 @@ def compute_field_pixel_mask(video_path: str, start_seconds: float = 0,
     # Build exclusion mask: 0 = field element (excluded), 255 = allowed
     mask = np.where(frequency >= threshold, 0, 255).astype(np.uint8)
 
-    # Grey carpet protection: force-allow pixels that are grey in >= 30% of frames.
-    # This prevents the carpet from being excluded even with sensitive color ranges.
+    # Carpet protection: force-allow pixels that are frequently grey or covered by
+    # yellow fuel, preventing pooled balls from causing carpet to be treated as
+    # static field structure.
     grey_frequency = grey_count / frame_count
-    carpet_protected = grey_frequency >= grey_protect_threshold
+    yellow_frequency = yellow_count / frame_count
+    carpet_protected = (
+        (grey_frequency >= grey_protect_threshold) |
+        (yellow_frequency >= grey_protect_threshold)
+    )
     mask[carpet_protected] = 255
 
     excluded_pixels = int(np.sum(mask == 0))
@@ -3670,6 +3721,7 @@ def detect_robots_by_bumper_color(frame_bgr: np.ndarray, person_mask: np.ndarray
             fill_ratio_min = max(0.008, 0.015 * (1.0 - 0.35 * sensitivity))
             allowed_ratio_min = max(0.45, 0.55 - 0.10 * sensitivity)
             soft_allowed_ratio_min = max(0.65, 0.75 - 0.10 * sensitivity)
+            contour_slice = contour_mask[y1:y2, x1:x2]
             roi_slice = color_mask[y1:y2, x1:x2]
             color_pixels = cv2.countNonZero(roi_slice)
             box_area = max(1, (x2 - x1) * (y2 - y1))
@@ -3686,6 +3738,8 @@ def detect_robots_by_bumper_color(frame_bgr: np.ndarray, person_mask: np.ndarray
             if allowed_ratio < allowed_ratio_min:
                 continue
             if allowed_ratio < soft_allowed_ratio_min and color_pixels < (min_color_pixels * 3):
+                continue
+            if _has_large_internal_horizontal_gap(contour_slice):
                 continue
 
             raw_bboxes.append((x1, y1, x2, y2))
