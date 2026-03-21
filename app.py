@@ -3323,7 +3323,7 @@ def compute_field_pixel_mask(video_path: str, start_seconds: float = 0,
     lower_grey = np.array([0, 0, 70])
     upper_grey = np.array([180, 35, 190])
     # Fraction of frames a pixel must be grey to be protected from exclusion
-    grey_protect_threshold = 0.30
+    grey_protect_threshold = 0.10
 
     cap.set(cv2.CAP_PROP_POS_FRAMES, first_valid_frame)
     current_frame = first_valid_frame
