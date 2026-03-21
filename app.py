@@ -364,21 +364,21 @@ def query_local_llm_batch(
 def query_side_camera_presence(
     frame_image: Image.Image,
     alliance_robots: list,
+    camera_side: str = "blue",
     timeout: float = 60.0
 ) -> list:
     """
-    Query local LMStudio to determine which alliance robots are visible in a side camera frame.
-    
-    Instead of detecting bounding boxes, this simply asks the LLM which robots from the
-    given list are present in the image. Used for blue/red side cameras in bumper mode.
+    Query local LMStudio to determine which alliance robots are visible in a side camera frame
+    and which of the 3 side-camera position buckets each robot occupies.
     
     Args:
         frame_image: PIL Image of the full side camera frame
         alliance_robots: List of team numbers for this alliance (up to 3)
+        camera_side: "blue" or "red" side camera, used for response ordering
         timeout: Request timeout in seconds
         
     Returns:
-        List of team number strings that are visible (e.g., ["1234", "5678"])
+        List of dicts like [{'team': '1234', 'x_bucket': 2}]
     """
     if not LMSTUDIO_ENABLED:
         return []
@@ -395,14 +395,26 @@ def query_side_camera_presence(
     
     # Build prompt
     numbers_str = ", ".join(valid_robots)
+    side_name = str(camera_side).strip().lower()
+    if side_name == "red":
+        bucket_instructions = (
+            "Use x_bucket 1 for the middle visible lane, x_bucket 2 for the right lane, "
+            "and x_bucket 3 for the farthest-right lane."
+        )
+    else:
+        bucket_instructions = (
+            "Use x_bucket 1 for the middle visible lane, x_bucket 2 for the left lane, "
+            "and x_bucket 3 for the farthest-left lane."
+        )
     prompt = (
         f"Which of these robots are visible in this image: {numbers_str}? "
         f"Only identify robots from this list. "
-        f"Order your response by distance to a point slightly left of the image center. "
-        f"The robot closest to that slightly-left-of-center point must come first, "
-        f"then the second closest, and so on. "
-        f"Reply with ONLY the numbers you can see, separated by commas. "
-        f"If none are visible, reply 'none'."
+        f"{bucket_instructions} "
+        f"Reply with ONLY a JSON array. "
+        f"Each item must be an object with keys 'team' and 'x_bucket'. "
+        f"Example: "
+        f"[{{\"team\":\"77235\",\"x_bucket\":1}}]. "
+        f"If none are visible, reply with []."
     )
     
     try:
@@ -430,14 +442,33 @@ def query_side_camera_presence(
             
             if "none" in answer.lower():
                 return []
-            
-            # Parse comma-separated numbers and validate against alliance list
+
+            try:
+                parsed = json.loads(parse_json(answer))
+            except Exception:
+                print(f"[Side Camera LLM] Could not parse JSON: {answer}")
+                return []
+
+            if not isinstance(parsed, list):
+                return []
+
             found = []
-            for token in answer.replace(",", " ").split():
-                token_clean = token.strip().strip(".")
-                if token_clean in valid_robots and token_clean not in found:
-                    found.append(token_clean)
-            
+            seen = set()
+            for item in parsed:
+                if not isinstance(item, dict):
+                    continue
+                team = str(item.get("team", "")).strip()
+                if team not in valid_robots or team in seen:
+                    continue
+                try:
+                    x_bucket = int(item.get("x_bucket"))
+                except Exception:
+                    continue
+                if x_bucket not in (1, 2, 3):
+                    continue
+                found.append({"team": team, "x_bucket": x_bucket})
+                seen.add(team)
+
             return found
         else:
             print(f"[Side Camera LLM] Error: {response.status_code}")
@@ -459,6 +490,146 @@ def query_side_camera_presence(
 # placed at this position on the center camera frame for shot attribution.
 _HIDDEN_ROBOT_BBOX_BLUE = (502, 360, 574, 417)  # x1, y1, x2, y2
 _HIDDEN_ROBOT_BBOX_RED = (1364, 371, 1442, 422)  # x1, y1, x2, y2
+
+# Hidden robot slot centers on the center camera (reference coords 1918x709).
+# These align with the 3 visible position buckets from each side camera.
+_HIDDEN_ROBOT_SLOT_CENTERS = {
+    "blue": {
+        1: (445, 482),   # middle blue (1)
+        2: (594, 379),   # left blue (2)
+        3: (338, 402),   # farthest left blue (3)
+    },
+    "red": {
+        1: (1493, 483),  # middle red (1)
+        2: (1367, 400),  # right red (2)
+        3: (1618, 406),  # farthest right red (3)
+    }
+}
+
+
+def _hidden_bbox_for_slot(side_name: str, x_bucket: int) -> tuple:
+    """Build a hidden robot bbox for a side-camera position bucket."""
+    base_bbox = _HIDDEN_ROBOT_BBOX_BLUE if side_name == "blue" else _HIDDEN_ROBOT_BBOX_RED
+    base_x1, base_y1, base_x2, base_y2 = base_bbox
+    width = base_x2 - base_x1
+    height = base_y2 - base_y1
+
+    cx, cy = _HIDDEN_ROBOT_SLOT_CENTERS.get(side_name, {}).get(
+        x_bucket,
+        ((base_x1 + base_x2) // 2, (base_y1 + base_y2) // 2)
+    )
+
+    x1 = int(round(cx - width / 2))
+    y1 = int(round(cy - height / 2))
+    x2 = x1 + width
+    y2 = y1 + height
+    return x1, y1, x2, y2
+
+
+def inject_hidden_robot_bboxes(base_bboxes_json: str, persistent_hidden_robots: dict,
+                               side_camera_visible_robots: dict, frame_count: int,
+                               width: int, height: int) -> tuple:
+    """
+    Augment center-camera detections with hidden robots inferred from the side cameras.
+
+    Returns:
+        Tuple of (augmented_bboxes_json, updated_persistent_hidden_robots)
+    """
+    try:
+        center_bboxes = json.loads(parse_json(base_bboxes_json))
+    except Exception:
+        center_bboxes = []
+
+    center_detected_labels = set()
+    for bbox in center_bboxes:
+        lbl = str(bbox.get('label', '')).strip()
+        if lbl and lbl not in ('robot', 'unknown', 'red', 'blue'):
+            center_detected_labels.add(lbl)
+
+    updated_hidden = dict(persistent_hidden_robots or {})
+
+    for side_name in ('blue', 'red'):
+        side_data = side_camera_visible_robots.get(side_name, {}) if side_camera_visible_robots else {}
+        if not side_data:
+            continue
+
+        latest_side_frame = None
+        for sf in sorted(side_data.keys()):
+            if sf <= frame_count:
+                latest_side_frame = sf
+            else:
+                break
+
+        if latest_side_frame is None:
+            continue
+
+        side_visible = side_data[latest_side_frame]
+        for item in side_visible:
+            if not isinstance(item, dict):
+                continue
+            robot_label = str(item.get('team', '')).strip()
+            try:
+                x_bucket = int(item.get('x_bucket'))
+            except Exception:
+                continue
+
+            if not robot_label or x_bucket not in (1, 2, 3):
+                continue
+            if robot_label in center_detected_labels:
+                continue
+
+            updated_hidden[robot_label] = {
+                'side': side_name,
+                'x_bucket': x_bucket
+            }
+
+    for robot_label in list(updated_hidden.keys()):
+        if robot_label in center_detected_labels:
+            del updated_hidden[robot_label]
+
+    injected_bboxes = list(center_bboxes)
+    slot_counts = {}
+    ordered_hidden = sorted(
+        updated_hidden.items(),
+        key=lambda item: (
+            0 if item[1].get('side') == "blue" else 1,
+            item[1].get('x_bucket', 99),
+            item[0]
+        )
+    )
+
+    for robot_label, hidden_meta in ordered_hidden:
+        side_name = hidden_meta.get('side')
+        x_bucket = hidden_meta.get('x_bucket', 1)
+        hx1, hy1, hx2, hy2 = _hidden_bbox_for_slot(side_name, x_bucket)
+
+        slot_key = (side_name, x_bucket)
+        duplicate_index = slot_counts.get(slot_key, 0)
+        slot_counts[slot_key] = duplicate_index + 1
+        if duplicate_index > 0:
+            bbox_height = hy2 - hy1
+            hy1 += duplicate_index * (bbox_height + 5)
+            hy2 += duplicate_index * (bbox_height + 5)
+
+        hx1_s, hy1_s = _calibration_transform_point(hx1, hy1, width, height, inverse=False)
+        hx2_s, hy2_s = _calibration_transform_point(hx2, hy2, width, height, inverse=False)
+
+        y1_norm = int((hy1_s / height) * 1000)
+        x1_norm = int((hx1_s / width) * 1000)
+        y2_norm = int((hy2_s / height) * 1000)
+        x2_norm = int((hx2_s / width) * 1000)
+
+        injected_bboxes.append({
+            "box_2d": [y1_norm, x1_norm, y2_norm, x2_norm],
+            "label": robot_label
+        })
+        print(
+            f"[Hidden Robot] Injecting {robot_label} at "
+            f"({hx1_s:.0f},{hy1_s:.0f})-({hx2_s:.0f},{hy2_s:.0f}) "
+            f"from {side_name} bucket {x_bucket}"
+        )
+
+    return json.dumps(injected_bboxes), updated_hidden
 
 
 
@@ -4095,7 +4266,7 @@ def process_single_video(video_path: str, camera_side: str = "blue", target_fps:
     # Ferry tracker for counting fuel ferries (cross out, cross back, shoot)
     ferry_tracker = FerryTracker(blue_robots=blue_robots, red_robots=red_robots)
     
-    # Persistent hidden robot tracking (label -> {'side': str, 'order_index': int})
+    # Persistent hidden robot tracking (label -> {'side': str, 'x_bucket': int})
     persistent_hidden_robots = {}
     
     # Disabled tracker for detecting when robots stop moving
@@ -4209,7 +4380,11 @@ def process_single_video(video_path: str, camera_side: str = "blue", target_fps:
             if camera_side in ("blue", "red"):
                 # Side camera: LLM presence query (no bounding boxes)
                 alliance_robots = blue_robots if camera_side == "blue" else red_robots
-                visible_robots = query_side_camera_presence(pil_frame, alliance_robots)
+                visible_robots = query_side_camera_presence(
+                    pil_frame,
+                    alliance_robots,
+                    camera_side=camera_side
+                )
                 side_visible_robots_by_frame[frame_count] = visible_robots
                 if visible_robots:
                     print(f"[Side Camera LLM] {camera_name} sees robots: {visible_robots}")
@@ -4296,6 +4471,16 @@ def process_single_video(video_path: str, camera_side: str = "blue", target_fps:
                         "label": final_labels[i] if i < len(final_labels) else "robot"
                     })
                 bounding_boxes_json = json.dumps(detections)
+
+                if camera_side == "center" and side_camera_visible_robots:
+                    bounding_boxes_json, persistent_hidden_robots = inject_hidden_robot_bboxes(
+                        bounding_boxes_json,
+                        persistent_hidden_robots,
+                        side_camera_visible_robots,
+                        frame_count,
+                        width,
+                        height
+                    )
             
             # Store for tracking
             current_bboxes_json = bounding_boxes_json
@@ -4357,105 +4542,6 @@ def process_single_video(video_path: str, camera_side: str = "blue", target_fps:
                     overlay[current_person_mask > 0] = (128, 128, 128)  # Grey
                     blended = cv2.addWeighted(frame_np, 0.6, overlay, 0.4, 0)
                     annotated_frame = Image.fromarray(blended)
-                
-                # Inject hidden robot bounding boxes for center camera (bumper mode)
-                # When a side camera sees a robot but the center camera doesn't,
-                # place a synthetic bounding box at the hidden robot position.
-                # This must happen BEFORE plot_bounding_boxes so they appear in the video output.
-                if camera_side == "center" and side_camera_visible_robots:
-                    center_detected_labels = set()
-                    try:
-                        center_bboxes = json.loads(parse_json(render_bboxes_json))
-                        for bbox in center_bboxes:
-                            lbl = str(bbox.get('label', '')).strip()
-                            if lbl and lbl not in ('robot', 'unknown', 'red', 'blue'):
-                                center_detected_labels.add(lbl)
-                    except Exception:
-                        center_bboxes = []
-                    
-                    injected_bboxes = list(center_bboxes)
-                    
-                    for side_name in ('blue', 'red'):
-                        side_data = side_camera_visible_robots.get(side_name, {})
-                        if not side_data:
-                            continue
-                        side_frames = sorted(side_data.keys())
-                        latest_side_frame = None
-                        for sf in side_frames:
-                            if sf <= frame_count:
-                                latest_side_frame = sf
-                            else:
-                                break
-                        if latest_side_frame is None:
-                            continue
-                        
-                        side_visible = side_data[latest_side_frame]
-                        # Add newly hidden robots to persistent tracking
-                        for visible_idx, robot_label in enumerate(side_visible):
-                            if robot_label not in center_detected_labels:
-                                persistent_hidden_robots[robot_label] = {
-                                    'side': side_name,
-                                    'order_index': visible_idx
-                                }
-                    
-                    # Remove any robots that are now visible on the center camera
-                    for robot_label in list(persistent_hidden_robots.keys()):
-                        if robot_label in center_detected_labels:
-                            del persistent_hidden_robots[robot_label]
-                            
-                    # Inject all currently active persistent hidden robots
-                    hidden_count_blue = 0
-                    hidden_count_red = 0
-                    
-                    ordered_hidden = sorted(
-                        persistent_hidden_robots.items(),
-                        key=lambda item: (
-                            0 if item[1].get('side') == "blue" else 1,
-                            item[1].get('order_index', 999),
-                            item[0]
-                        )
-                    )
-
-                    for robot_label, hidden_meta in ordered_hidden:
-                        side_name = hidden_meta.get('side')
-                        hidden_bbox = _HIDDEN_ROBOT_BBOX_BLUE if side_name == "blue" else _HIDDEN_ROBOT_BBOX_RED
-                        hx1, hy1, hx2, hy2 = hidden_bbox
-                        
-                        # Offset vertically when multiple robots share the same hidden spot.
-                        # Preserve the side-camera order: first robot stays in the base slot,
-                        # then each subsequent robot goes lower and shifts sideways.
-                        bbox_height = hy2 - hy1
-                        if side_name == "blue":
-                            hx1 -= hidden_count_blue * 25
-                            hx2 -= hidden_count_blue * 25
-                            hy1 += hidden_count_blue * (bbox_height + 5)
-                            hy2 += hidden_count_blue * (bbox_height + 5)
-                            hidden_count_blue += 1
-                        else:
-                            hx1 += hidden_count_red * 25
-                            hx2 += hidden_count_red * 25
-                            hy1 += hidden_count_red * (bbox_height + 5)
-                            hy2 += hidden_count_red * (bbox_height + 5)
-                            hidden_count_red += 1
-                        
-                        # Apply calibration shift (reference -> current frame coords)
-                        hx1_s, hy1_s = _calibration_transform_point(hx1, hy1, width, height, inverse=False)
-                        hx2_s, hy2_s = _calibration_transform_point(hx2, hy2, width, height, inverse=False)
-                        
-                        # Convert to normalized 0-1000 coords
-                        y1_norm = int((hy1_s / height) * 1000)
-                        x1_norm = int((hx1_s / width) * 1000)
-                        y2_norm = int((hy2_s / height) * 1000)
-                        x2_norm = int((hx2_s / width) * 1000)
-                        
-                        injected_bboxes.append({
-                            "box_2d": [y1_norm, x1_norm, y2_norm, x2_norm],
-                            "label": robot_label
-                        })
-                        print(f"[Hidden Robot] Injecting {robot_label} at ({hx1_s:.0f},{hy1_s:.0f})-({hx2_s:.0f},{hy2_s:.0f}) from persistent {side_name} tracking")
-                    
-                    if len(injected_bboxes) > len(center_bboxes):
-                        render_bboxes_json = json.dumps(injected_bboxes)
                 
                 annotated_frame = plot_bounding_boxes(
                     annotated_frame, 
