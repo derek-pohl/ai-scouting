@@ -3152,7 +3152,7 @@ def plot_bounding_boxes(img: Image.Image, bounding_boxes_json: str, blue_robots:
 _BUMPER_MORPH_KERNEL = np.ones((5, 5), np.uint8)
 _BUMPER_BRIDGE_KERNEL = cv2.getStructuringElement(cv2.MORPH_RECT, (25, 5))
 _BUMPER_WHITE_PROXIMITY_KERNEL = np.ones((30, 30), np.uint8)
-_BUMPER_STRUCTURE_MARGIN_KERNEL = np.ones((17, 17), np.uint8)
+_BUMPER_STRUCTURE_MARGIN_KERNEL = np.ones((9, 9), np.uint8)
 
 # White/near-white HSV range for team number text on bumpers
 # Covers pure white rgb(255,255,255) and pinkish-white rgb(203,181,199)
@@ -3162,9 +3162,8 @@ _BUMPER_WHITE_UPPER = np.array([180, 60, 255])
 # Minimum contour area / color pixels for bumper detection (reject small noise)
 _BUMPER_MIN_AREA = 120
 _BUMPER_MIN_COLOR_PIXELS = 90
-_BUMPER_MERGE_GAP_X = 55
-_BUMPER_MERGE_GAP_Y = 28
-_BUMPER_MAX_STRUCTURE_OVERLAP = 0.25
+_BUMPER_MERGE_GAP_X = 90
+_BUMPER_MERGE_GAP_Y = 45
 
 # Center camera playing field ROI (x1, y1, x2, y2) — excludes audience areas
 _BUMPER_FIELD_ROI = (0, 315, 1918, 705)
@@ -3230,10 +3229,6 @@ def _merge_bumper_boxes(boxes: list,
                         continue
 
                     bx1, by1, bx2, by2 = box_b
-                    aw = max(1, cx2 - cx1)
-                    ah = max(1, cy2 - cy1)
-                    bw = max(1, bx2 - bx1)
-                    bh = max(1, by2 - by1)
                     bcy = (by1 + by2) / 2.0
 
                     overlaps_x = not (bx1 > cx2 or bx2 < cx1)
@@ -3241,20 +3236,11 @@ def _merge_bumper_boxes(boxes: list,
                     horiz_gap = max(0, max(bx1 - cx2, cx1 - bx2))
                     vert_gap = max(0, max(by1 - cy2, cy1 - by2))
                     center_y_gap = abs(bcy - ccy)
-                    vertical_overlap = max(0, min(cy2, by2) - max(cy1, by1))
-                    min_height = min(ah, bh)
-                    max_width = max(aw, bw)
-                    dynamic_gap_x = min(gap_x, int(max_width * 0.35) + 12)
-                    dynamic_gap_y = min(gap_y, int(min_height * 0.30) + 8)
-                    has_strong_vertical_alignment = (
-                        vertical_overlap >= min_height * 0.30 or
-                        center_y_gap <= dynamic_gap_y
-                    )
 
                     if (overlaps_x and overlaps_y) or (
-                        has_strong_vertical_alignment and
-                        horiz_gap <= dynamic_gap_x and
-                        vert_gap <= dynamic_gap_y
+                        horiz_gap <= gap_x and
+                        vert_gap <= gap_y and
+                        center_y_gap <= gap_y
                     ):
                         current = [
                             min(cx1, bx1),
@@ -3505,10 +3491,10 @@ def detect_robots_by_bumper_color(frame_bgr: np.ndarray, person_mask: np.ndarray
     # Use dynamic field pixel mask if available
     fh, fw = field_region.shape[:2]
     if field_pixel_mask is not None:
-        active_exc_mask = field_pixel_mask[:fh, :fw].copy()
-        excluded = np.where(active_exc_mask == 0, 255, 0).astype(np.uint8)
-        excluded = cv2.dilate(excluded, _BUMPER_STRUCTURE_MARGIN_KERNEL, iterations=1)
-        active_exc_mask = cv2.bitwise_not(excluded)
+        active_exc_mask = field_pixel_mask[:fh, :fw]
+        # Expand excluded structure regions slightly so edge-adjacent color noise
+        # does not turn into robot detections hugging field elements.
+        active_exc_mask = cv2.erode(active_exc_mask, _BUMPER_STRUCTURE_MARGIN_KERNEL, iterations=1)
     else:
         active_exc_mask = np.ones((fh, fw), dtype=np.uint8) * 255
     
@@ -3655,15 +3641,18 @@ def detect_robots_by_bumper_color(frame_bgr: np.ndarray, person_mask: np.ndarray
             color_pixels = cv2.countNonZero(roi_slice)
             box_area = max(1, (x2 - x1) * (y2 - y1))
             fill_ratio = color_pixels / box_area
-            allowed_pixels = cv2.countNonZero(active_exc_mask_full[y1:y2, x1:x2])
-            structure_overlap = 1.0 - (allowed_pixels / box_area)
+            allowed_slice = active_exc_mask_full[y1:y2, x1:x2]
+            allowed_pixels = cv2.countNonZero(allowed_slice)
+            allowed_ratio = allowed_pixels / box_area
 
             # Keep robot-sized, color-supported regions while still rejecting sparse noise.
             if color_pixels < _BUMPER_MIN_COLOR_PIXELS:
                 continue
             if fill_ratio < 0.015 and color_pixels < (_BUMPER_MIN_COLOR_PIXELS * 2):
                 continue
-            if structure_overlap > _BUMPER_MAX_STRUCTURE_OVERLAP:
+            if allowed_ratio < 0.55:
+                continue
+            if allowed_ratio < 0.75 and color_pixels < (_BUMPER_MIN_COLOR_PIXELS * 3):
                 continue
 
             raw_bboxes.append((x1, y1, x2, y2))
