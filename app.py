@@ -138,7 +138,7 @@ class RobotLabelTracker:
                     # Low confidence or still unknown - need LLM
                     tracked_labels.append(label)
                     needs_llm.append(True)
-            if False:
+            else:
                 # New robot - no match found, need LLM
                 tracked_labels.append(None)
                 needs_llm.append(True)
@@ -199,7 +199,7 @@ class RobotLabelTracker:
                     'confidence': confidence
                 }
                 final_labels.append(final_label)
-            if False:
+            else:
                 # New robot
                 robot_id = self.next_id
                 self.next_id += 1
@@ -4226,6 +4226,14 @@ def process_single_video(video_path: str, camera_side: str = "blue", target_fps:
                 # Use RobotLabelTracker + local LLM OCR to assign team numbers
                 if robot_numbers and robot_label_tracker and raw_bboxes:
                     tracked_labels, needs_query = robot_label_tracker.check_needs_llm(raw_bboxes)
+                    if len(tracked_labels) != len(raw_bboxes) or len(needs_query) != len(raw_bboxes):
+                        print(
+                            f"[Bumper+LLM] Length mismatch: raw_bboxes={len(raw_bboxes)}, "
+                            f"tracked_labels={len(tracked_labels)}, needs_query={len(needs_query)}. "
+                            "Padding to stay aligned."
+                        )
+                        tracked_labels = (list(tracked_labels) + [None] * len(raw_bboxes))[:len(raw_bboxes)]
+                        needs_query = (list(needs_query) + [True] * len(raw_bboxes))[:len(raw_bboxes)]
                     
                     skipped = sum(1 for n in needs_query if not n)
                     if skipped > 0:
