@@ -398,6 +398,9 @@ def query_side_camera_presence(
     prompt = (
         f"Which of these robots are visible in this image: {numbers_str}? "
         f"Only identify robots from this list. "
+        f"Order your response by distance to a point slightly left of the image center. "
+        f"The robot closest to that slightly-left-of-center point must come first, "
+        f"then the second closest, and so on. "
         f"Reply with ONLY the numbers you can see, separated by commas. "
         f"If none are visible, reply 'none'."
     )
@@ -4092,7 +4095,7 @@ def process_single_video(video_path: str, camera_side: str = "blue", target_fps:
     # Ferry tracker for counting fuel ferries (cross out, cross back, shoot)
     ferry_tracker = FerryTracker(blue_robots=blue_robots, red_robots=red_robots)
     
-    # Persistent hidden robot tracking (label -> side_name)
+    # Persistent hidden robot tracking (label -> {'side': str, 'order_index': int})
     persistent_hidden_robots = {}
     
     # Disabled tracker for detecting when robots stop moving
@@ -4388,9 +4391,12 @@ def process_single_video(video_path: str, camera_side: str = "blue", target_fps:
                         
                         side_visible = side_data[latest_side_frame]
                         # Add newly hidden robots to persistent tracking
-                        for robot_label in side_visible:
+                        for visible_idx, robot_label in enumerate(side_visible):
                             if robot_label not in center_detected_labels:
-                                persistent_hidden_robots[robot_label] = side_name
+                                persistent_hidden_robots[robot_label] = {
+                                    'side': side_name,
+                                    'order_index': visible_idx
+                                }
                     
                     # Remove any robots that are now visible on the center camera
                     for robot_label in list(persistent_hidden_robots.keys()):
@@ -4401,17 +4407,33 @@ def process_single_video(video_path: str, camera_side: str = "blue", target_fps:
                     hidden_count_blue = 0
                     hidden_count_red = 0
                     
-                    for robot_label, side_name in persistent_hidden_robots.items():
+                    ordered_hidden = sorted(
+                        persistent_hidden_robots.items(),
+                        key=lambda item: (
+                            0 if item[1].get('side') == "blue" else 1,
+                            item[1].get('order_index', 999),
+                            item[0]
+                        )
+                    )
+
+                    for robot_label, hidden_meta in ordered_hidden:
+                        side_name = hidden_meta.get('side')
                         hidden_bbox = _HIDDEN_ROBOT_BBOX_BLUE if side_name == "blue" else _HIDDEN_ROBOT_BBOX_RED
                         hx1, hy1, hx2, hy2 = hidden_bbox
                         
-                        # Offset vertically when multiple robots share the same hidden spot
+                        # Offset vertically when multiple robots share the same hidden spot.
+                        # Preserve the side-camera order: first robot stays in the base slot,
+                        # then each subsequent robot goes lower and shifts sideways.
                         bbox_height = hy2 - hy1
                         if side_name == "blue":
+                            hx1 -= hidden_count_blue * 25
+                            hx2 -= hidden_count_blue * 25
                             hy1 += hidden_count_blue * (bbox_height + 5)
                             hy2 += hidden_count_blue * (bbox_height + 5)
                             hidden_count_blue += 1
                         else:
+                            hx1 += hidden_count_red * 25
+                            hx2 += hidden_count_red * 25
                             hy1 += hidden_count_red * (bbox_height + 5)
                             hy2 += hidden_count_red * (bbox_height + 5)
                             hidden_count_red += 1
