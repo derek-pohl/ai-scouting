@@ -3547,6 +3547,17 @@ _BUMPER_STRUCTURE_MARGIN_KERNEL = np.ones((9, 9), np.uint8)
 _BUMPER_WHITE_LOWER = np.array([0, 0, 160])
 _BUMPER_WHITE_UPPER = np.array([180, 60, 255])
 
+# Center-camera blue bumper tuning.
+# The extra dark-navy range keeps very dark blue bumpers visible while the
+# channel-dominance gate prevents near-black field structures from matching.
+_BUMPER_BLUE_LOWER = np.array([92, 100, 30])
+_BUMPER_BLUE_UPPER = np.array([122, 255, 200])
+_BUMPER_DARK_BLUE_LOWER = np.array([96, 65, 18])
+_BUMPER_DARK_BLUE_UPPER = np.array([132, 255, 90])
+_BUMPER_BLUE_MIN_DOMINANCE = 10
+_BUMPER_BLUE_NEAR_BLACK_VALUE_MAX = 55
+_BUMPER_BLUE_NEAR_BLACK_SPREAD_MAX = 10
+
 # Minimum contour area / color pixels for bumper detection (reject small noise)
 _BUMPER_MIN_AREA = 90
 _BUMPER_MIN_COLOR_PIXELS = 65
@@ -3555,6 +3566,39 @@ _BUMPER_MERGE_GAP_Y = 45
 
 # Center camera playing field ROI (x1, y1, x2, y2) — excludes audience areas
 _BUMPER_FIELD_ROI = (0, 315, 1918, 705)
+
+
+def _build_center_blue_mask(field_region_bgr: np.ndarray, hsv_region: np.ndarray) -> np.ndarray:
+    """
+    Detect center-camera blue bumpers, including dark navy shades such as
+    rgb(18, 21, 38), while rejecting nearly neutral black structures.
+    """
+    base_blue_mask = cv2.inRange(hsv_region, _BUMPER_BLUE_LOWER, _BUMPER_BLUE_UPPER)
+    dark_blue_mask = cv2.inRange(hsv_region, _BUMPER_DARK_BLUE_LOWER, _BUMPER_DARK_BLUE_UPPER)
+
+    if field_region_bgr is None or field_region_bgr.size == 0:
+        return cv2.bitwise_or(base_blue_mask, dark_blue_mask)
+
+    blue = field_region_bgr[:, :, 0].astype(np.int16)
+    green = field_region_bgr[:, :, 1].astype(np.int16)
+    red = field_region_bgr[:, :, 2].astype(np.int16)
+    value = hsv_region[:, :, 2].astype(np.int16)
+
+    channel_max = np.maximum(np.maximum(blue, green), red)
+    channel_min = np.minimum(np.minimum(blue, green), red)
+    channel_spread = channel_max - channel_min
+
+    blue_dominant = (
+        (blue >= (green + _BUMPER_BLUE_MIN_DOMINANCE)) &
+        (blue >= (red + _BUMPER_BLUE_MIN_DOMINANCE))
+    )
+    near_black_structure = (
+        (value <= _BUMPER_BLUE_NEAR_BLACK_VALUE_MAX) &
+        (channel_spread <= _BUMPER_BLUE_NEAR_BLACK_SPREAD_MAX)
+    )
+
+    blue_gate = np.where(blue_dominant & ~near_black_structure, 255, 0).astype(np.uint8)
+    return cv2.bitwise_and(cv2.bitwise_or(base_blue_mask, dark_blue_mask), blue_gate)
 
 
 def _bumper_far_corner_sensitivity(x1: int, y1: int, x2: int, y2: int,
@@ -3763,9 +3807,6 @@ def compute_field_pixel_mask(video_path: str, start_seconds: float = 0,
     upper_red1 = np.array([20, 255, 255])
     lower_red2 = np.array([140, 25, 15])
     upper_red2 = np.array([180, 255, 255])
-    lower_blue = np.array([75, 25, 15])
-    upper_blue = np.array([140, 255, 255])
-
     # Grey carpet range (low saturation, mid-range value).
     # Covers greys from dark ~(90,90,85) to light ~(170,170,165).
     # Any hue is OK since saturation is nearly zero for true greys.
@@ -3810,8 +3851,8 @@ def compute_field_pixel_mask(video_path: str, start_seconds: float = 0,
             r2 = cv2.inRange(hsv, lower_red2, upper_red2)
             red_pix = cv2.bitwise_or(r1, r2)
 
-            # Blue
-            blue_pix = cv2.inRange(hsv, lower_blue, upper_blue)
+            # Blue, including dark navy bumpers while filtering nearly-black structures.
+            blue_pix = _build_center_blue_mask(field_region, hsv)
 
             # Combined: pixel is red OR blue in this frame
             combined = cv2.bitwise_or(red_pix, blue_pix)
@@ -3984,9 +4025,6 @@ def detect_robots_by_bumper_color(frame_bgr: np.ndarray, person_mask: np.ndarray
     upper_red1 = np.array([10, 255, 220])
     lower_red2 = np.array([160, 80, 80])
     upper_red2 = np.array([180, 255, 220])
-    lower_blue = np.array([92, 100, 30])
-    upper_blue = np.array([122, 255, 200])
-    
     try:
         # GPU Acceleration Path (using OpenCV T-API / OpenCL)
         umat_roi = cv2.UMat(field_region)
@@ -3998,7 +4036,7 @@ def detect_robots_by_bumper_color(frame_bgr: np.ndarray, person_mask: np.ndarray
         red_mask = cv2.bitwise_or(red_mask1, red_mask2)
         
         # Blue bumper
-        blue_mask = cv2.inRange(hsv, lower_blue, upper_blue)
+        blue_mask = _build_center_blue_mask(field_region, hsv.get())
         
         # Morphology on GPU
         red_mask = cv2.morphologyEx(red_mask, cv2.MORPH_OPEN, _BUMPER_MORPH_KERNEL, iterations=1)
@@ -4031,7 +4069,7 @@ def detect_robots_by_bumper_color(frame_bgr: np.ndarray, person_mask: np.ndarray
         red_mask1 = cv2.inRange(hsv, lower_red1, upper_red1)
         red_mask2 = cv2.inRange(hsv, lower_red2, upper_red2)
         red_mask = cv2.bitwise_or(red_mask1, red_mask2)
-        blue_mask = cv2.inRange(hsv, lower_blue, upper_blue)
+        blue_mask = _build_center_blue_mask(field_region, hsv)
         
         red_mask = cv2.morphologyEx(red_mask, cv2.MORPH_OPEN, _BUMPER_MORPH_KERNEL, iterations=1)
         blue_mask = cv2.morphologyEx(blue_mask, cv2.MORPH_OPEN, _BUMPER_MORPH_KERNEL, iterations=1)
