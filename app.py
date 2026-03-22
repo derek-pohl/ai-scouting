@@ -384,8 +384,8 @@ def _query_single_side_camera_robot(
             "Assign this robot to one position: 'middle', 'right', or 'far right'. "
             "Default to 'middle' if between middle and right. "
             "Use 'right' only if clearly in the right lane but not at the edge. "
-            "Use 'far right' only if at the extreme right lane or against the wall. "
-            "Base decisions on visual evidence (guide-box, lane, wall, center) and compare nearby boxes when helpful."
+            "Use 'far right' only if on the right side of the attached frame and close to the ladder. "
+            "Base decisions on visual evidence (guide-box, lane, frame side, center) and compare nearby boxes when helpful."
         )
         example_json = (
             f"[{{\"team\":\"{team}\","
@@ -403,8 +403,8 @@ def _query_single_side_camera_robot(
             "Assign this robot to one position: 'middle', 'left', or 'far left'. "
             "Default to 'middle' if between middle and left. "
             "Use 'left' only if clearly in the left lane but not at the edge. "
-            "Use 'far left' only if at the extreme left lane or against the wall. "
-            "Base decisions on visual evidence (guide-box, lane, wall, center) and compare nearby boxes when helpful."
+            "Use 'far left' only if on the left side of the attached frame and close to the ladder. "
+            "Base decisions on visual evidence (guide-box, lane, frame side, center) and compare nearby boxes when helpful."
         )
         example_json = (
             f"[{{\"team\":\"{team}\","
