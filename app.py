@@ -661,6 +661,45 @@ def _hidden_bbox_for_slot(side_name: str, x_bucket: int) -> tuple:
     return x1, y1, x2, y2
 
 
+def _bbox_json_to_pixels(bbox: dict, frame_width: int, frame_height: int) -> tuple:
+    """Convert a normalized detection bbox into pixel coordinates."""
+    box = bbox.get("box_2d", []) if isinstance(bbox, dict) else []
+    if len(box) < 4 or frame_width <= 0 or frame_height <= 0:
+        return None
+    y1 = float(box[0]) / 1000.0 * frame_height
+    x1 = float(box[1]) / 1000.0 * frame_width
+    y2 = float(box[2]) / 1000.0 * frame_height
+    x2 = float(box[3]) / 1000.0 * frame_width
+    return (x1, y1, x2, y2)
+
+
+def _bbox_overlap_ratio(box_a: tuple, box_b: tuple) -> float:
+    """
+    Return overlap relative to the smaller box.
+
+    This is more forgiving than IoU for center-vs-hidden robot conflicts because
+    the hidden proxy box is intentionally small.
+    """
+    if not box_a or not box_b:
+        return 0.0
+
+    ax1, ay1, ax2, ay2 = box_a
+    bx1, by1, bx2, by2 = box_b
+    inter_x1 = max(ax1, bx1)
+    inter_y1 = max(ay1, by1)
+    inter_x2 = min(ax2, bx2)
+    inter_y2 = min(ay2, by2)
+    inter_w = max(0.0, inter_x2 - inter_x1)
+    inter_h = max(0.0, inter_y2 - inter_y1)
+    inter_area = inter_w * inter_h
+    if inter_area <= 0:
+        return 0.0
+
+    area_a = max(1.0, (ax2 - ax1) * (ay2 - ay1))
+    area_b = max(1.0, (bx2 - bx1) * (by2 - by1))
+    return inter_area / min(area_a, area_b)
+
+
 def inject_hidden_robot_bboxes(base_bboxes_json: str, persistent_hidden_robots: dict,
                                side_camera_visible_robots: dict, frame_count: int,
                                width: int, height: int,
@@ -721,6 +760,38 @@ def inject_hidden_robot_bboxes(base_bboxes_json: str, persistent_hidden_robots: 
                 'last_side_seen_frame': latest_side_frame
             }
 
+    corner_hidden_overrides = []
+    for robot_label, hidden_meta in updated_hidden.items():
+        side_name = hidden_meta.get('side')
+        x_bucket = hidden_meta.get('x_bucket', 1)
+        if x_bucket != 3:
+            continue
+        hx1, hy1, hx2, hy2 = _hidden_bbox_for_slot(side_name, x_bucket)
+        hx1_s, hy1_s = _calibration_transform_point(hx1, hy1, width, height, inverse=False)
+        hx2_s, hy2_s = _calibration_transform_point(hx2, hy2, width, height, inverse=False)
+        corner_hidden_overrides.append((robot_label, side_name, (hx1_s, hy1_s, hx2_s, hy2_s)))
+
+    filtered_center_bboxes = []
+    for bbox in center_bboxes:
+        center_label = str(bbox.get('label', '')).strip()
+        center_box_px = _bbox_json_to_pixels(bbox, width, height)
+        should_drop = False
+        for hidden_label, side_name, hidden_box_px in corner_hidden_overrides:
+            if center_label == hidden_label:
+                continue
+            overlap_ratio = _bbox_overlap_ratio(center_box_px, hidden_box_px)
+            if overlap_ratio >= 0.25:
+                print(
+                    f"[Hidden Robot] Corner override: keeping side-camera label {hidden_label} "
+                    f"from {side_name} far corner and dropping overlapping center label "
+                    f"{center_label or 'robot'}"
+                )
+                should_drop = True
+                break
+        if not should_drop:
+            filtered_center_bboxes.append(bbox)
+
+    center_bboxes = filtered_center_bboxes
     injected_bboxes = list(center_bboxes)
     slot_counts = {}
     ordered_hidden = sorted(
@@ -3959,6 +4030,8 @@ _BUMPER_MIN_AREA = 90
 _BUMPER_MIN_COLOR_PIXELS = 65
 _BUMPER_MERGE_GAP_X = 90
 _BUMPER_MERGE_GAP_Y = 45
+_BUMPER_MAX_BOX_WIDTH = 170
+_BUMPER_MAX_BOX_HEIGHT = 110
 
 # Center camera playing field ROI (x1, y1, x2, y2) — excludes audience areas
 _BUMPER_FIELD_ROI = (0, 315, 1918, 705)
@@ -4185,6 +4258,89 @@ def _has_large_internal_horizontal_gap(mask_slice: np.ndarray,
             longest_gap = current_gap
 
     return longest_gap >= min_gap_px and (longest_gap / span_width) >= min_gap_fraction
+
+
+def _split_oversized_bumper_box(box: tuple, contour_mask: np.ndarray, color_mask: np.ndarray,
+                                max_width: int = _BUMPER_MAX_BOX_WIDTH,
+                                max_height: int = _BUMPER_MAX_BOX_HEIGHT) -> list:
+    """
+    Break oversized merged boxes into smaller robot-sized boxes.
+
+    Splits along the lowest-signal seam in the original color mask so merged
+    robots are separated before final validation.
+    """
+    pending = [tuple(box)]
+    final_boxes = []
+
+    while pending:
+        x1, y1, x2, y2 = pending.pop(0)
+        box_w = max(0, x2 - x1)
+        box_h = max(0, y2 - y1)
+        if box_w <= max_width and box_h <= max_height:
+            final_boxes.append((x1, y1, x2, y2))
+            continue
+
+        split_vertical = box_w > max_width and (
+            box_h <= max_height or
+            (box_w / max(1, max_width)) >= (box_h / max(1, max_height))
+        )
+
+        signal_slice = color_mask[y1:y2, x1:x2]
+        if signal_slice.size == 0 or cv2.countNonZero(signal_slice) == 0:
+            signal_slice = contour_mask[y1:y2, x1:x2]
+
+        if signal_slice.size == 0:
+            continue
+
+        if split_vertical:
+            projection = np.sum(signal_slice > 0, axis=0)
+            if projection.size < 2:
+                final_boxes.append((x1, y1, x2, y2))
+                continue
+            candidate_offsets = np.arange(1, projection.size)
+            seam_scores = projection[:-1] + projection[1:]
+            midpoint = projection.size / 2.0
+            seam_scores = seam_scores + (np.abs(candidate_offsets - midpoint) * 0.25)
+            split_offset = int(candidate_offsets[np.argmin(seam_scores)])
+            split_x = x1 + split_offset
+            child_boxes = [
+                (x1, y1, split_x, y2),
+                (split_x, y1, x2, y2),
+            ]
+        else:
+            projection = np.sum(signal_slice > 0, axis=1)
+            if projection.size < 2:
+                final_boxes.append((x1, y1, x2, y2))
+                continue
+            candidate_offsets = np.arange(1, projection.size)
+            seam_scores = projection[:-1] + projection[1:]
+            midpoint = projection.size / 2.0
+            seam_scores = seam_scores + (np.abs(candidate_offsets - midpoint) * 0.25)
+            split_offset = int(candidate_offsets[np.argmin(seam_scores)])
+            split_y = y1 + split_offset
+            child_boxes = [
+                (x1, y1, x2, split_y),
+                (x1, split_y, x2, y2),
+            ]
+
+        valid_children = []
+        for child_x1, child_y1, child_x2, child_y2 in child_boxes:
+            if child_x2 <= child_x1 or child_y2 <= child_y1:
+                continue
+            child_signal = color_mask[child_y1:child_y2, child_x1:child_x2]
+            if child_signal.size == 0 or cv2.countNonZero(child_signal) == 0:
+                child_signal = contour_mask[child_y1:child_y2, child_x1:child_x2]
+                if child_signal.size == 0 or cv2.countNonZero(child_signal) == 0:
+                    continue
+            valid_children.append((child_x1, child_y1, child_x2, child_y2))
+
+        if not valid_children:
+            final_boxes.append((x1, y1, x2, y2))
+            continue
+
+        pending = valid_children + pending
+
+    return final_boxes
 
 
 
@@ -4602,47 +4758,51 @@ def detect_robots_by_bumper_color(frame_bgr: np.ndarray, person_mask: np.ndarray
 
             candidate_boxes.append((x, y, x + w, y + h))
 
-        for x1, y1, x2, y2 in _merge_bumper_boxes(candidate_boxes):
-            sensitivity = _bumper_far_corner_sensitivity(
-                x1, y1, x2, y2, roi_x1, roi_y1, roi_x2, roi_y2
-            )
-            min_color_pixels = _BUMPER_MIN_COLOR_PIXELS * (1.0 - 0.45 * sensitivity)
-            fill_ratio_min = max(0.008, 0.015 * (1.0 - 0.35 * sensitivity))
-            allowed_ratio_min = max(0.45, 0.55 - 0.10 * sensitivity)
-            soft_allowed_ratio_min = max(0.65, 0.75 - 0.10 * sensitivity)
-            contour_slice = contour_mask[y1:y2, x1:x2]
-            roi_slice = color_mask[y1:y2, x1:x2]
-            color_pixels = cv2.countNonZero(roi_slice)
-            box_area = max(1, (x2 - x1) * (y2 - y1))
-            fill_ratio = color_pixels / box_area
-            allowed_slice = active_exc_mask_full[y1:y2, x1:x2]
-            allowed_pixels = cv2.countNonZero(allowed_slice)
-            allowed_ratio = allowed_pixels / box_area
+        for merged_box in _merge_bumper_boxes(candidate_boxes):
+            split_boxes = _split_oversized_bumper_box(merged_box, contour_mask, color_mask)
+            for x1, y1, x2, y2 in split_boxes:
+                sensitivity = _bumper_far_corner_sensitivity(
+                    x1, y1, x2, y2, roi_x1, roi_y1, roi_x2, roi_y2
+                )
+                min_color_pixels = _BUMPER_MIN_COLOR_PIXELS * (1.0 - 0.45 * sensitivity)
+                fill_ratio_min = max(0.008, 0.015 * (1.0 - 0.35 * sensitivity))
+                allowed_ratio_min = max(0.45, 0.55 - 0.10 * sensitivity)
+                soft_allowed_ratio_min = max(0.65, 0.75 - 0.10 * sensitivity)
+                contour_slice = contour_mask[y1:y2, x1:x2]
+                roi_slice = color_mask[y1:y2, x1:x2]
+                color_pixels = cv2.countNonZero(roi_slice)
+                box_area = max(1, (x2 - x1) * (y2 - y1))
+                fill_ratio = color_pixels / box_area
+                allowed_slice = active_exc_mask_full[y1:y2, x1:x2]
+                allowed_pixels = cv2.countNonZero(allowed_slice)
+                allowed_ratio = allowed_pixels / box_area
 
-            # Keep robot-sized, color-supported regions while still rejecting sparse noise.
-            if color_pixels < min_color_pixels:
-                continue
-            if fill_ratio < fill_ratio_min and color_pixels < (min_color_pixels * 2):
-                continue
-            if allowed_ratio < allowed_ratio_min:
-                continue
-            if allowed_ratio < soft_allowed_ratio_min and color_pixels < (min_color_pixels * 3):
-                continue
-            if _has_large_internal_horizontal_gap(contour_slice):
-                continue
+                # Keep robot-sized, color-supported regions while still rejecting sparse noise.
+                if (x2 - x1) > _BUMPER_MAX_BOX_WIDTH or (y2 - y1) > _BUMPER_MAX_BOX_HEIGHT:
+                    continue
+                if color_pixels < min_color_pixels:
+                    continue
+                if fill_ratio < fill_ratio_min and color_pixels < (min_color_pixels * 2):
+                    continue
+                if allowed_ratio < allowed_ratio_min:
+                    continue
+                if allowed_ratio < soft_allowed_ratio_min and color_pixels < (min_color_pixels * 3):
+                    continue
+                if _has_large_internal_horizontal_gap(contour_slice):
+                    continue
 
-            raw_bboxes.append((x1, y1, x2, y2))
+                raw_bboxes.append((x1, y1, x2, y2))
 
-            # Convert to normalized 0-1000 format [y1, x1, y2, x2]
-            y1_norm = int(y1 / height * 1000)
-            x1_norm = int(x1 / width * 1000)
-            y2_norm = int(y2 / height * 1000)
-            x2_norm = int(x2 / width * 1000)
+                # Convert to normalized 0-1000 format [y1, x1, y2, x2]
+                y1_norm = int(y1 / height * 1000)
+                x1_norm = int(x1 / width * 1000)
+                y2_norm = int(y2 / height * 1000)
+                x2_norm = int(x2 / width * 1000)
 
-            detections.append({
-                "box_2d": [y1_norm, x1_norm, y2_norm, x2_norm],
-                "label": label
-            })
+                detections.append({
+                    "box_2d": [y1_norm, x1_norm, y2_norm, x2_norm],
+                    "label": label
+                })
     
     bounding_boxes_json = json.dumps(detections)
     return bounding_boxes_json, red_mask, blue_mask, raw_bboxes
