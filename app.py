@@ -397,23 +397,48 @@ def query_side_camera_presence(
     numbers_str = ", ".join(valid_robots)
     side_name = str(camera_side).strip().lower()
     if side_name == "red":
+        valid_positions = {
+            "middle": 1,
+            "right": 2,
+            "far right": 3,
+            "farright": 3,
+        }
         bucket_instructions = (
-            "Use x_bucket 1 for the middle visible lane, x_bucket 2 for the right lane, "
-            "and x_bucket 3 for the farthest-right lane."
+            "Think of the 3 possible positions as 'middle', 'right', and 'far right'. "
+            "Use the JSON field 'position' with one of exactly these values: "
+            "'middle', 'right', or 'far right'."
+        )
+        example_json = (
+            "[{\"team\":\"77235\",\"position\":\"middle\"},"
+            "{\"team\":\"4909\",\"position\":\"right\"},"
+            "{\"team\":\"5962\",\"position\":\"far right\"}]"
         )
     else:
+        valid_positions = {
+            "middle": 1,
+            "left": 2,
+            "far left": 3,
+            "farleft": 3,
+        }
         bucket_instructions = (
-            "Use x_bucket 1 for the middle visible lane, x_bucket 2 for the left lane, "
-            "and x_bucket 3 for the farthest-left lane."
+            "Think of the 3 possible positions as 'middle', 'left', and 'far left'. "
+            "Use the JSON field 'position' with one of exactly these values: "
+            "'middle', 'left', or 'far left'."
+        )
+        example_json = (
+            "[{\"team\":\"77235\",\"position\":\"middle\"},"
+            "{\"team\":\"4909\",\"position\":\"left\"},"
+            "{\"team\":\"5962\",\"position\":\"far left\"}]"
         )
     prompt = (
         f"Which of these robots are visible in this image: {numbers_str}? "
         f"Only identify robots from this list. "
         f"{bucket_instructions} "
         f"Reply with ONLY a JSON array. "
-        f"Each item must be an object with keys 'team' and 'x_bucket'. "
+        f"Each item must be an object with keys 'team' and 'position'. "
+        f"You can return multiple robots. "
         f"Example: "
-        f"[{{\"team\":\"77235\",\"x_bucket\":1}}]. "
+        f"{example_json}. "
         f"If none are visible, reply with []."
     )
     
@@ -460,13 +485,12 @@ def query_side_camera_presence(
                 team = str(item.get("team", "")).strip()
                 if team not in valid_robots or team in seen:
                     continue
-                try:
-                    x_bucket = int(item.get("x_bucket"))
-                except Exception:
+                position = str(item.get("position", "")).strip().lower()
+                position = " ".join(position.split())
+                x_bucket = valid_positions.get(position)
+                if x_bucket is None:
                     continue
-                if x_bucket not in (1, 2, 3):
-                    continue
-                found.append({"team": team, "x_bucket": x_bucket})
+                found.append({"team": team, "position": position, "x_bucket": x_bucket})
                 seen.add(team)
 
             return found
