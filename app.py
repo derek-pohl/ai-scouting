@@ -439,6 +439,7 @@ def query_side_camera_presence(
     prompt = (
         f"Which of these robots are visible in this image: {numbers_str}? "
         f"Only identify robots from this list. "
+        f"You do not need to find every robot from the list; return only the ones you actually see. "
         f"{bucket_instructions} "
         f"Reply with ONLY a JSON array. "
         f"Each item must be an object with keys 'team' and 'position'. "
