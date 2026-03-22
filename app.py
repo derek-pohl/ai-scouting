@@ -406,7 +406,9 @@ def query_side_camera_presence(
         bucket_instructions = (
             "Think of the 3 possible positions as 'middle', 'right', and 'far right'. "
             "Use the JSON field 'position' with one of exactly these values: "
-            "'middle', 'right', or 'far right'."
+            "'middle', 'right', or 'far right'. "
+            "Each robot can appear in only one position, so do not assign multiple positions to the same team. "
+            "Use 'far right' only if the robot is truly in the far-right edge lane, not merely somewhat right of center."
         )
         example_json = (
             "[{\"team\":\"77235\",\"position\":\"middle\"},"
@@ -423,7 +425,9 @@ def query_side_camera_presence(
         bucket_instructions = (
             "Think of the 3 possible positions as 'middle', 'left', and 'far left'. "
             "Use the JSON field 'position' with one of exactly these values: "
-            "'middle', 'left', or 'far left'."
+            "'middle', 'left', or 'far left'. "
+            "Each robot can appear in only one position, so do not assign multiple positions to the same team. "
+            "Use 'far left' only if the robot is truly in the far-left edge lane, not merely somewhat left of center."
         )
         example_json = (
             "[{\"team\":\"77235\",\"position\":\"middle\"},"
