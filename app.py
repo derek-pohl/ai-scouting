@@ -361,113 +361,17 @@ def query_local_llm_batch(
     return [r if r is not None else "unknown" for r in results]
 
 
-def label_robot_bboxes_with_local_llm(raw_bboxes: list,
-                                      pil_frame: Image.Image,
-                                      available_numbers: list,
-                                      robot_label_tracker: RobotLabelTracker = None,
-                                      crop_padding: int = 50) -> list:
-    """Label robot crops with the local LLM while preserving track identity across frames."""
-    if not raw_bboxes:
-        return []
-
-    available_numbers = [
-        str(n).strip()
-        for n in (available_numbers or [])
-        if n is not None and str(n).strip()
-    ]
-    img_width, img_height = pil_frame.size
-
-    if available_numbers and robot_label_tracker:
-        tracked_labels, needs_query = robot_label_tracker.check_needs_llm(raw_bboxes)
-        if len(tracked_labels) != len(raw_bboxes) or len(needs_query) != len(raw_bboxes):
-            print(
-                f"[Bumper+LLM] Length mismatch: raw_bboxes={len(raw_bboxes)}, "
-                f"tracked_labels={len(tracked_labels)}, needs_query={len(needs_query)}. "
-                "Padding to stay aligned."
-            )
-            tracked_labels = (list(tracked_labels) + [None] * len(raw_bboxes))[:len(raw_bboxes)]
-            needs_query = (list(needs_query) + [True] * len(raw_bboxes))[:len(raw_bboxes)]
-
-        skipped = sum(1 for n in needs_query if not n)
-        if skipped > 0:
-            print(f"[Bumper+LLM] Skipping {skipped}/{len(needs_query)} robots (confident tracking)")
-
-        llm_queries = []
-        llm_indices = []
-        for i, bbox in enumerate(raw_bboxes):
-            if not needs_query[i]:
-                continue
-            x1, y1, x2, y2 = bbox
-            cx1 = max(0, x1 - crop_padding)
-            cy1 = max(0, y1 - crop_padding)
-            cx2 = min(img_width, x2 + crop_padding)
-            cy2 = min(img_height, y2 + crop_padding)
-            cropped = pil_frame.crop((cx1, cy1, cx2, cy2))
-            llm_queries.append({
-                'cropped_image': cropped,
-                'available_numbers': available_numbers,
-                'previous_label': tracked_labels[i] if tracked_labels[i] else None
-            })
-            llm_indices.append(i)
-
-        if llm_queries:
-            print(f"[Bumper+LLM] Querying {len(llm_queries)} robots via local LLM...")
-            parallel_results = query_local_llm_batch(
-                llm_queries,
-                max_workers=min(50, len(llm_queries))
-            )
-        else:
-            parallel_results = []
-
-        all_labels = []
-        parallel_idx = 0
-        for i in range(len(raw_bboxes)):
-            if needs_query[i]:
-                all_labels.append(parallel_results[parallel_idx])
-                parallel_idx += 1
-            else:
-                all_labels.append(tracked_labels[i])
-
-        return robot_label_tracker.update(raw_bboxes, all_labels)
-
-    return ["robot"] * len(raw_bboxes)
-
-
-def query_side_camera_presence(
-    frame_image: Image.Image,
-    alliance_robots: list,
+def _query_single_side_camera_robot(
+    img_base64: str,
+    robot_team: str,
     camera_side: str = "blue",
     timeout: float = 60.0
-) -> list:
-    """
-    Query local LMStudio to determine which alliance robots are visible in a side camera frame
-    and which of the 3 side-camera position buckets each robot occupies.
-    
-    Args:
-        frame_image: PIL Image of the full side camera frame
-        alliance_robots: List of team numbers for this alliance (up to 3)
-        camera_side: "blue" or "red" side camera, used for response ordering
-        timeout: Request timeout in seconds
-        
-    Returns:
-        List of dicts like
-        [{'team': '1234', 'description': 'low robot near left wall', 'position': 'left', 'x_bucket': 2}]
-    """
-    if not LMSTUDIO_ENABLED:
-        return []
-    
-    # Filter out empty/None robot numbers
-    valid_robots = [str(r).strip() for r in alliance_robots if r and str(r).strip()]
-    if not valid_robots:
-        return []
-    
-    # Convert image to base64
-    buffered = BytesIO()
-    frame_image.save(buffered, format="JPEG", quality=85)
-    img_base64 = base64.b64encode(buffered.getvalue()).decode('utf-8')
-    
-    # Build prompt
-    numbers_str = ", ".join(valid_robots)
+) -> dict:
+    """Ask the side-camera LLM about one specific robot and return its position if visible."""
+    team = str(robot_team).strip()
+    if not team:
+        return None
+
     side_name = str(camera_side).strip().lower()
     if side_name == "red":
         valid_positions = {
@@ -477,17 +381,16 @@ def query_side_camera_presence(
             "farright": 3,
         }
         bucket_instructions = (
-            "Assign each to one position: 'middle', 'right', or 'far right': "
+            "Assign this robot to one position: 'middle', 'right', or 'far right'. "
             "Default to 'middle' if between middle and right. "
             "Use 'right' only if clearly in the right lane but not at the edge. "
             "Use 'far right' only if at the extreme right lane or against the wall. "
-            "Base decisions on visual evidence (guide-box, lane, wall, center) and compare nearby boxes when helpful. "
-            "Each robot may appear only once; prefer at most one per box."
+            "Base decisions on visual evidence (guide-box, lane, wall, center) and compare nearby boxes when helpful."
         )
         example_json = (
-            "[{\"team\":\"77235\",\"description\":\"This robot sits mainly inside the middle guide box and is not close enough to the right wall to count as right, so I placed it in middle.\",\"position\":\"middle\"},"
-            "{\"team\":\"4909\",\"description\":\"This robot is shifted into the right-side lane and aligns better with the right guide box than the middle one, but it is not extreme enough to be far right.\",\"position\":\"right\"},"
-            "{\"team\":\"5962\",\"description\":\"This robot is pushed all the way against the far-right edge lane near the wall, clearly beyond the normal right box, so it belongs in far right.\",\"position\":\"far right\"}]"
+            f"[{{\"team\":\"{team}\","
+            "\"description\":\"This robot is shifted into the right-side lane and aligns better with the right guide box than the middle one, but it is not extreme enough to be far right.\","
+            "\"position\":\"right\"}}]"
         )
     else:
         valid_positions = {
@@ -497,31 +400,29 @@ def query_side_camera_presence(
             "farleft": 3,
         }
         bucket_instructions = (
-            "Assign each to one position: 'middle', 'left', or 'far left': "
+            "Assign this robot to one position: 'middle', 'left', or 'far left'. "
             "Default to 'middle' if between middle and left. "
             "Use 'left' only if clearly in the left lane but not at the edge. "
             "Use 'far left' only if at the extreme left lane or against the wall. "
-            "Base decisions on visual evidence (guide-box, lane, wall, center) and compare nearby boxes when helpful. "
-            "Each robot may appear only once; prefer at most one per box."
+            "Base decisions on visual evidence (guide-box, lane, wall, center) and compare nearby boxes when helpful."
         )
         example_json = (
-            "[{\"team\":\"77235\",\"description\":\"This robot sits mainly inside the middle guide box and is not close enough to the left wall to count as left, so I placed it in middle.\",\"position\":\"middle\"},"
-            "{\"team\":\"4909\",\"description\":\"This robot is shifted into the left-side lane and aligns better with the left guide box than the middle one, but it is not extreme enough to be far left.\",\"position\":\"left\"},"
-            "{\"team\":\"5962\",\"description\":\"This robot is pushed all the way against the far-left edge lane near the wall, clearly beyond the normal left box, so it belongs in far left.\",\"position\":\"far left\"}]"
+            f"[{{\"team\":\"{team}\","
+            "\"description\":\"This robot is shifted into the left-side lane and aligns better with the left guide box than the middle one, but it is not extreme enough to be far left.\","
+            "\"position\":\"left\"}}]"
         )
+
     prompt = (
-        f"Which robots from {numbers_str} are visible in this image? "
-        f"Only include robots you actually see. "
-        f"Not all robots in the list must be detected. "
+        f"Where is robot {team} in this image? "
+        f"Only answer for robot {team}. "
         f"{bucket_instructions} "
         f"Reply with ONLY a JSON array. "
-        f"Return ONLY a JSON array of objects with keys in this order: 'team', 'description', 'position'. "
+        f"Return either [] if robot {team} is not visible, or a one-item JSON array with keys in this order: 'team', 'description', 'position'. "
         f"Descriptions should be 1-2 sentences describing where the robot is in the frame. "
-        f"Example: "
-        f"{example_json}. "
-        f"If none are visible, reply with []."
+        f"Example if visible: {example_json}. "
+        f"If robot {team} is not visible, return []."
     )
-    
+
     try:
         response = requests.post(
             LMSTUDIO_URL,
@@ -539,60 +440,118 @@ def query_side_camera_presence(
             },
             timeout=timeout
         )
-        
-        if response.status_code == 200:
-            result = response.json()
-            answer = result.get("choices", [{}])[0].get("message", {}).get("content", "").strip()
-            print(f"[LMStudio Side Presence {side_name}] Raw response: {answer}")
-            
-            if "none" in answer.lower():
-                return []
 
-            try:
-                parsed = json.loads(parse_json(answer))
-            except Exception:
-                print(f"[Side Camera LLM] Could not parse JSON: {answer}")
-                return []
+        if response.status_code != 200:
+            print(f"[Side Camera LLM] Error for {team}: {response.status_code}")
+            return None
 
-            if not isinstance(parsed, list):
-                return []
+        result = response.json()
+        answer = result.get("choices", [{}])[0].get("message", {}).get("content", "").strip()
+        print(f"[LMStudio Side Presence {side_name}] Raw response for {team}: {answer}")
 
-            found = []
-            seen = set()
-            for item in parsed:
-                if not isinstance(item, dict):
-                    continue
-                team = str(item.get("team", "")).strip()
-                if team not in valid_robots or team in seen:
-                    continue
-                description = " ".join(str(item.get("description", "")).strip().split())
-                position = str(item.get("position", "")).strip().lower()
-                position = " ".join(position.split())
-                x_bucket = valid_positions.get(position)
-                if x_bucket is None:
-                    continue
-                found.append({
-                    "team": team,
-                    "description": description,
-                    "position": position,
-                    "x_bucket": x_bucket
-                })
-                seen.add(team)
+        if not answer or answer.strip() == "[]" or "none" in answer.lower():
+            return None
 
-            return found
-        else:
-            print(f"[Side Camera LLM] Error: {response.status_code}")
-            return []
-            
+        try:
+            parsed = json.loads(parse_json(answer))
+        except Exception:
+            print(f"[Side Camera LLM] Could not parse JSON for {team}: {answer}")
+            return None
+
+        if isinstance(parsed, dict):
+            parsed = [parsed]
+        if not isinstance(parsed, list):
+            return None
+
+        for item in parsed:
+            if not isinstance(item, dict):
+                continue
+            returned_team = str(item.get("team", "")).strip() or team
+            if returned_team != team:
+                continue
+            description = " ".join(str(item.get("description", "")).strip().split())
+            position = str(item.get("position", "")).strip().lower()
+            position = " ".join(position.split())
+            x_bucket = valid_positions.get(position)
+            if x_bucket is None:
+                continue
+            return {
+                "team": team,
+                "description": description,
+                "position": position,
+                "x_bucket": x_bucket
+            }
+
+        return None
     except requests.exceptions.Timeout:
-        print("[Side Camera LLM] Timeout")
-        return []
+        print(f"[Side Camera LLM] Timeout for {team}")
+        return None
     except requests.exceptions.ConnectionError:
         print("[Side Camera LLM] Not available")
-        return []
+        return None
     except Exception as e:
-        print(f"[Side Camera LLM] Error: {e}")
+        print(f"[Side Camera LLM] Error for {team}: {e}")
+        return None
+
+
+def query_side_camera_presence(
+    frame_image: Image.Image,
+    alliance_robots: list,
+    camera_side: str = "blue",
+    timeout: float = 60.0
+) -> list:
+    """
+    Query local LMStudio one robot at a time to determine which alliance robots
+    are visible in a side camera frame and which of the 3 side-camera position
+    buckets each visible robot occupies.
+
+    Args:
+        frame_image: PIL Image of the full side camera frame
+        alliance_robots: List of team numbers for this alliance (up to 3)
+        camera_side: "blue" or "red" side camera, used for response ordering
+        timeout: Request timeout in seconds
+
+    Returns:
+        List of dicts like
+        [{'team': '1234', 'description': 'low robot near left wall', 'position': 'left', 'x_bucket': 2}]
+    """
+    if not LMSTUDIO_ENABLED:
         return []
+
+    valid_robots = [str(r).strip() for r in alliance_robots if r and str(r).strip()]
+    if not valid_robots:
+        return []
+
+    buffered = BytesIO()
+    frame_image.save(buffered, format="JPEG", quality=85)
+    img_base64 = base64.b64encode(buffered.getvalue()).decode('utf-8')
+
+    results = [None] * len(valid_robots)
+
+    def query_single(idx: int, team: str) -> tuple:
+        return idx, _query_single_side_camera_robot(
+            img_base64,
+            team,
+            camera_side=camera_side,
+            timeout=timeout
+        )
+
+    max_workers = min(3, len(valid_robots))
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        futures = {
+            executor.submit(query_single, idx, team): idx
+            for idx, team in enumerate(valid_robots)
+        }
+        for future in as_completed(futures):
+            idx = futures[future]
+            try:
+                result_idx, found = future.result()
+                results[result_idx] = found
+            except Exception as e:
+                print(f"[Side Camera LLM] Parallel query {valid_robots[idx]} failed: {e}")
+                results[idx] = None
+
+    return [item for item in results if item]
 
 
 # Hidden robot bounding box positions on center camera (reference coords 1918x709)
@@ -658,11 +617,8 @@ def inject_hidden_robot_bboxes(base_bboxes_json: str, persistent_hidden_robots: 
             center_detected_labels.add(lbl)
 
     updated_hidden = dict(persistent_hidden_robots or {})
-
-    for robot_label in center_detected_labels:
-        hidden_meta = dict(updated_hidden.get(robot_label, {}))
-        hidden_meta['last_center_seen_frame'] = frame_count
-        updated_hidden[robot_label] = hidden_meta
+    latest_side_frame_by_side = {}
+    seen_on_latest_side_frame = {"blue": set(), "red": set()}
 
     for side_name in ('blue', 'red'):
         side_data = side_camera_visible_robots.get(side_name, {}) if side_camera_visible_robots else {}
@@ -679,6 +635,8 @@ def inject_hidden_robot_bboxes(base_bboxes_json: str, persistent_hidden_robots: 
         if latest_side_frame is None:
             continue
 
+        latest_side_frame_by_side[side_name] = latest_side_frame
+
         side_visible = side_data[latest_side_frame]
         for item in side_visible:
             if not isinstance(item, dict):
@@ -691,30 +649,46 @@ def inject_hidden_robot_bboxes(base_bboxes_json: str, persistent_hidden_robots: 
 
             if not robot_label or x_bucket not in (1, 2, 3):
                 continue
+            if robot_label in center_detected_labels:
+                continue
 
-            hidden_meta = dict(updated_hidden.get(robot_label, {}))
-            hidden_meta.update({
+            seen_on_latest_side_frame[side_name].add(robot_label)
+
+            updated_hidden[robot_label] = {
                 'side': side_name,
                 'x_bucket': x_bucket,
                 'last_side_seen_frame': latest_side_frame
-            })
-            updated_hidden[robot_label] = hidden_meta
+            }
+
+    for robot_label in list(updated_hidden.keys()):
+        if robot_label in center_detected_labels:
+            del updated_hidden[robot_label]
+            continue
+
+        hidden_meta = updated_hidden[robot_label]
+        side_name = hidden_meta.get('side')
+        x_bucket = hidden_meta.get('x_bucket')
+        last_side_seen_frame = hidden_meta.get('last_side_seen_frame')
+
+        if side_name in seen_on_latest_side_frame and robot_label in seen_on_latest_side_frame[side_name]:
+            continue
+
+        latest_side_frame = latest_side_frame_by_side.get(side_name)
+        if latest_side_frame is None:
+            del updated_hidden[robot_label]
+            continue
+
+        if x_bucket == 3 and last_side_seen_frame is not None:
+            age = frame_count - last_side_seen_frame
+            if age <= edge_persist_frames:
+                continue
+
+        del updated_hidden[robot_label]
 
     injected_bboxes = list(center_bboxes)
     slot_counts = {}
     ordered_hidden = sorted(
-        [
-            (robot_label, meta)
-            for robot_label, meta in updated_hidden.items()
-            if robot_label not in center_detected_labels
-            and meta.get('side') in ('blue', 'red')
-            and meta.get('x_bucket') in (1, 2, 3)
-            and meta.get('last_side_seen_frame') is not None
-            and meta.get('last_side_seen_frame') > (
-                meta.get('last_center_seen_frame')
-                if meta.get('last_center_seen_frame') is not None else -1
-            )
-        ],
+        updated_hidden.items(),
         key=lambda item: (
             0 if item[1].get('side') == "blue" else 1,
             item[1].get('x_bucket', 99),
@@ -800,92 +774,10 @@ def _get_side_camera_zone_rects(camera_side: str, frame_width: int, frame_height
     return rects
 
 
-def _side_camera_bucket_for_bbox(x1: int, y1: int, x2: int, y2: int,
-                                 camera_side: str,
-                                 frame_width: int, frame_height: int) -> tuple:
-    """Assign a side-camera bbox to the nearest guide box."""
-    rects = _get_side_camera_zone_rects(camera_side, frame_width, frame_height)
-    if not rects:
-        return None, None
-
-    cx = (x1 + x2) / 2.0
-    cy = (y1 + y2) / 2.0
-    best = None
-
-    for label, (zx1, zy1, zx2, zy2) in rects:
-        overlap_w = max(0, min(x2, zx2) - max(x1, zx1))
-        overlap_h = max(0, min(y2, zy2) - max(y1, zy1))
-        overlap_area = overlap_w * overlap_h
-        center_inside = zx1 <= cx <= zx2 and zy1 <= cy <= zy2
-        zone_cx = (zx1 + zx2) / 2.0
-        zone_cy = (zy1 + zy2) / 2.0
-        center_dist = abs(cx - zone_cx) + (abs(cy - zone_cy) * 0.1)
-        candidate = (1 if center_inside else 0, overlap_area, -center_dist, label)
-        if best is None or candidate > best:
-            best = candidate
-
-    label = best[3] if best else None
-    if not label:
-        return None, None
-
-    position = label.strip().lower()
-    bucket_lookup = {
-        "middle": 1,
-        "left": 2,
-        "right": 2,
-        "far left": 3,
-        "far right": 3,
-    }
-    return position, bucket_lookup.get(position)
-
-
-def build_side_camera_visible_robots(raw_bboxes: list, labels: list,
-                                     camera_side: str,
-                                     frame_width: int, frame_height: int) -> list:
-    """Convert labeled side-camera detections into bucketed visibility entries."""
-    best_by_team = {}
-    unknown_labels = {"robot", "unknown", "Unknown", ""}
-
-    for bbox, label in zip(raw_bboxes or [], labels or []):
-        team = str(label).strip()
-        if team in unknown_labels:
-            continue
-        if not bbox or len(bbox) < 4:
-            continue
-
-        x1, y1, x2, y2 = bbox
-        position, x_bucket = _side_camera_bucket_for_bbox(
-            x1, y1, x2, y2, camera_side, frame_width, frame_height
-        )
-        if x_bucket not in (1, 2, 3):
-            continue
-
-        bbox_area = max(1, (x2 - x1) * (y2 - y1))
-        entry = {
-            "team": team,
-            "position": position,
-            "x_bucket": x_bucket,
-            "bbox": [int(x1), int(y1), int(x2), int(y2)],
-            "bbox_area": bbox_area,
-        }
-
-        old = best_by_team.get(team)
-        if old is None or bbox_area > old["bbox_area"]:
-            best_by_team[team] = entry
-
-    return [
-        {
-            "team": item["team"],
-            "position": item["position"],
-            "x_bucket": item["x_bucket"],
-        }
-        for item in sorted(best_by_team.values(), key=lambda item: (item["x_bucket"], item["team"]))
-    ]
-
-
 def annotate_side_camera_guides(frame: Image.Image, camera_side: str) -> Image.Image:
     """
-    Draw lightweight side-camera lane guides for bucketed side-camera robot positions.
+    Draw lightweight side-camera lane guides to help the local LLM reason about
+    middle / left / right / far-left / far-right positions.
     """
     if frame is None:
         return frame
@@ -3716,8 +3608,8 @@ _BUMPER_FIELD_ROI = (0, 315, 1918, 705)
 
 def _build_center_blue_mask(field_region_bgr: np.ndarray, hsv_region: np.ndarray) -> np.ndarray:
     """
-    Detect blue bumpers, including dark navy shades such as rgb(18, 21, 38),
-    while rejecting nearly neutral black structures.
+    Detect center-camera blue bumpers, including dark navy shades such as
+    rgb(18, 21, 38), while rejecting nearly neutral black structures.
     """
     base_blue_mask = cv2.inRange(hsv_region, _BUMPER_BLUE_LOWER, _BUMPER_BLUE_UPPER)
     dark_blue_mask = cv2.inRange(hsv_region, _BUMPER_DARK_BLUE_LOWER, _BUMPER_DARK_BLUE_UPPER)
@@ -3745,13 +3637,6 @@ def _build_center_blue_mask(field_region_bgr: np.ndarray, hsv_region: np.ndarray
 
     blue_gate = np.where(blue_dominant & ~near_black_structure, 255, 0).astype(np.uint8)
     return cv2.bitwise_and(cv2.bitwise_or(base_blue_mask, dark_blue_mask), blue_gate)
-
-
-def _get_bumper_field_roi(camera_side: str, frame_width: int, frame_height: int) -> tuple:
-    """Return the robot-detection ROI for the given camera."""
-    if str(camera_side).strip().lower() == "center":
-        return _get_calibrated_field_roi()
-    return 0, 0, frame_width, frame_height
 
 
 def _bumper_far_corner_sensitivity(x1: int, y1: int, x2: int, y2: int,
@@ -3908,10 +3793,9 @@ def _has_large_internal_horizontal_gap(mask_slice: np.ndarray,
 
 def compute_field_pixel_mask(video_path: str, start_seconds: float = 0,
                              sample_fps: float = 3.0,
-                             threshold: float = 0.40,
-                             camera_side: str = "center") -> np.ndarray:
+                             threshold: float = 0.40) -> np.ndarray:
     """
-    Pre-scan a camera video to build a per-pixel field exclusion mask.
+    Pre-scan the center camera video to build a per-pixel field exclusion mask.
 
     Any pixel in the field ROI that is red or blue in >= `threshold` fraction of
     sampled frames is considered a static field element and will be excluded from
@@ -3919,20 +3803,19 @@ def compute_field_pixel_mask(video_path: str, start_seconds: float = 0,
     (robots may still be settling into position).
 
     Args:
-        video_path: Path to the camera video file.
+        video_path: Path to the center camera video file.
         start_seconds: Global start offset already applied to the video (so we
                        skip an additional 3 s on top of this).
         sample_fps: How many frames per second to sample (default 3).
         threshold: Fraction of frames a pixel must be red/blue to be excluded.
-        camera_side: "center", "blue", or "red".
 
     Returns:
         Binary mask the same size as the field ROI (h, w) where
         0 = excluded (field element) and 255 = allowed (potential robot).
     """
-    roi_x1 = roi_y1 = 0
-    roi_x2 = roi_y2 = 1
-    roi_h = roi_w = 1
+    roi_x1, roi_y1, roi_x2, roi_y2 = _get_calibrated_field_roi()
+    roi_h = roi_y2 - roi_y1
+    roi_w = roi_x2 - roi_x1
 
     cap = cv2.VideoCapture(video_path)
     if not cap.isOpened():
@@ -3941,18 +3824,13 @@ def compute_field_pixel_mask(video_path: str, start_seconds: float = 0,
 
     original_fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
     total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-    frame_width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)) or 1
-    frame_height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT)) or 1
-    roi_x1, roi_y1, roi_x2, roi_y2 = _get_bumper_field_roi(camera_side, frame_width, frame_height)
-    roi_h = max(1, roi_y2 - roi_y1)
-    roi_w = max(1, roi_x2 - roi_x1)
 
     # Skip the first 3 seconds (on top of any user-specified start offset)
     skip_seconds = 3.0
     first_valid_frame = int((start_seconds + skip_seconds) * original_fps)
     sample_interval = max(1, int(original_fps / sample_fps))
 
-    # ROI already computed above via _get_bumper_field_roi()
+    # ROI already computed above via _get_calibrated_field_roi()
 
     # Accumulators (float32 to avoid overflow for long videos)
     red_blue_count = np.zeros((roi_h, roi_w), dtype=np.float32)
@@ -4136,8 +4014,7 @@ def _build_robot_exclusion_mask(polygons: list, frame_width: int, frame_height: 
 
 def detect_robots_by_bumper_color(frame_bgr: np.ndarray, person_mask: np.ndarray = None,
                                   field_pixel_mask: np.ndarray = None,
-                                  robot_exclusion_polygons: list = None,
-                                  camera_side: str = "center") -> tuple:
+                                  robot_exclusion_polygons: list = None) -> tuple:
     """
     Detect robots by finding red and blue bumper regions using HSV color matching.
     
@@ -4146,11 +4023,10 @@ def detect_robots_by_bumper_color(frame_bgr: np.ndarray, person_mask: np.ndarray
     plus raw masks for visual highlighting.
     
     Args:
-        frame_bgr: OpenCV BGR image
+        frame_bgr: OpenCV BGR image (center camera frame)
         person_mask: Optional binary mask of detected people (255 = person, 0 = not)
         field_pixel_mask: Optional per-pixel exclusion mask from compute_field_pixel_mask().
         robot_exclusion_polygons: Optional list of user-drawn no-scan polygons in frame coordinates.
-        camera_side: "center", "blue", or "red".
         
     Returns:
         Tuple of (bounding_boxes_json, red_mask, blue_mask):
@@ -4158,9 +4034,9 @@ def detect_robots_by_bumper_color(frame_bgr: np.ndarray, person_mask: np.ndarray
         - red_mask: Binary mask of red bumper pixels
         - blue_mask: Binary mask of blue bumper pixels
     """
+    # Crop to playing field ROI (calibration-adjusted) to exclude audience areas
+    roi_x1, roi_y1, roi_x2, roi_y2 = _get_calibrated_field_roi()
     h_full, w_full = frame_bgr.shape[:2]
-    # Crop to the robot-detection ROI (calibration-adjusted for center, full frame for side cameras)
-    roi_x1, roi_y1, roi_x2, roi_y2 = _get_bumper_field_roi(camera_side, w_full, h_full)
     # Clamp ROI to actual frame dimensions
     roi_x1 = max(0, min(roi_x1, w_full))
     roi_y1 = max(0, min(roi_y1, h_full))
@@ -4515,7 +4391,7 @@ def process_single_video(video_path: str, camera_side: str = "blue", target_fps:
         progress: Gradio progress tracker
         camera_name: Display name for the camera (e.g., "Blue Camera")
         side_camera_visible_robots: Dict of side camera visibility data (for center camera hidden robot injection)
-            Format: {'blue': {frame_num: [{'team': str, 'position': str, 'x_bucket': int}]}, ...}
+            Format: {'blue': {frame_num: [robot_labels]}, 'red': {frame_num: [robot_labels]}}
         
     Returns:
         Tuple of (output_video_path, robot_tracks, tracks_by_frame, width, height, robot_stats, ferry_counts, disabled_statuses, shot_events, side_visible_robots)
@@ -4581,7 +4457,7 @@ def process_single_video(video_path: str, camera_side: str = "blue", target_fps:
     
     # Calculate frame intervals
     # Robot detection at user-specified FPS
-    # Side cameras stay at a fixed 3 FPS for bumper detection / OCR
+    # Side cameras query the LLM at a fixed 3 FPS regardless of center camera setting
     if camera_side in ("blue", "red"):
         robot_frame_interval = max(1, int(original_fps / 3.0))
     else:
@@ -4665,16 +4541,12 @@ def process_single_video(video_path: str, camera_side: str = "blue", target_fps:
     # Store latest robot detection for use with ball frames
     current_bboxes_json = "[]"
     
-    # Pre-compute field pixel mask for bumper detection
+    # Pre-compute field pixel mask for bumper detection (center camera only)
     field_pixel_mask = None
-    if enable_robot_detection:
+    if camera_side == "center":
         if progress is not None:
             progress(0, desc="Scanning video to build field pixel mask...")
-        field_pixel_mask = compute_field_pixel_mask(
-            video_path,
-            start_seconds=start_seconds,
-            camera_side=camera_side
-        )
+        field_pixel_mask = compute_field_pixel_mask(video_path, start_seconds=start_seconds)
     
     # Bumper detection masks (stored for rendering on ball frames)
     current_bumper_red_mask = None
@@ -4683,8 +4555,8 @@ def process_single_video(video_path: str, camera_side: str = "blue", target_fps:
     # Person detection state (stored for rendering and bumper exclusion)
     current_person_mask = None
     
-    # Side-camera visibility data for hidden-robot injection
-    # Maps frame_number -> list of {'team', 'position', 'x_bucket'}
+    # Side camera LLM visibility data (for side cameras in bumper mode)
+    # Maps frame_number -> list of visible robot labels
     side_visible_robots_by_frame = {}
     
     # Robot label tracker for YOLO + LLM mode (maintains identity across frames)
@@ -4721,74 +4593,89 @@ def process_single_video(video_path: str, camera_side: str = "blue", target_fps:
             
             # Bumper detection
             if camera_side in ("blue", "red"):
-                # Side camera: bumper detection + OCR labeling + side-box bucketing
+                # Side camera: LLM presence query (no bounding boxes)
                 alliance_robots = blue_robots if camera_side == "blue" else red_robots
-                color_bboxes_json, current_bumper_red_mask, current_bumper_blue_mask, raw_bboxes = detect_robots_by_bumper_color(
-                    frame,
-                    field_pixel_mask=field_pixel_mask,
-                    camera_side=camera_side
-                )
-                try:
-                    color_detections = json.loads(parse_json(color_bboxes_json))
-                except Exception:
-                    color_detections = []
-
-                alliance_color = str(camera_side).strip().lower()
-                alliance_raw_bboxes = [
-                    bbox for bbox, det in zip(raw_bboxes, color_detections)
-                    if str(det.get("label", "")).strip().lower() == alliance_color
-                ]
-
-                final_labels = label_robot_bboxes_with_local_llm(
-                    alliance_raw_bboxes,
-                    pil_frame,
+                guided_pil_frame = annotate_side_camera_guides(pil_frame, camera_side)
+                visible_robots = query_side_camera_presence(
+                    guided_pil_frame,
                     alliance_robots,
-                    robot_label_tracker
-                )
-
-                detections = []
-                for i, (x1, y1, x2, y2) in enumerate(alliance_raw_bboxes):
-                    y1_norm = int((y1 / height) * 1000)
-                    x1_norm = int((x1 / width) * 1000)
-                    y2_norm = int((y2 / height) * 1000)
-                    x2_norm = int((x2 / width) * 1000)
-                    detections.append({
-                        "box_2d": [y1_norm, x1_norm, y2_norm, x2_norm],
-                        "label": final_labels[i] if i < len(final_labels) else "robot"
-                    })
-                bounding_boxes_json = json.dumps(detections)
-
-                visible_robots = build_side_camera_visible_robots(
-                    alliance_raw_bboxes,
-                    final_labels,
-                    camera_side,
-                    width,
-                    height
+                    camera_side=camera_side
                 )
                 side_visible_robots_by_frame[frame_count] = visible_robots
                 if visible_robots:
-                    print(f"[Side Camera Bumper] {camera_name} sees robots: {visible_robots}")
+                    print(f"[Side Camera LLM] {camera_name} sees robots: {visible_robots}")
+                bounding_boxes_json = "[]"
             else:
                 # Center camera: bumper color detection + LLM labeling
                 _, current_bumper_red_mask, current_bumper_blue_mask, raw_bboxes = detect_robots_by_bumper_color(
                     frame,
                     person_mask=current_person_mask,
                     field_pixel_mask=field_pixel_mask,
-                    robot_exclusion_polygons=robot_exclusion_polygons,
-                    camera_side=camera_side
+                    robot_exclusion_polygons=robot_exclusion_polygons
                 )
                 
+                # Get frame dimensions for crop clamping
+                img_height, img_width = frame.shape[:2]
+                
                 # Use RobotLabelTracker + local LLM OCR to assign team numbers
-                final_labels = label_robot_bboxes_with_local_llm(
-                    raw_bboxes,
-                    pil_frame,
-                    robot_numbers,
-                    robot_label_tracker
-                )
+                if robot_numbers and robot_label_tracker and raw_bboxes:
+                    tracked_labels, needs_query = robot_label_tracker.check_needs_llm(raw_bboxes)
+                    if len(tracked_labels) != len(raw_bboxes) or len(needs_query) != len(raw_bboxes):
+                        print(
+                            f"[Bumper+LLM] Length mismatch: raw_bboxes={len(raw_bboxes)}, "
+                            f"tracked_labels={len(tracked_labels)}, needs_query={len(needs_query)}. "
+                            "Padding to stay aligned."
+                        )
+                        tracked_labels = (list(tracked_labels) + [None] * len(raw_bboxes))[:len(raw_bboxes)]
+                        needs_query = (list(needs_query) + [True] * len(raw_bboxes))[:len(raw_bboxes)]
+                    
+                    skipped = sum(1 for n in needs_query if not n)
+                    if skipped > 0:
+                        print(f"[Bumper+LLM] Skipping {skipped}/{len(needs_query)} robots (confident tracking)")
+                    
+                    # Collect crops for robots that need OCR
+                    llm_queries = []
+                    llm_indices = []
+                    for i, bbox in enumerate(raw_bboxes):
+                        if needs_query[i]:
+                            x1, y1, x2, y2 = bbox
+                            # Expand crop: 50px on each side
+                            cx1 = max(0, x1 - 50)
+                            cy1 = max(0, y1 - 50)
+                            cx2 = min(img_width, x2 + 50)
+                            cy2 = min(img_height, y2 + 50)
+                            cropped = pil_frame.crop((cx1, cy1, cx2, cy2))
+                            llm_queries.append({
+                                'cropped_image': cropped,
+                                'available_numbers': robot_numbers,
+                                'previous_label': tracked_labels[i] if tracked_labels[i] else None
+                            })
+                            llm_indices.append(i)
+                    
+                    # Send all OCR queries to local LLM in parallel
+                    if llm_queries:
+                        print(f"[Bumper+LLM] Querying {len(llm_queries)} robots via local LLM...")
+                        parallel_results = query_local_llm_batch(llm_queries, max_workers=min(50, len(llm_queries)))
+                    else:
+                        parallel_results = []
+                    
+                    # Build labels combining tracked + OCR results
+                    all_labels = []
+                    parallel_idx = 0
+                    for i in range(len(raw_bboxes)):
+                        if needs_query[i]:
+                            all_labels.append(parallel_results[parallel_idx])
+                            parallel_idx += 1
+                        else:
+                            all_labels.append(tracked_labels[i])
+                    
+                    # Update tracker for identity persistence
+                    final_labels = robot_label_tracker.update(raw_bboxes, all_labels)
+                else:
+                    final_labels = ["robot"] * len(raw_bboxes)
                 
                 # Rebuild bounding_boxes_json with team number labels
                 detections = []
-                img_height, img_width = frame.shape[:2]
 
                 for i, (x1, y1, x2, y2) in enumerate(raw_bboxes):
                     y1_norm = int((y1 / img_height) * 1000)
@@ -4859,14 +4746,13 @@ def process_single_video(video_path: str, camera_side: str = "blue", target_fps:
             
             # Draw bounding boxes with alliance colors (for robots) - only if robot detection enabled
             annotated_frame = pil_frame.copy()
+            if camera_side in ("blue", "red"):
+                annotated_frame = annotate_side_camera_guides(annotated_frame, camera_side)
             if enable_robot_detection:
-                # Draw bumper color highlights using the cached masks from the last robot detection frame
-                annotated_frame = draw_bumper_highlights(
-                    annotated_frame,
-                    current_bumper_red_mask,
-                    current_bumper_blue_mask,
-                    field_pixel_mask=field_pixel_mask
-                )
+                # Draw bumper color highlights on center camera
+                if camera_side == "center":
+                    # Reuse cached masks from last robot detection frame (fast)
+                    annotated_frame = draw_bumper_highlights(annotated_frame, current_bumper_red_mask, current_bumper_blue_mask, field_pixel_mask=field_pixel_mask)
                 
                 # Draw person segmentation in grey
                 if current_person_mask is not None and enable_person_detection and np.any(current_person_mask):
@@ -4884,8 +4770,6 @@ def process_single_video(video_path: str, camera_side: str = "blue", target_fps:
                     stats=ball_tracker.robot_stats,
                     show_unlabeled=show_unlabeled_robots
                 )
-            if camera_side in ("blue", "red"):
-                annotated_frame = annotate_side_camera_guides(annotated_frame, camera_side)
             
             # Update ball tracker with best available robot bboxes (interpolated on non-keyframes)
             # This ensures shot attribution uses accurate robot positions every ball frame,
