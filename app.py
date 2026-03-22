@@ -774,7 +774,8 @@ def _get_side_camera_zone_rects(camera_side: str, frame_width: int, frame_height
     return rects
 
 
-def annotate_side_camera_guides(frame: Image.Image, camera_side: str) -> Image.Image:
+def annotate_side_camera_guides(frame: Image.Image, camera_side: str,
+                                calibrated_boxes: list = None) -> Image.Image:
     """
     Draw lightweight side-camera lane guides to help the local LLM reason about
     middle / left / right / far-left / far-right positions.
@@ -782,31 +783,8 @@ def annotate_side_camera_guides(frame: Image.Image, camera_side: str) -> Image.I
     if frame is None:
         return frame
 
-    img = frame.copy().convert("RGBA")
-    overlay = Image.new("RGBA", img.size, (0, 0, 0, 0))
-    draw = ImageDraw.Draw(overlay)
-    font = get_font(18)
-    is_blue = str(camera_side).strip().lower() == "blue"
-    line_color = (80, 180, 255, 180) if is_blue else (255, 110, 110, 180)
-    fill_color = (80, 180, 255, 30) if is_blue else (255, 110, 110, 30)
-    tag_fill = (18, 18, 18, 175)
-    text_fill = (255, 255, 255, 235)
-
-    for label, (x1, y1, x2, y2) in _get_side_camera_zone_rects(camera_side, img.width, img.height):
-        draw.rectangle([x1, y1, x2, y2], outline=line_color, width=3, fill=fill_color)
-        text_bbox = draw.textbbox((0, 0), label, font=font)
-        text_w = text_bbox[2] - text_bbox[0]
-        text_h = text_bbox[3] - text_bbox[1]
-        tag_pad_x = 10
-        tag_pad_y = 6
-        tag_x1 = max(x1 + 8, min(x2 - text_w - tag_pad_x * 2 - 8, x1 + 14))
-        tag_y1 = max(6, y1 + 6)
-        tag_x2 = tag_x1 + text_w + tag_pad_x * 2
-        tag_y2 = tag_y1 + text_h + tag_pad_y * 2
-        draw.rounded_rectangle([tag_x1, tag_y1, tag_x2, tag_y2], radius=8, fill=tag_fill)
-        draw.text((tag_x1 + tag_pad_x, tag_y1 + tag_pad_y - 1), label, fill=text_fill, font=font)
-
-    return Image.alpha_composite(img, overlay).convert("RGB")
+    boxes = calibrated_boxes or _get_side_camera_zone_rects(camera_side, frame.width, frame.height)
+    return _draw_side_camera_box_overlay(frame, boxes, camera_side)
 
 
 
@@ -2446,6 +2424,163 @@ NO_SCAN_POINT_LABELS = ["BZ1", "BZ2", "BZ3", "BZ4", "RZ1", "RZ2", "RZ3", "RZ4"]
 ALL_CALIBRATION_POINT_LABELS = CALIBRATION_POINT_LABELS + NO_SCAN_POINT_LABELS
 CALIBRATION_REQUIRED_POINTS = len(CALIBRATION_POINT_LABELS)
 CALIBRATION_TOTAL_POINTS = len(ALL_CALIBRATION_POINT_LABELS)
+SIDE_CAMERA_BOX_LABELS = {
+    "blue": ["MIDDLE", "LEFT", "FAR LEFT"],
+    "red": ["MIDDLE", "RIGHT", "FAR RIGHT"],
+}
+SIDE_CAMERA_BOX_POINT_COUNT = 6
+
+
+def _extract_composite_calibration_frames(video_path: str, start_seconds: float = 0) -> tuple:
+    """Extract center / blue / red preview frames from the composite video for calibration."""
+    if video_path is None:
+        return None, None, None
+
+    cap = cv2.VideoCapture(video_path)
+    if not cap.isOpened():
+        print("[Calibration] Failed to open video for composite preview extraction")
+        return None, None, None
+
+    target_ms = (start_seconds + 4) * 1000
+    cap.set(cv2.CAP_PROP_POS_MSEC, target_ms)
+    ret, frame = cap.read()
+    actual_ms = cap.get(cv2.CAP_PROP_POS_MSEC)
+    cap.release()
+
+    print(f"[Calibration] Requested preview frame at {target_ms:.0f}ms, got {actual_ms:.0f}ms")
+    if not ret:
+        print("[Calibration] Failed to read composite preview frame")
+        return None, None, None
+
+    h, w = frame.shape[:2]
+    crops = {
+        "center": (1, 0, 1919, 709),
+        "blue": (1, 739, 941, 1078),
+        "red": (979, 739, 1919, 1078),
+    }
+
+    images = {}
+    for name, (x1, y1, x2, y2) in crops.items():
+        cx1 = max(0, min(x1, w))
+        cy1 = max(0, min(y1, h))
+        cx2 = max(0, min(x2, w))
+        cy2 = max(0, min(y2, h))
+        crop = frame[cy1:cy2, cx1:cx2]
+        if crop.size == 0:
+            images[name] = None
+            continue
+        images[name] = Image.fromarray(cv2.cvtColor(crop, cv2.COLOR_BGR2RGB))
+
+    return images.get("center"), images.get("blue"), images.get("red")
+
+
+def _get_side_box_point_labels(camera_side: str) -> list:
+    """Return ordered top-left / bottom-right click labels for side-box calibration."""
+    side_name = str(camera_side).strip().lower()
+    labels = SIDE_CAMERA_BOX_LABELS.get(side_name, SIDE_CAMERA_BOX_LABELS["blue"])
+    point_labels = []
+    for label in labels:
+        point_labels.extend([f"{label} TL", f"{label} BR"])
+    return point_labels
+
+
+def _get_side_box_calibration_status_text(camera_side: str, num_points: int) -> str:
+    """Instruction text for side-camera box calibration."""
+    point_labels = _get_side_box_point_labels(camera_side)
+    side_title = "Blue" if str(camera_side).strip().lower() == "blue" else "Red"
+    if num_points <= 0:
+        return f"**{side_title} side:** Click **{point_labels[0]}** (1 of {len(point_labels)})"
+    if num_points < len(point_labels):
+        return f"**{side_title} side:** Click **{point_labels[num_points]}** ({num_points + 1} of {len(point_labels)})"
+    return f"**{side_title} side boxes set!** Click Process Video to use them."
+
+
+def _side_box_pairs_to_rects(clicked_points: list, camera_side: str) -> list:
+    """Convert side-camera click pairs into normalized rectangles."""
+    labels = SIDE_CAMERA_BOX_LABELS.get(str(camera_side).strip().lower(), SIDE_CAMERA_BOX_LABELS["blue"])
+    rects = []
+    points = list(clicked_points or [])
+    for idx, label in enumerate(labels):
+        pair = points[idx * 2:(idx * 2) + 2]
+        if len(pair) < 2:
+            continue
+        (x1, y1), (x2, y2) = pair
+        rects.append((label, (min(x1, x2), min(y1, y2), max(x1, x2), max(y1, y2))))
+    return rects
+
+
+def _extract_side_camera_calibration_boxes(clicked_points: list, image_size: tuple,
+                                           frame_width: int, frame_height: int,
+                                           camera_side: str) -> list:
+    """Scale side-camera calibration rectangles from UI image coords to frame coords."""
+    if not clicked_points or not image_size or frame_width <= 0 or frame_height <= 0:
+        return []
+
+    src_w, src_h = image_size
+    if src_w <= 0 or src_h <= 0:
+        return []
+
+    boxes = []
+    for label, (x1, y1, x2, y2) in _side_box_pairs_to_rects(clicked_points, camera_side):
+        sx1 = int(round((x1 / src_w) * frame_width))
+        sy1 = int(round((y1 / src_h) * frame_height))
+        sx2 = int(round((x2 / src_w) * frame_width))
+        sy2 = int(round((y2 / src_h) * frame_height))
+        boxes.append((label, (min(sx1, sx2), min(sy1, sy2), max(sx1, sx2), max(sy1, sy2))))
+    return boxes
+
+
+def _draw_side_camera_box_overlay(base_image: Image.Image, boxes: list, camera_side: str) -> Image.Image:
+    """Draw side-camera guidance boxes on top of an image."""
+    if base_image is None:
+        return None
+
+    img = base_image.copy().convert("RGBA")
+    overlay = Image.new("RGBA", img.size, (0, 0, 0, 0))
+    draw = ImageDraw.Draw(overlay)
+    font = get_font(18)
+    is_blue = str(camera_side).strip().lower() == "blue"
+    line_color = (80, 180, 255, 180) if is_blue else (255, 110, 110, 180)
+    fill_color = (80, 180, 255, 30) if is_blue else (255, 110, 110, 30)
+    tag_fill = (18, 18, 18, 175)
+    text_fill = (255, 255, 255, 235)
+
+    for label, (x1, y1, x2, y2) in boxes or []:
+        draw.rectangle([x1, y1, x2, y2], outline=line_color, width=3, fill=fill_color)
+        text_bbox = draw.textbbox((0, 0), label, font=font)
+        text_w = text_bbox[2] - text_bbox[0]
+        text_h = text_bbox[3] - text_bbox[1]
+        tag_pad_x = 10
+        tag_pad_y = 6
+        tag_x1 = max(x1 + 8, min(x2 - text_w - tag_pad_x * 2 - 8, x1 + 14))
+        tag_y1 = max(6, y1 + 6)
+        tag_x2 = tag_x1 + text_w + tag_pad_x * 2
+        tag_y2 = tag_y1 + text_h + tag_pad_y * 2
+        draw.rounded_rectangle([tag_x1, tag_y1, tag_x2, tag_y2], radius=8, fill=tag_fill)
+        draw.text((tag_x1 + tag_pad_x, tag_y1 + tag_pad_y - 1), label, fill=text_fill, font=font)
+
+    return Image.alpha_composite(img, overlay).convert("RGB")
+
+
+def _redraw_side_calibration_image(base_image: Image.Image, clicked_points: list, camera_side: str) -> Image.Image:
+    """Redraw a side-camera calibration image with completed boxes and click markers."""
+    if base_image is None:
+        return None
+
+    img = _draw_side_camera_box_overlay(base_image, _side_box_pairs_to_rects(clicked_points, camera_side), camera_side)
+    draw = ImageDraw.Draw(img)
+    font = get_font(15)
+    point_labels = _get_side_box_point_labels(camera_side)
+    is_blue = str(camera_side).strip().lower() == "blue"
+    point_color = (80, 180, 255) if is_blue else (255, 110, 110)
+
+    for i, (px, py) in enumerate(clicked_points or []):
+        label = point_labels[i] if i < len(point_labels) else f"P{i + 1}"
+        radius = 6
+        draw.ellipse([px - radius, py - radius, px + radius, py + radius], fill=point_color, outline=(255, 255, 255), width=2)
+        draw.text((px + 10, py - 10), label, fill=point_color, font=font)
+
+    return img
 
 
 def _get_calibration_status_text(num_points: int) -> str:
@@ -4373,7 +4508,7 @@ class ThreadedVideoWriter:
         self.thread.join()
 
 
-def process_single_video(video_path: str, camera_side: str = "blue", target_fps: int = 3, start_seconds: float = 0, end_seconds: float = 0, blue_robots: list = None, red_robots: list = None, enable_robot_detection: bool = True, enable_fuel_detection: bool = True, progress=gr.Progress(), camera_name: str = "Camera", enable_person_detection: bool = True, calibration_points: list = None, calibration_image_size: tuple = None, side_camera_visible_robots: dict = None, show_unlabeled_robots: bool = True) -> tuple:
+def process_single_video(video_path: str, camera_side: str = "blue", target_fps: int = 3, start_seconds: float = 0, end_seconds: float = 0, blue_robots: list = None, red_robots: list = None, enable_robot_detection: bool = True, enable_fuel_detection: bool = True, progress=gr.Progress(), camera_name: str = "Camera", enable_person_detection: bool = True, calibration_points: list = None, calibration_image_size: tuple = None, side_box_points: list = None, side_box_image_size: tuple = None, side_camera_visible_robots: dict = None, show_unlabeled_robots: bool = True) -> tuple:
     """
     Process a single video, tracking objects at specified FPS.
     Uses bumper color detection for robot identification.
@@ -4504,6 +4639,7 @@ def process_single_video(video_path: str, camera_side: str = "blue", target_fps:
     # Center Camera Auto-Calibrator (uses user-clicked points for homography)
     center_calibrator = None
     robot_exclusion_polygons = []
+    side_calibration_boxes = []
     if camera_side == "center":
         # Reset any previous calibration
         center_camera_to_map_coords.calibration_homography = None
@@ -4537,6 +4673,22 @@ def process_single_video(video_path: str, camera_side: str = "blue", target_fps:
                 print("[Pre-Calibration] Homography computation failed. Using default calibration.")
         else:
             print(f"[Pre-Calibration] No calibration points provided ({len(calibration_homography_points) if calibration_homography_points else 0} points). Using default calibration.")
+    elif camera_side in ("blue", "red"):
+        side_calibration_boxes = _extract_side_camera_calibration_boxes(
+            side_box_points,
+            side_box_image_size,
+            width,
+            height,
+            camera_side
+        )
+        expected_box_count = len(SIDE_CAMERA_BOX_LABELS.get(camera_side, []))
+        if side_calibration_boxes and len(side_calibration_boxes) != expected_box_count:
+            print(
+                f"[Side Calibration] Incomplete {camera_side} side calibration "
+                f"({len(side_calibration_boxes)}/{expected_box_count} boxes). "
+                "Falling back to default guide boxes."
+            )
+            side_calibration_boxes = []
 
     # Store latest robot detection for use with ball frames
     current_bboxes_json = "[]"
@@ -4595,7 +4747,11 @@ def process_single_video(video_path: str, camera_side: str = "blue", target_fps:
             if camera_side in ("blue", "red"):
                 # Side camera: LLM presence query (no bounding boxes)
                 alliance_robots = blue_robots if camera_side == "blue" else red_robots
-                guided_pil_frame = annotate_side_camera_guides(pil_frame, camera_side)
+                guided_pil_frame = annotate_side_camera_guides(
+                    pil_frame,
+                    camera_side,
+                    calibrated_boxes=side_calibration_boxes
+                )
                 visible_robots = query_side_camera_presence(
                     guided_pil_frame,
                     alliance_robots,
@@ -4747,7 +4903,11 @@ def process_single_video(video_path: str, camera_side: str = "blue", target_fps:
             # Draw bounding boxes with alliance colors (for robots) - only if robot detection enabled
             annotated_frame = pil_frame.copy()
             if camera_side in ("blue", "red"):
-                annotated_frame = annotate_side_camera_guides(annotated_frame, camera_side)
+                annotated_frame = annotate_side_camera_guides(
+                    annotated_frame,
+                    camera_side,
+                    calibrated_boxes=side_calibration_boxes
+                )
             if enable_robot_detection:
                 # Draw bumper color highlights on center camera
                 if camera_side == "center":
@@ -5202,7 +5362,7 @@ def split_composite_video(composite_path: str, progress=None) -> tuple:
     return paths['center'], paths['blue'], paths['red']
 
 
-def process_dual_videos(blue_video_path: str, red_video_path: str, center_video_path: str = None, composite_video_path: str = None, target_fps: int = 3, start_seconds: float = 0, end_seconds: float = 0, blue_robot_1: str = "", blue_robot_2: str = "", blue_robot_3: str = "", red_robot_1: str = "", red_robot_2: str = "", red_robot_3: str = "", enable_robot_detection: bool = True, enable_fuel_detection: bool = True, side_ref_image: Image.Image = None, center_ref_image: Image.Image = None, enable_blue_camera: bool = True, enable_center_camera: bool = True, enable_red_camera: bool = True, enable_person_detection: bool = True, calibration_points: list = None, calibration_image_size: tuple = None, show_unlabeled_robots: bool = True, progress=gr.Progress()) -> tuple:
+def process_dual_videos(blue_video_path: str, red_video_path: str, center_video_path: str = None, composite_video_path: str = None, target_fps: int = 3, start_seconds: float = 0, end_seconds: float = 0, blue_robot_1: str = "", blue_robot_2: str = "", blue_robot_3: str = "", red_robot_1: str = "", red_robot_2: str = "", red_robot_3: str = "", enable_robot_detection: bool = True, enable_fuel_detection: bool = True, side_ref_image: Image.Image = None, center_ref_image: Image.Image = None, enable_blue_camera: bool = True, enable_center_camera: bool = True, enable_red_camera: bool = True, enable_person_detection: bool = True, calibration_points: list = None, calibration_image_size: tuple = None, blue_side_box_points: list = None, blue_side_box_image_size: tuple = None, red_side_box_points: list = None, red_side_box_image_size: tuple = None, show_unlabeled_robots: bool = True, progress=gr.Progress()) -> tuple:
     """
     Process blue, red, and center camera videos using bumper detection.
     
@@ -5255,7 +5415,9 @@ def process_dual_videos(blue_video_path: str, red_video_path: str, center_video_
                 False,  # Side cameras only used for positioning, not shot detection
                 progress,
                 "Blue Camera",
-                enable_person_detection=enable_person_detection
+                enable_person_detection=enable_person_detection,
+                side_box_points=blue_side_box_points,
+                side_box_image_size=blue_side_box_image_size
             )
             results['blue'] = {
                 'output_path': output_path,
@@ -5290,7 +5452,9 @@ def process_dual_videos(blue_video_path: str, red_video_path: str, center_video_
                 False,  # Side cameras only used for positioning, not shot detection
                 progress,
                 "Red Camera",
-                enable_person_detection=enable_person_detection
+                enable_person_detection=enable_person_detection,
+                side_box_points=red_side_box_points,
+                side_box_image_size=red_side_box_image_size
             )
             results['red'] = {
                 'output_path': output_path,
@@ -5649,6 +5813,43 @@ def create_demo():
                     undo_btn = gr.Button("Undo Last Point", size="sm")
                     skip_calib_btn = gr.Button("Skip Calibration", size="sm")
 
+                gr.Markdown("### Side Camera Box Calibration")
+                gr.Markdown(
+                    "Optional: define 6 side-camera boxes using 2 clicks per box "
+                    "(top-left, then bottom-right). "
+                    "Blue side order: MIDDLE, LEFT, FAR LEFT. "
+                    "Red side order: MIDDLE, RIGHT, FAR RIGHT."
+                )
+
+                blue_side_name_state = gr.State("blue")
+                red_side_name_state = gr.State("red")
+                blue_side_base_image = gr.State(None)
+                blue_side_box_points_state = gr.State([])
+                blue_side_box_image_size_state = gr.State(None)
+                red_side_base_image = gr.State(None)
+                red_side_box_points_state = gr.State([])
+                red_side_box_image_size_state = gr.State(None)
+
+                with gr.Row():
+                    with gr.Column():
+                        blue_side_calibration_image = gr.Image(
+                            label="Blue Side Boxes",
+                            type="pil",
+                            interactive=False,
+                            height=220,
+                        )
+                        blue_side_status = gr.Markdown("*Upload a video to calibrate blue side boxes*")
+                        blue_side_undo_btn = gr.Button("Undo Blue Side Point", size="sm")
+                    with gr.Column():
+                        red_side_calibration_image = gr.Image(
+                            label="Red Side Boxes",
+                            type="pil",
+                            interactive=False,
+                            height=220,
+                        )
+                        red_side_status = gr.Markdown("*Upload a video to calibrate red side boxes*")
+                        red_side_undo_btn = gr.Button("Undo Red Side Point", size="sm")
+
                 # Robot number inputs
                 gr.Markdown("### Blue Alliance")
                 with gr.Row():
@@ -5815,17 +6016,35 @@ def create_demo():
         def handle_video_upload(video_path, start_seconds):
             """Extract calibration frame when video is uploaded."""
             if video_path is None:
-                return None, None, [], None, "*Upload a video to begin calibration*"
-            frame = CenterCameraCalibrator.extract_calibration_frame(video_path, start_seconds or 0)
-            if frame is None:
-                return None, None, [], None, "Failed to extract frame from video"
-            img_size = frame.size  # (width, height)
-            return frame, frame, [], img_size, _get_calibration_status_text(0)
+                return (
+                    None, None, [], None, "*Upload a video to begin calibration*",
+                    None, None, [], None, "*Upload a video to calibrate blue side boxes*",
+                    None, None, [], None, "*Upload a video to calibrate red side boxes*"
+                )
+            center_frame, blue_frame, red_frame = _extract_composite_calibration_frames(video_path, start_seconds or 0)
+            if center_frame is None:
+                return (
+                    None, None, [], None, "Failed to extract frame from video",
+                    None, None, [], None, "Failed to extract blue side frame",
+                    None, None, [], None, "Failed to extract red side frame"
+                )
+
+            blue_status = _get_side_box_calibration_status_text("blue", 0) if blue_frame is not None else "Failed to extract blue side frame"
+            red_status = _get_side_box_calibration_status_text("red", 0) if red_frame is not None else "Failed to extract red side frame"
+            return (
+                center_frame, center_frame, [], center_frame.size, _get_calibration_status_text(0),
+                blue_frame, blue_frame, [], (blue_frame.size if blue_frame is not None else None), blue_status,
+                red_frame, red_frame, [], (red_frame.size if red_frame is not None else None), red_status
+            )
         
         composite_video_input.change(
             fn=handle_video_upload,
             inputs=[composite_video_input, start_seconds_input],
-            outputs=[calibration_image, calibration_base_image, calibration_points_state, calibration_image_size_state, calibration_status]
+            outputs=[
+                calibration_image, calibration_base_image, calibration_points_state, calibration_image_size_state, calibration_status,
+                blue_side_calibration_image, blue_side_base_image, blue_side_box_points_state, blue_side_box_image_size_state, blue_side_status,
+                red_side_calibration_image, red_side_base_image, red_side_box_points_state, red_side_box_image_size_state, red_side_status,
+            ]
         )
         
         def handle_image_click(base_image, clicked_points, evt: gr.SelectData):
@@ -5855,6 +6074,32 @@ def create_demo():
             inputs=[calibration_base_image, calibration_points_state],
             outputs=[calibration_image, calibration_points_state, calibration_status]
         )
+
+        def handle_side_box_click(base_image, clicked_points, camera_side, evt: gr.SelectData):
+            if base_image is None:
+                return None, clicked_points, "Upload a video first"
+            x, y = evt.index
+            n = len(clicked_points)
+            if n >= SIDE_CAMERA_BOX_POINT_COUNT:
+                annotated = _redraw_side_calibration_image(base_image, clicked_points, camera_side)
+                return annotated, clicked_points, _get_side_box_calibration_status_text(camera_side, n)
+            label = _get_side_box_point_labels(camera_side)[n]
+            print(f"[Side Box UI] {camera_side} click #{n+1} ({label}): raw=({x}, {y})")
+            clicked_points = list(clicked_points) + [(x, y)]
+            annotated = _redraw_side_calibration_image(base_image, clicked_points, camera_side)
+            return annotated, clicked_points, _get_side_box_calibration_status_text(camera_side, len(clicked_points))
+
+        blue_side_calibration_image.select(
+            fn=handle_side_box_click,
+            inputs=[blue_side_base_image, blue_side_box_points_state, blue_side_name_state],
+            outputs=[blue_side_calibration_image, blue_side_box_points_state, blue_side_status]
+        )
+
+        red_side_calibration_image.select(
+            fn=handle_side_box_click,
+            inputs=[red_side_base_image, red_side_box_points_state, red_side_name_state],
+            outputs=[red_side_calibration_image, red_side_box_points_state, red_side_status]
+        )
         
         def handle_undo(base_image, clicked_points):
             if not clicked_points:
@@ -5874,6 +6119,28 @@ def create_demo():
             inputs=[calibration_base_image, calibration_points_state],
             outputs=[calibration_image, calibration_points_state, calibration_status]
         )
+
+        def handle_side_undo(base_image, clicked_points, camera_side):
+            if not clicked_points:
+                return base_image, clicked_points, "No points to undo"
+            clicked_points = list(clicked_points)[:-1]
+            if clicked_points:
+                annotated = _redraw_side_calibration_image(base_image, clicked_points, camera_side)
+            else:
+                annotated = base_image
+            return annotated, clicked_points, _get_side_box_calibration_status_text(camera_side, len(clicked_points)) + " — Undid last point"
+
+        blue_side_undo_btn.click(
+            fn=handle_side_undo,
+            inputs=[blue_side_base_image, blue_side_box_points_state, blue_side_name_state],
+            outputs=[blue_side_calibration_image, blue_side_box_points_state, blue_side_status]
+        )
+
+        red_side_undo_btn.click(
+            fn=handle_side_undo,
+            inputs=[red_side_base_image, red_side_box_points_state, red_side_name_state],
+            outputs=[red_side_calibration_image, red_side_box_points_state, red_side_status]
+        )
         
         def handle_skip():
             return [], "**Calibration skipped** — will use default alignment"
@@ -5887,7 +6154,7 @@ def create_demo():
         # Connect the processing function
         process_btn.click(
             fn=process_dual_videos,
-            inputs=[blue_video_input, red_video_input, center_video_input, composite_video_input, fps_slider, start_seconds_input, end_seconds_input, blue_robot_1, blue_robot_2, blue_robot_3, red_robot_1, red_robot_2, red_robot_3, detect_robots_checkbox, detect_fuel_checkbox, side_ref_image_input, center_ref_image_input, enable_blue_cam, enable_center_cam, enable_red_cam, detect_people_checkbox, calibration_points_state, calibration_image_size_state, show_unlabeled_checkbox],
+            inputs=[blue_video_input, red_video_input, center_video_input, composite_video_input, fps_slider, start_seconds_input, end_seconds_input, blue_robot_1, blue_robot_2, blue_robot_3, red_robot_1, red_robot_2, red_robot_3, detect_robots_checkbox, detect_fuel_checkbox, side_ref_image_input, center_ref_image_input, enable_blue_cam, enable_center_cam, enable_red_cam, detect_people_checkbox, calibration_points_state, calibration_image_size_state, blue_side_box_points_state, blue_side_box_image_size_state, red_side_box_points_state, red_side_box_image_size_state, show_unlabeled_checkbox],
             outputs=[
                 blue_video_output, red_video_output, center_video_output, map_video_output,
                 blue1_map, blue1_stats,
