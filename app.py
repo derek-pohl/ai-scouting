@@ -660,6 +660,81 @@ def inject_hidden_robot_bboxes(base_bboxes_json: str, persistent_hidden_robots: 
     return json.dumps(injected_bboxes), updated_hidden
 
 
+_SIDE_CAMERA_REF_SIZE = (940, 339)
+_SIDE_CAMERA_RED_ZONE_RECTS = [
+    ("MIDDLE", (257, 10, 509, 337)),
+    ("RIGHT", (509, 10, 705, 337)),
+    ("FAR RIGHT", (705, 10, 937, 337)),
+]
+
+
+def _get_side_camera_zone_rects(camera_side: str, frame_width: int, frame_height: int) -> list:
+    """Return side-camera guidance rectangles scaled to the current cropped frame."""
+    ref_w, ref_h = _SIDE_CAMERA_REF_SIZE
+    sx = frame_width / ref_w if ref_w else 1.0
+    sy = frame_height / ref_h if ref_h else 1.0
+    is_blue = str(camera_side).strip().lower() == "blue"
+
+    rects = []
+    for label, (x1, y1, x2, y2) in _SIDE_CAMERA_RED_ZONE_RECTS:
+        if is_blue:
+            flipped_label = label.replace("RIGHT", "LEFT")
+            x1_f = ref_w - x2
+            x2_f = ref_w - x1
+            x1_use, x2_use = x1_f, x2_f
+            label_use = flipped_label
+        else:
+            x1_use, x2_use = x1, x2
+            label_use = label
+
+        rects.append((
+            label_use,
+            (
+                int(round(x1_use * sx)),
+                int(round(y1 * sy)),
+                int(round(x2_use * sx)),
+                int(round(y2 * sy)),
+            )
+        ))
+
+    return rects
+
+
+def annotate_side_camera_guides(frame: Image.Image, camera_side: str) -> Image.Image:
+    """
+    Draw lightweight side-camera lane guides to help the local LLM reason about
+    middle / left / right / far-left / far-right positions.
+    """
+    if frame is None:
+        return frame
+
+    img = frame.copy().convert("RGBA")
+    overlay = Image.new("RGBA", img.size, (0, 0, 0, 0))
+    draw = ImageDraw.Draw(overlay)
+    font = get_font(18)
+    is_blue = str(camera_side).strip().lower() == "blue"
+    line_color = (80, 180, 255, 180) if is_blue else (255, 110, 110, 180)
+    fill_color = (80, 180, 255, 30) if is_blue else (255, 110, 110, 30)
+    tag_fill = (18, 18, 18, 175)
+    text_fill = (255, 255, 255, 235)
+
+    for label, (x1, y1, x2, y2) in _get_side_camera_zone_rects(camera_side, img.width, img.height):
+        draw.rectangle([x1, y1, x2, y2], outline=line_color, width=3, fill=fill_color)
+        text_bbox = draw.textbbox((0, 0), label, font=font)
+        text_w = text_bbox[2] - text_bbox[0]
+        text_h = text_bbox[3] - text_bbox[1]
+        tag_pad_x = 10
+        tag_pad_y = 6
+        tag_x1 = max(x1 + 8, min(x2 - text_w - tag_pad_x * 2 - 8, x1 + 14))
+        tag_y1 = max(6, y1 + 6)
+        tag_x2 = tag_x1 + text_w + tag_pad_x * 2
+        tag_y2 = tag_y1 + text_h + tag_pad_y * 2
+        draw.rounded_rectangle([tag_x1, tag_y1, tag_x2, tag_y2], radius=8, fill=tag_fill)
+        draw.text((tag_x1 + tag_pad_x, tag_y1 + tag_pad_y - 1), label, fill=text_fill, font=font)
+
+    return Image.alpha_composite(img, overlay).convert("RGB")
+
+
 
 
 # Color palette for bounding boxes
@@ -4408,8 +4483,9 @@ def process_single_video(video_path: str, camera_side: str = "blue", target_fps:
             if camera_side in ("blue", "red"):
                 # Side camera: LLM presence query (no bounding boxes)
                 alliance_robots = blue_robots if camera_side == "blue" else red_robots
+                guided_pil_frame = annotate_side_camera_guides(pil_frame, camera_side)
                 visible_robots = query_side_camera_presence(
-                    pil_frame,
+                    guided_pil_frame,
                     alliance_robots,
                     camera_side=camera_side
                 )
@@ -4557,6 +4633,8 @@ def process_single_video(video_path: str, camera_side: str = "blue", target_fps:
             
             # Draw bounding boxes with alliance colors (for robots) - only if robot detection enabled
             annotated_frame = pil_frame.copy()
+            if camera_side in ("blue", "red"):
+                annotated_frame = annotate_side_camera_guides(annotated_frame, camera_side)
             if enable_robot_detection:
                 # Draw bumper color highlights on center camera
                 if camera_side == "center":
