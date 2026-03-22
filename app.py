@@ -405,22 +405,12 @@ def query_side_camera_presence(
             "farright": 3,
         }
         bucket_instructions = (
-            "Think of the 3 possible positions as 'middle', 'right', and 'far right'. "
-            "Use the JSON field 'position' with one of exactly these values: "
-            "'middle', 'right', or 'far right'. "
-            "Use the JSON field 'description' to explain your reasoning for which robot you matched "
-            "and why it belongs in that position box. "
-            "Reflect carefully on the choice before answering: compare the robot against the neighboring boxes "
-            "and decide which box it really belongs in, not just which label is vaguely plausible. "
-            "Describe where the robot appears in the scene relative to the guide boxes, wall, lane, "
-            "or center area, and explain why you chose 'middle', 'right', or 'far right'. "
-            "'Far right' is a strict edge case and should be used rarely. "
-            "Only choose 'far right' when the robot is truly in the extreme far-right lane or pressed against the right wall/edge of the scene. "
-            "If a robot sits between the middle and right sections, assign it to 'middle'. "
-            "If the robot is merely right of center, somewhat right, or split between middle and right, choose 'right' instead. "
-            "Each robot can appear in only one position, so do not assign multiple positions to the same team. "
-            "Try to keep only one robot in each zone at a time whenever possible. "
-            "Use 'far right' only if the robot is truly in the far-right edge lane, not merely somewhat right of center."
+            "Assign each to one position: 'middle', 'right', or 'far right': "
+            "Default to 'middle' if between middle and right. "
+            "Use 'right' only if clearly in the right lane but not at the edge. "
+            "Use 'far right' only if at the extreme right lane or against the wall. "
+            "Base decisions on visual evidence (guide-box, lane, wall, center) and compare nearby boxes when helpful. "
+            "Each robot may appear only once; prefer at most one per box."
         )
         example_json = (
             "[{\"team\":\"77235\",\"description\":\"This robot sits mainly inside the middle guide box and is not close enough to the right wall to count as right, so I placed it in middle.\",\"position\":\"middle\"},"
@@ -435,22 +425,12 @@ def query_side_camera_presence(
             "farleft": 3,
         }
         bucket_instructions = (
-            "Think of the 3 possible positions as 'middle', 'left', and 'far left'. "
-            "Use the JSON field 'position' with one of exactly these values: "
-            "'middle', 'left', or 'far left'. "
-            "Use the JSON field 'description' to explain your reasoning for which robot you matched "
-            "and why it belongs in that position box. "
-            "Reflect carefully on the choice before answering: compare the robot against the neighboring boxes "
-            "and decide which box it really belongs in, not just which label is vaguely plausible. "
-            "Describe where the robot appears in the scene relative to the guide boxes, wall, lane, "
-            "or center area, and explain why you chose 'middle', 'left', or 'far left'. "
-            "'Far left' is a strict edge case and should be used rarely. "
-            "Only choose 'far left' when the robot is truly in the extreme far-left lane or pressed against the left wall/edge of the scene. "
-            "If a robot sits between the middle and left sections, assign it to 'middle'. "
-            "If the robot is merely left of center, somewhat left, or split between middle and left, choose 'left' instead. "
-            "Each robot can appear in only one position, so do not assign multiple positions to the same team. "
-            "Try to keep only one robot in each zone at a time whenever possible. "
-            "Use 'far left' only if the robot is truly in the far-left edge lane, not merely somewhat left of center."
+            "Assign each to one position: 'middle', 'left', or 'far left': "
+            "Default to 'middle' if between middle and left. "
+            "Use 'left' only if clearly in the left lane but not at the edge. "
+            "Use 'far left' only if at the extreme left lane or against the wall. "
+            "Base decisions on visual evidence (guide-box, lane, wall, center) and compare nearby boxes when helpful. "
+            "Each robot may appear only once; prefer at most one per box."
         )
         example_json = (
             "[{\"team\":\"77235\",\"description\":\"This robot sits mainly inside the middle guide box and is not close enough to the left wall to count as left, so I placed it in middle.\",\"position\":\"middle\"},"
@@ -458,16 +438,12 @@ def query_side_camera_presence(
             "{\"team\":\"5962\",\"description\":\"This robot is pushed all the way against the far-left edge lane near the wall, clearly beyond the normal left box, so it belongs in far left.\",\"position\":\"far left\"}]"
         )
     prompt = (
-        f"Which of these robots are visible in this image: {numbers_str}? "
-        f"Only identify robots from this list. "
-        f"You do not need to find every robot from the list; return only the ones you actually see. "
+        f"Which robots from {numbers_str} are visible in this image? "
+        f"Only include robots you actually see. "
         f"{bucket_instructions} "
         f"Reply with ONLY a JSON array. "
-        f"Each item must be an object with keys 'team', 'description', and 'position', in that order. "
-        f"Use 'description' to explain the visual evidence for the match and the reasoning behind the position choice. "
-        f"In the description, briefly mention why nearby alternative boxes were rejected when that matters, especially for any far-left or far-right decision. "
-        f"The description does not need to be brief; 1-2 sentences is fine if needed. "
-        f"You can return multiple robots. "
+        f"Return ONLY a JSON array of objects with keys in this order: 'team', 'description', 'position'. "
+        f"Descriptions should be 1-2 sentences describing where the robot is in the frame. "
         f"Example: "
         f"{example_json}. "
         f"If none are visible, reply with []."
