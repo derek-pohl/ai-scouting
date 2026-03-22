@@ -274,6 +274,7 @@ def query_local_llm_for_team_number(
         if response.status_code == 200:
             result = response.json()
             answer = result.get("choices", [{}])[0].get("message", {}).get("content", "").strip()
+            print(f"[LMStudio Center OCR] Raw response: {answer}")
             
             # Validate answer is a valid team number
             answer_clean = answer.replace(" ", "").strip()
@@ -468,6 +469,7 @@ def query_side_camera_presence(
         if response.status_code == 200:
             result = response.json()
             answer = result.get("choices", [{}])[0].get("message", {}).get("content", "").strip()
+            print(f"[LMStudio Side Presence {side_name}] Raw response: {answer}")
             
             if "none" in answer.lower():
                 return []
