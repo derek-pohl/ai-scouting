@@ -559,7 +559,8 @@ def _hidden_bbox_for_slot(side_name: str, x_bucket: int) -> tuple:
 
 def inject_hidden_robot_bboxes(base_bboxes_json: str, persistent_hidden_robots: dict,
                                side_camera_visible_robots: dict, frame_count: int,
-                               width: int, height: int) -> tuple:
+                               width: int, height: int,
+                               edge_persist_frames: int = 60) -> tuple:
     """
     Augment center-camera detections with hidden robots inferred from the side cameras.
 
@@ -578,6 +579,8 @@ def inject_hidden_robot_bboxes(base_bboxes_json: str, persistent_hidden_robots: 
             center_detected_labels.add(lbl)
 
     updated_hidden = dict(persistent_hidden_robots or {})
+    latest_side_frame_by_side = {}
+    seen_on_latest_side_frame = {"blue": set(), "red": set()}
 
     for side_name in ('blue', 'red'):
         side_data = side_camera_visible_robots.get(side_name, {}) if side_camera_visible_robots else {}
@@ -594,6 +597,8 @@ def inject_hidden_robot_bboxes(base_bboxes_json: str, persistent_hidden_robots: 
         if latest_side_frame is None:
             continue
 
+        latest_side_frame_by_side[side_name] = latest_side_frame
+
         side_visible = side_data[latest_side_frame]
         for item in side_visible:
             if not isinstance(item, dict):
@@ -609,14 +614,38 @@ def inject_hidden_robot_bboxes(base_bboxes_json: str, persistent_hidden_robots: 
             if robot_label in center_detected_labels:
                 continue
 
+            seen_on_latest_side_frame[side_name].add(robot_label)
+
             updated_hidden[robot_label] = {
                 'side': side_name,
-                'x_bucket': x_bucket
+                'x_bucket': x_bucket,
+                'last_side_seen_frame': latest_side_frame
             }
 
     for robot_label in list(updated_hidden.keys()):
         if robot_label in center_detected_labels:
             del updated_hidden[robot_label]
+            continue
+
+        hidden_meta = updated_hidden[robot_label]
+        side_name = hidden_meta.get('side')
+        x_bucket = hidden_meta.get('x_bucket')
+        last_side_seen_frame = hidden_meta.get('last_side_seen_frame')
+
+        if side_name in seen_on_latest_side_frame and robot_label in seen_on_latest_side_frame[side_name]:
+            continue
+
+        latest_side_frame = latest_side_frame_by_side.get(side_name)
+        if latest_side_frame is None:
+            del updated_hidden[robot_label]
+            continue
+
+        if x_bucket == 3 and last_side_seen_frame is not None:
+            age = frame_count - last_side_seen_frame
+            if age <= edge_persist_frames:
+                continue
+
+        del updated_hidden[robot_label]
 
     injected_bboxes = list(center_bboxes)
     slot_counts = {}
@@ -4590,7 +4619,8 @@ def process_single_video(video_path: str, camera_side: str = "blue", target_fps:
                         side_camera_visible_robots,
                         frame_count,
                         width,
-                        height
+                        height,
+                        edge_persist_frames=max(30, int(round(original_fps * 2.0)))
                     )
             
             # Store for tracking
