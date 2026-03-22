@@ -408,6 +408,7 @@ def query_side_camera_presence(
             "Use the JSON field 'position' with one of exactly these values: "
             "'middle', 'right', or 'far right'. "
             "Each robot can appear in only one position, so do not assign multiple positions to the same team. "
+            "Try to keep only one robot in each zone at a time whenever possible. "
             "Use 'far right' only if the robot is truly in the far-right edge lane, not merely somewhat right of center."
         )
         example_json = (
@@ -427,6 +428,7 @@ def query_side_camera_presence(
             "Use the JSON field 'position' with one of exactly these values: "
             "'middle', 'left', or 'far left'. "
             "Each robot can appear in only one position, so do not assign multiple positions to the same team. "
+            "Try to keep only one robot in each zone at a time whenever possible. "
             "Use 'far left' only if the robot is truly in the far-left edge lane, not merely somewhat left of center."
         )
         example_json = (
@@ -674,6 +676,7 @@ def _get_side_camera_zone_rects(camera_side: str, frame_width: int, frame_height
     sx = frame_width / ref_w if ref_w else 1.0
     sy = frame_height / ref_h if ref_h else 1.0
     is_blue = str(camera_side).strip().lower() == "blue"
+    shift_px = 50 if is_blue else -50
 
     rects = []
     for label, (x1, y1, x2, y2) in _SIDE_CAMERA_RED_ZONE_RECTS:
@@ -686,6 +689,9 @@ def _get_side_camera_zone_rects(camera_side: str, frame_width: int, frame_height
         else:
             x1_use, x2_use = x1, x2
             label_use = label
+
+        x1_use = max(0, min(ref_w, x1_use + shift_px))
+        x2_use = max(0, min(ref_w, x2_use + shift_px))
 
         rects.append((
             label_use,
