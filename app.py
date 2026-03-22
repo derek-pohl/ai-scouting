@@ -91,13 +91,36 @@ class RobotLabelTracker:
     def _distance(self, p1: tuple, p2: tuple) -> float:
         """Euclidean distance between two points."""
         return ((p1[0] - p2[0])**2 + (p1[1] - p2[1])**2) ** 0.5
+
+    @staticmethod
+    def _normalize_allowed_labels(allowed_labels: list) -> set:
+        """Normalize an optional list of allowed labels into a set."""
+        if allowed_labels is None:
+            return set()
+        return {
+            str(label).strip()
+            for label in allowed_labels
+            if str(label).strip()
+        }
+
+    @classmethod
+    def _label_is_allowed(cls, label: str, allowed_labels: list = None) -> bool:
+        """Check whether a tracked/OCR label is valid for the current detection."""
+        label_text = str(label).strip() if label is not None else ""
+        if label_text in ("", "robot", "unknown"):
+            return True
+        if allowed_labels is None:
+            return True
+        return label_text in cls._normalize_allowed_labels(allowed_labels)
     
-    def check_needs_llm(self, detections: list) -> tuple:
+    def check_needs_llm(self, detections: list, allowed_labels_by_detection: list = None) -> tuple:
         """
         Check which detections need LLM queries vs can use tracked labels.
         
         Args:
             detections: List of (x1, y1, x2, y2) bounding boxes in pixels
+            allowed_labels_by_detection: Optional valid team-number candidates for
+                each detection. Empty candidates force the detection to stay generic.
             
         Returns:
             Tuple of (tracked_labels, needs_llm):
@@ -108,8 +131,17 @@ class RobotLabelTracker:
         needs_llm = []
         matched_ids = set()
         
-        for bbox in detections:
+        for idx, bbox in enumerate(detections):
             center = self._calculate_center(bbox)
+            allowed_labels = (
+                allowed_labels_by_detection[idx]
+                if allowed_labels_by_detection is not None and idx < len(allowed_labels_by_detection)
+                else None
+            )
+            force_generic = (
+                allowed_labels_by_detection is not None and
+                len(self._normalize_allowed_labels(allowed_labels)) == 0
+            )
             
             # Find closest existing tracked robot
             best_match_id = None
@@ -130,8 +162,14 @@ class RobotLabelTracker:
                 label = robot_data['label']
                 confidence = robot_data['confidence']
                 
+                if force_generic:
+                    tracked_labels.append("robot")
+                    needs_llm.append(False)
+                elif not self._label_is_allowed(label, allowed_labels):
+                    tracked_labels.append(None)
+                    needs_llm.append(True)
                 # Use tracked label if confident (identified before)
-                if label not in ("robot", "unknown") and confidence >= self.confident_threshold:
+                elif label not in ("robot", "unknown") and confidence >= self.confident_threshold:
                     tracked_labels.append(label)
                     needs_llm.append(False)  # Skip LLM - confident track
                 else:
@@ -140,18 +178,24 @@ class RobotLabelTracker:
                     needs_llm.append(True)
             else:
                 # New robot - no match found, need LLM
-                tracked_labels.append(None)
-                needs_llm.append(True)
+                if force_generic:
+                    tracked_labels.append("robot")
+                    needs_llm.append(False)
+                else:
+                    tracked_labels.append(None)
+                    needs_llm.append(True)
         
         return tracked_labels, needs_llm
     
-    def update(self, detections: list, new_labels: list) -> list:
+    def update(self, detections: list, new_labels: list, allowed_labels_by_detection: list = None) -> list:
         """
         Update tracking with new detections and labels.
         
         Args:
             detections: List of (x1, y1, x2, y2) bounding boxes in pixels
             new_labels: List of labels from LLM (or "unknown")
+            allowed_labels_by_detection: Optional valid team-number candidates for
+                each detection. Incompatible labels are forced back to "robot".
             
         Returns:
             List of final labels (using history when LLM returns "unknown")
@@ -165,6 +209,18 @@ class RobotLabelTracker:
         
         for i, (bbox, label) in enumerate(zip(detections, new_labels)):
             center = self._calculate_center(bbox)
+            allowed_labels = (
+                allowed_labels_by_detection[i]
+                if allowed_labels_by_detection is not None and i < len(allowed_labels_by_detection)
+                else None
+            )
+            force_generic = (
+                allowed_labels_by_detection is not None and
+                len(self._normalize_allowed_labels(allowed_labels)) == 0
+            )
+            label = str(label).strip() if label is not None else "unknown"
+            if force_generic or not self._label_is_allowed(label, allowed_labels):
+                label = "robot"
             
             # Find closest existing tracked robot
             best_match_id = None
@@ -183,11 +239,17 @@ class RobotLabelTracker:
                 # Found match - update or keep previous label
                 matched_ids.add(best_match_id)
                 old_data = self.tracked_robots[best_match_id]
+                old_label_allowed = self._label_is_allowed(old_data['label'], allowed_labels)
                 
                 if label == "unknown" or label == "robot":
-                    # Keep previous label
-                    final_label = old_data['label']
-                    confidence = old_data['confidence']
+                    # Keep previous label only if it still matches this detection's
+                    # allowed alliance candidates.
+                    if old_label_allowed and old_data['label'] not in ("robot", "unknown"):
+                        final_label = old_data['label']
+                        confidence = old_data['confidence']
+                    else:
+                        final_label = "robot"
+                        confidence = 0
                 else:
                     # Update with new label
                     final_label = label
@@ -240,6 +302,8 @@ def query_local_llm_for_team_number(
         Team number string or "unknown"
     """
     if not LMSTUDIO_ENABLED:
+        return "unknown"
+    if not available_numbers:
         return "unknown"
     
     # Convert image to base64
@@ -880,6 +944,71 @@ def get_robot_color(robot_label: str, blue_robots: list = None, red_robots: list
     
     # Unknown robot - return black
     return DEFAULT_COLOR
+
+
+def _normalize_robot_numbers(robots: list) -> list:
+    """Return cleaned team-number strings, preserving input order."""
+    return [str(robot).strip() for robot in (robots or []) if str(robot).strip()]
+
+
+def _get_center_robot_scan_alliance(bbox: tuple, frame_width: int) -> str:
+    """
+    Split the center camera into scan zones.
+
+    Left third scans blue only, right third scans red only, and the middle third
+    can still be either alliance.
+    """
+    if bbox is None or frame_width <= 0:
+        return None
+    x1, _, x2, _ = bbox
+    center_x = (x1 + x2) / 2.0
+    third_width = frame_width / 3.0
+    if center_x < third_width:
+        return "blue"
+    if center_x >= (2.0 * third_width):
+        return "red"
+    return None
+
+
+def _get_allowed_robot_numbers_for_detection(camera_side: str, bbox: tuple, mask_color: str,
+                                             frame_width: int, blue_robots: list = None,
+                                             red_robots: list = None) -> list:
+    """
+    Return the only team numbers this detection is allowed to become.
+
+    Side cameras stay alliance-locked. For the center camera, the outer thirds
+    only scan the alliance on that side of the field. The mask color is also a
+    hard constraint: blue-mask detections cannot become red teams and vice versa.
+    """
+    blue_labels = _normalize_robot_numbers(blue_robots)
+    red_labels = _normalize_robot_numbers(red_robots)
+    all_labels = blue_labels + red_labels
+    if not all_labels:
+        return []
+
+    side_name = str(camera_side).strip().lower()
+    field_allowed = set(all_labels)
+    if side_name == "blue":
+        field_allowed = set(blue_labels)
+    elif side_name == "red":
+        field_allowed = set(red_labels)
+    elif side_name == "center":
+        center_alliance = _get_center_robot_scan_alliance(bbox, frame_width)
+        if center_alliance == "blue":
+            field_allowed = set(blue_labels)
+        elif center_alliance == "red":
+            field_allowed = set(red_labels)
+
+    mask_color_name = str(mask_color).strip().lower()
+    if mask_color_name == "blue":
+        color_allowed = set(blue_labels)
+    elif mask_color_name == "red":
+        color_allowed = set(red_labels)
+    else:
+        color_allowed = set(all_labels)
+
+    allowed = field_allowed & color_allowed
+    return [robot for robot in all_labels if robot in allowed]
 
 
 def rgb_to_hex(rgb: tuple) -> str:
@@ -2481,10 +2610,8 @@ class CenterCameraCalibrator:
 # --- Calibration UI Helper Functions ---
 
 CALIBRATION_POINT_LABELS = list(CenterCameraCalibrator.REFERENCE_POINTS.keys())
-NO_SCAN_POINT_LABELS = ["BZ1", "BZ2", "BZ3", "BZ4", "RZ1", "RZ2", "RZ3", "RZ4"]
-ALL_CALIBRATION_POINT_LABELS = CALIBRATION_POINT_LABELS + NO_SCAN_POINT_LABELS
 CALIBRATION_REQUIRED_POINTS = len(CALIBRATION_POINT_LABELS)
-CALIBRATION_TOTAL_POINTS = len(ALL_CALIBRATION_POINT_LABELS)
+NO_SCAN_POINTS_PER_BOX = 4
 SIDE_CAMERA_BOX_LABELS = {
     "blue": ["MIDDLE", "LEFT", "FAR LEFT"],
     "red": ["MIDDLE", "RIGHT", "FAR RIGHT"],
@@ -2655,27 +2782,47 @@ def _get_calibration_status_text(num_points: int) -> str:
 
     if num_points == CALIBRATION_REQUIRED_POINTS:
         return (
-            "**Calibration points set!** Optional: click **BZ1** to start the blue no-scan box "
-            "(9 of 16), or click 'Process Video' now."
+            "**Calibration points set!** Optional: click **Z1.1** to start the first "
+            "center-camera no-scan box, or click 'Process Video' now."
         )
 
-    if num_points < CALIBRATION_TOTAL_POINTS:
-        next_label = ALL_CALIBRATION_POINT_LABELS[num_points]
-        return f"**Click point {next_label}** ({num_points + 1} of 16)"
+    extra_points = num_points - CALIBRATION_REQUIRED_POINTS
+    next_label = _get_center_calibration_click_label(num_points)
+    current_box = (extra_points // NO_SCAN_POINTS_PER_BOX) + 1
+    next_point_in_box = (extra_points % NO_SCAN_POINTS_PER_BOX) + 1
+    if extra_points % NO_SCAN_POINTS_PER_BOX == 0:
+        completed_boxes = extra_points // NO_SCAN_POINTS_PER_BOX
+        return (
+            f"**{completed_boxes} no-scan box(es) set!** Optional: click **{next_label}** "
+            "to start another box, or click 'Process Video' now."
+        )
 
-    return "**Calibration + no-scan boxes set!** Click 'Process Video' to start."
+    return (
+        f"**Click point {next_label}** "
+        f"(no-scan box {current_box}, point {next_point_in_box} of 4)"
+    )
+
+
+def _get_center_calibration_click_label(index: int) -> str:
+    """Return the UI label for a center-camera calibration / exclusion click."""
+    if index < CALIBRATION_REQUIRED_POINTS:
+        return CALIBRATION_POINT_LABELS[index]
+    extra_index = index - CALIBRATION_REQUIRED_POINTS
+    box_index = (extra_index // NO_SCAN_POINTS_PER_BOX) + 1
+    point_index = (extra_index % NO_SCAN_POINTS_PER_BOX) + 1
+    return f"Z{box_index}.{point_index}"
 
 
 def _split_calibration_and_exclusion_points(clicked_points: list) -> tuple:
     """Split UI clicks into homography points and optional robot no-scan polygons."""
     points = list(clicked_points or [])
     calibration_points = points[:CALIBRATION_REQUIRED_POINTS]
-    extra_points = points[CALIBRATION_REQUIRED_POINTS:CALIBRATION_TOTAL_POINTS]
+    extra_points = points[CALIBRATION_REQUIRED_POINTS:]
 
     polygons = []
-    for idx in range(0, len(extra_points), 4):
-        polygon = extra_points[idx:idx + 4]
-        if len(polygon) == 4:
+    for idx in range(0, len(extra_points), NO_SCAN_POINTS_PER_BOX):
+        polygon = extra_points[idx:idx + NO_SCAN_POINTS_PER_BOX]
+        if len(polygon) == NO_SCAN_POINTS_PER_BOX:
             polygons.append(polygon)
 
     return calibration_points, polygons
@@ -2728,7 +2875,7 @@ def _redraw_calibration_image(base_image: Image.Image, clicked_points: list) -> 
         draw.line(polygon + [polygon[0]], fill=(255, 220, 0), width=3)
 
     for i, (px, py) in enumerate(clicked_points):
-        label = ALL_CALIBRATION_POINT_LABELS[i] if i < len(ALL_CALIBRATION_POINT_LABELS) else f"P{i}"
+        label = _get_center_calibration_click_label(i)
         color = (0, 200, 255) if label.startswith('B') else (255, 100, 100)
         radius = 8
         draw.ellipse([px - radius, py - radius, px + radius, py + radius], fill=color, outline=(255, 255, 255), width=2)
@@ -4890,7 +5037,7 @@ def process_single_video(video_path: str, camera_side: str = "blue", target_fps:
                 bounding_boxes_json = "[]"
             else:
                 # Center camera: bumper color detection + LLM labeling
-                _, current_bumper_red_mask, current_bumper_blue_mask, raw_bboxes = detect_robots_by_bumper_color(
+                detector_bboxes_json, current_bumper_red_mask, current_bumper_blue_mask, raw_bboxes = detect_robots_by_bumper_color(
                     frame,
                     person_mask=current_person_mask,
                     field_pixel_mask=field_pixel_mask,
@@ -4899,10 +5046,34 @@ def process_single_video(video_path: str, camera_side: str = "blue", target_fps:
                 
                 # Get frame dimensions for crop clamping
                 img_height, img_width = frame.shape[:2]
+                try:
+                    detector_entries = json.loads(parse_json(detector_bboxes_json))
+                except Exception:
+                    detector_entries = []
+                raw_bbox_colors = [
+                    str(detector_entries[i].get("label", "robot")).strip().lower()
+                    if i < len(detector_entries) and isinstance(detector_entries[i], dict)
+                    else "robot"
+                    for i in range(len(raw_bboxes))
+                ]
+                allowed_numbers_by_detection = [
+                    _get_allowed_robot_numbers_for_detection(
+                        camera_side,
+                        bbox,
+                        raw_bbox_colors[i] if i < len(raw_bbox_colors) else "robot",
+                        img_width,
+                        blue_robots,
+                        red_robots
+                    )
+                    for i, bbox in enumerate(raw_bboxes)
+                ]
                 
                 # Use RobotLabelTracker + local LLM OCR to assign team numbers
                 if robot_numbers and robot_label_tracker and raw_bboxes:
-                    tracked_labels, needs_query = robot_label_tracker.check_needs_llm(raw_bboxes)
+                    tracked_labels, needs_query = robot_label_tracker.check_needs_llm(
+                        raw_bboxes,
+                        allowed_numbers_by_detection
+                    )
                     if len(tracked_labels) != len(raw_bboxes) or len(needs_query) != len(raw_bboxes):
                         print(
                             f"[Bumper+LLM] Length mismatch: raw_bboxes={len(raw_bboxes)}, "
@@ -4930,7 +5101,7 @@ def process_single_video(video_path: str, camera_side: str = "blue", target_fps:
                             cropped = pil_frame.crop((cx1, cy1, cx2, cy2))
                             llm_queries.append({
                                 'cropped_image': cropped,
-                                'available_numbers': robot_numbers,
+                                'available_numbers': allowed_numbers_by_detection[i],
                                 'previous_label': tracked_labels[i] if tracked_labels[i] else None
                             })
                             llm_indices.append(i)
@@ -4953,7 +5124,11 @@ def process_single_video(video_path: str, camera_side: str = "blue", target_fps:
                             all_labels.append(tracked_labels[i])
                     
                     # Update tracker for identity persistence
-                    final_labels = robot_label_tracker.update(raw_bboxes, all_labels)
+                    final_labels = robot_label_tracker.update(
+                        raw_bboxes,
+                        all_labels,
+                        allowed_numbers_by_detection
+                    )
                 else:
                     final_labels = ["robot"] * len(raw_bboxes)
                 
@@ -5928,10 +6103,14 @@ def create_demo():
                 # --- Center Camera Calibration ---
                 gr.Markdown("### Center Camera Calibration")
                 gr.Markdown(
-                    "After the 8 field points, you can optionally click 2 rotated no-scan boxes: "
-                    "BZ1->BZ4 for the blue-side box, then RZ1->RZ4 for the red-side box."
+                    "After the 8 field points, you can optionally click 4 corners per "
+                    "center-camera no-scan box. Keep clicking in groups of 4 to add as "
+                    "many robot exclusion boxes as you want."
                 )
-                gr.Markdown("Click the 8 field landmarks in order (B1→B4, R1→R4) on the frame below.")
+                gr.Markdown(
+                    "Click the 8 field landmarks in order (B1→B4, R1→R4) on the frame below. "
+                    "Any extra clicks after that are grouped into 4-point no-scan polygons."
+                )
                 
                 calibration_base_image = gr.State(None)  # Original clean frame
                 calibration_points_state = gr.State([])    # List of (x,y) tuples
@@ -6187,10 +6366,7 @@ def create_demo():
                 return None, clicked_points, "Upload a video first"
             x, y = evt.index
             n = len(clicked_points)
-            if n >= CALIBRATION_TOTAL_POINTS:
-                annotated = _redraw_calibration_image(base_image, clicked_points)
-                return annotated, clicked_points, _get_calibration_status_text(n)
-            label = ALL_CALIBRATION_POINT_LABELS[n] if n < len(ALL_CALIBRATION_POINT_LABELS) else f"P{n}"
+            label = _get_center_calibration_click_label(n)
             img_w, img_h = base_image.size
             print(f"[Calibration UI] Click #{n+1} ({label}): raw=({x}, {y}), base_image_size=({img_w}x{img_h})")
             clicked_points = list(clicked_points) + [(x, y)]
