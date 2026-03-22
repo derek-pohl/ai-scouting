@@ -575,6 +575,8 @@ _HIDDEN_ROBOT_SLOT_CENTERS = {
     }
 }
 
+_RECENT_ROBOT_BBOX_SKIP_LABELS = {"robot", "unknown", "red", "blue"}
+
 
 def _hidden_bbox_for_slot(side_name: str, x_bucket: int) -> tuple:
     """Build a hidden robot bbox for a side-camera position bucket."""
@@ -600,7 +602,8 @@ def inject_hidden_robot_bboxes(base_bboxes_json: str, persistent_hidden_robots: 
                                width: int, height: int,
                                edge_persist_frames: int = 60) -> tuple:
     """
-    Augment center-camera detections with hidden robots inferred from the side cameras.
+    Augment center-camera detections with hidden robots inferred from the latest
+    side-camera visibility snapshot for each alliance.
 
     Returns:
         Tuple of (augmented_bboxes_json, updated_persistent_hidden_robots)
@@ -616,9 +619,7 @@ def inject_hidden_robot_bboxes(base_bboxes_json: str, persistent_hidden_robots: 
         if lbl and lbl not in ('robot', 'unknown', 'red', 'blue'):
             center_detected_labels.add(lbl)
 
-    updated_hidden = dict(persistent_hidden_robots or {})
-    latest_side_frame_by_side = {}
-    seen_on_latest_side_frame = {"blue": set(), "red": set()}
+    updated_hidden = {}
 
     for side_name in ('blue', 'red'):
         side_data = side_camera_visible_robots.get(side_name, {}) if side_camera_visible_robots else {}
@@ -635,8 +636,6 @@ def inject_hidden_robot_bboxes(base_bboxes_json: str, persistent_hidden_robots: 
         if latest_side_frame is None:
             continue
 
-        latest_side_frame_by_side[side_name] = latest_side_frame
-
         side_visible = side_data[latest_side_frame]
         for item in side_visible:
             if not isinstance(item, dict):
@@ -652,38 +651,11 @@ def inject_hidden_robot_bboxes(base_bboxes_json: str, persistent_hidden_robots: 
             if robot_label in center_detected_labels:
                 continue
 
-            seen_on_latest_side_frame[side_name].add(robot_label)
-
             updated_hidden[robot_label] = {
                 'side': side_name,
                 'x_bucket': x_bucket,
                 'last_side_seen_frame': latest_side_frame
             }
-
-    for robot_label in list(updated_hidden.keys()):
-        if robot_label in center_detected_labels:
-            del updated_hidden[robot_label]
-            continue
-
-        hidden_meta = updated_hidden[robot_label]
-        side_name = hidden_meta.get('side')
-        x_bucket = hidden_meta.get('x_bucket')
-        last_side_seen_frame = hidden_meta.get('last_side_seen_frame')
-
-        if side_name in seen_on_latest_side_frame and robot_label in seen_on_latest_side_frame[side_name]:
-            continue
-
-        latest_side_frame = latest_side_frame_by_side.get(side_name)
-        if latest_side_frame is None:
-            del updated_hidden[robot_label]
-            continue
-
-        if x_bucket == 3 and last_side_seen_frame is not None:
-            age = frame_count - last_side_seen_frame
-            if age <= edge_persist_frames:
-                continue
-
-        del updated_hidden[robot_label]
 
     injected_bboxes = list(center_bboxes)
     slot_counts = {}
@@ -728,6 +700,65 @@ def inject_hidden_robot_bboxes(base_bboxes_json: str, persistent_hidden_robots: 
         )
 
     return json.dumps(injected_bboxes), updated_hidden
+
+
+def persist_recent_robot_bboxes(current_bboxes_json: str, recent_robot_bboxes: dict,
+                                frame_count: int, max_age_frames: int) -> tuple:
+    """
+    Keep the last seen labeled robot bbox alive briefly when detections disappear.
+
+    This runs after center detections and side-camera hidden injections are merged,
+    so a robot only persists when neither source currently sees it.
+    """
+    try:
+        current_bboxes = json.loads(parse_json(current_bboxes_json))
+    except Exception:
+        current_bboxes = []
+
+    output_bboxes = list(current_bboxes)
+    updated_recent = {}
+    current_labels = set()
+
+    for bbox in current_bboxes:
+        label = str(bbox.get('label', '')).strip()
+        box = bbox.get('box_2d', [])
+        if not label or label.lower() in _RECENT_ROBOT_BBOX_SKIP_LABELS or len(box) < 4:
+            continue
+
+        current_labels.add(label)
+        updated_recent[label] = {
+            'bbox': {
+                'box_2d': list(box[:4]),
+                'label': label
+            },
+            'last_seen_frame': frame_count
+        }
+
+    for label, meta in (recent_robot_bboxes or {}).items():
+        if label in current_labels:
+            continue
+
+        bbox = meta.get('bbox')
+        last_seen_frame = meta.get('last_seen_frame')
+        if bbox is None or last_seen_frame is None:
+            continue
+
+        if (frame_count - last_seen_frame) > max_age_frames:
+            continue
+
+        output_bboxes.append({
+            'box_2d': list(bbox.get('box_2d', [])[:4]),
+            'label': str(bbox.get('label', label)).strip() or label
+        })
+        updated_recent[label] = {
+            'bbox': {
+                'box_2d': list(bbox.get('box_2d', [])[:4]),
+                'label': str(bbox.get('label', label)).strip() or label
+            },
+            'last_seen_frame': last_seen_frame
+        }
+
+    return json.dumps(output_bboxes), updated_recent
 
 
 _SIDE_CAMERA_REF_SIZE = (940, 339)
@@ -1405,6 +1436,31 @@ class BallTracker:
         else:
             # Unknown camera side - allow all robots
             return True
+
+    def _get_center_ball_alliance(self, ball_x: int) -> str:
+        """Determine which alliance owns the current half of the center camera."""
+        if self.camera_side != "center" or self.frame_width <= 0:
+            return None
+        midpoint = self.frame_width / 2.0
+        return "blue" if ball_x < midpoint else "red"
+
+    def _is_robot_eligible_for_ball(self, robot_label: str, ball_x: int) -> bool:
+        """
+        Filter candidate robots for attribution.
+
+        Side cameras are alliance-specific. For the center camera, the ball's x
+        position determines which alliance can own the shot: left half is blue,
+        right half is red.
+        """
+        label = str(robot_label).strip()
+        if self.camera_side == "center":
+            ball_alliance = self._get_center_ball_alliance(ball_x)
+            if ball_alliance == "blue":
+                return label in self.blue_robots
+            if ball_alliance == "red":
+                return label in self.red_robots
+            return False
+        return self._is_robot_in_camera_alliance(label)
     
     def _ball_overlaps_robot(self, ball_x: int, ball_y: int, ball_radius: int) -> str:
         """
@@ -1420,8 +1476,8 @@ class BallTracker:
         edge_margin = self.frame_width * 0.05 if self.frame_width > 0 else 0
         
         for (y1, x1, y2, x2, label) in self.robot_bboxes:
-            # Only consider robots in the camera's alliance for shot attribution
-            if not self._is_robot_in_camera_alliance(label):
+            # Only consider robots eligible for the current ball position.
+            if not self._is_robot_eligible_for_ball(label, ball_x):
                 continue
             
             bbox_w = x2 - x1
@@ -1468,7 +1524,7 @@ class BallTracker:
         best_dist = max_dist
         
         for (y1, x1, y2, x2, label) in self.robot_bboxes:
-            if not self._is_robot_in_camera_alliance(label):
+            if not self._is_robot_eligible_for_ball(label, ball_x):
                 continue
             robot_cx = (x1 + x2) / 2
             robot_cy = (y1 + y2) / 2
@@ -1479,7 +1535,7 @@ class BallTracker:
         
         return best_label
 
-    def _get_shot_origin_robot(self, overlapping_robot: str, last_overlap_robot: str,
+    def _get_shot_origin_robot(self, ball_x: int, overlapping_robot: str, last_overlap_robot: str,
                                last_overlap_frame: int, last_near_robot: str) -> str:
         """
         Choose which robot should own a newly detected shot.
@@ -1487,15 +1543,19 @@ class BallTracker:
         We prefer a recent true overlap/possession signal over nearest-robot fallback
         so airborne balls don't get reassigned to a robot behind the shooter.
         """
-        if overlapping_robot:
+        if overlapping_robot and self._is_robot_eligible_for_ball(overlapping_robot, ball_x):
             return overlapping_robot
 
         if last_overlap_robot and last_overlap_frame is not None:
             frames_since_overlap = self.current_frame - last_overlap_frame
-            if frames_since_overlap <= self.possession_memory_frames:
+            if (frames_since_overlap <= self.possession_memory_frames and
+                    self._is_robot_eligible_for_ball(last_overlap_robot, ball_x)):
                 return last_overlap_robot
 
-        return last_near_robot
+        if last_near_robot and self._is_robot_eligible_for_ball(last_near_robot, ball_x):
+            return last_near_robot
+
+        return None
     
     def get_predicted_positions(self) -> list:
         """
@@ -1820,6 +1880,7 @@ class BallTracker:
             # Prefer recent true possession/overlap over nearest-robot fallback.
             if not shot_by and not candidate_shot:
                 nearby_robot = self._get_shot_origin_robot(
+                    x,
                     overlapping_robot,
                     last_overlap_robot,
                     last_overlap_frame,
@@ -3731,6 +3792,21 @@ _BUMPER_BLUE_MIN_DOMINANCE = 10
 _BUMPER_BLUE_NEAR_BLACK_VALUE_MAX = 55
 _BUMPER_BLUE_NEAR_BLACK_SPREAD_MAX = 10
 
+# Center-camera red bumper tuning.
+# Includes darker maroon bumpers such as rgb(68, 19, 30) while using the
+# field-structure exclusion mask to keep persistent deep-red structures out.
+_BUMPER_RED1_LOWER = np.array([0, 80, 80])
+_BUMPER_RED1_UPPER = np.array([10, 255, 220])
+_BUMPER_RED2_LOWER = np.array([160, 80, 80])
+_BUMPER_RED2_UPPER = np.array([180, 255, 220])
+_BUMPER_DARK_RED1_LOWER = np.array([0, 110, 35])
+_BUMPER_DARK_RED1_UPPER = np.array([12, 255, 120])
+_BUMPER_DARK_RED2_LOWER = np.array([165, 110, 35])
+_BUMPER_DARK_RED2_UPPER = np.array([180, 255, 120])
+_BUMPER_RED_MIN_DOMINANCE = 10
+_BUMPER_RED_NEAR_BLACK_VALUE_MAX = 40
+_BUMPER_RED_NEAR_BLACK_SPREAD_MAX = 10
+
 # Minimum contour area / color pixels for bumper detection (reject small noise)
 _BUMPER_MIN_AREA = 90
 _BUMPER_MIN_COLOR_PIXELS = 65
@@ -3739,6 +3815,45 @@ _BUMPER_MERGE_GAP_Y = 45
 
 # Center camera playing field ROI (x1, y1, x2, y2) — excludes audience areas
 _BUMPER_FIELD_ROI = (0, 315, 1918, 705)
+
+
+def _build_center_red_mask(field_region_bgr: np.ndarray, hsv_region: np.ndarray) -> np.ndarray:
+    """
+    Detect center-camera red bumpers, including darker maroon shades such as
+    rgb(68, 19, 30), while rejecting nearly neutral black structures.
+    """
+    base_red_mask = cv2.bitwise_or(
+        cv2.inRange(hsv_region, _BUMPER_RED1_LOWER, _BUMPER_RED1_UPPER),
+        cv2.inRange(hsv_region, _BUMPER_RED2_LOWER, _BUMPER_RED2_UPPER)
+    )
+    dark_red_mask = cv2.bitwise_or(
+        cv2.inRange(hsv_region, _BUMPER_DARK_RED1_LOWER, _BUMPER_DARK_RED1_UPPER),
+        cv2.inRange(hsv_region, _BUMPER_DARK_RED2_LOWER, _BUMPER_DARK_RED2_UPPER)
+    )
+
+    if field_region_bgr is None or field_region_bgr.size == 0:
+        return cv2.bitwise_or(base_red_mask, dark_red_mask)
+
+    blue = field_region_bgr[:, :, 0].astype(np.int16)
+    green = field_region_bgr[:, :, 1].astype(np.int16)
+    red = field_region_bgr[:, :, 2].astype(np.int16)
+    value = hsv_region[:, :, 2].astype(np.int16)
+
+    channel_max = np.maximum(np.maximum(blue, green), red)
+    channel_min = np.minimum(np.minimum(blue, green), red)
+    channel_spread = channel_max - channel_min
+
+    red_dominant = (
+        (red >= (green + _BUMPER_RED_MIN_DOMINANCE)) &
+        (red >= (blue + _BUMPER_RED_MIN_DOMINANCE))
+    )
+    near_black_structure = (
+        (value <= _BUMPER_RED_NEAR_BLACK_VALUE_MAX) &
+        (channel_spread <= _BUMPER_RED_NEAR_BLACK_SPREAD_MAX)
+    )
+
+    red_gate = np.where(red_dominant & ~near_black_structure, 255, 0).astype(np.uint8)
+    return cv2.bitwise_and(cv2.bitwise_or(base_red_mask, dark_red_mask), red_gate)
 
 
 def _build_center_blue_mask(field_region_bgr: np.ndarray, hsv_region: np.ndarray) -> np.ndarray:
@@ -4019,10 +4134,15 @@ def compute_field_pixel_mask(video_path: str, start_seconds: float = 0,
 
             hsv = cv2.cvtColor(field_region, cv2.COLOR_BGR2HSV)
 
-            # Red (two HSV ranges)
-            r1 = cv2.inRange(hsv, lower_red1, upper_red1)
-            r2 = cv2.inRange(hsv, lower_red2, upper_red2)
-            red_pix = cv2.bitwise_or(r1, r2)
+            # Red, including deeper maroon shades that should also count as
+            # persistent field structure if they remain static in the center view.
+            red_pix = cv2.bitwise_or(
+                cv2.bitwise_or(
+                    cv2.inRange(hsv, lower_red1, upper_red1),
+                    cv2.inRange(hsv, lower_red2, upper_red2)
+                ),
+                _build_center_red_mask(field_region, hsv)
+            )
 
             # Blue, including dark navy bumpers while filtering nearly-black structures.
             blue_pix = _build_center_blue_mask(field_region, hsv)
@@ -4192,24 +4312,25 @@ def detect_robots_by_bumper_color(frame_bgr: np.ndarray, person_mask: np.ndarray
 
     exclusion_roi = robot_exclusion_mask_full[roi_y1:roi_y2, roi_x1:roi_x2][:fh, :fw]
     active_exc_mask = cv2.bitwise_and(active_exc_mask, exclusion_roi)
-    
-    # HSV color ranges
-    lower_red1 = np.array([0, 80, 80])
-    upper_red1 = np.array([10, 255, 220])
-    lower_red2 = np.array([160, 80, 80])
-    upper_red2 = np.array([180, 255, 220])
+
     try:
         # GPU Acceleration Path (using OpenCV T-API / OpenCL)
         umat_roi = cv2.UMat(field_region)
         hsv = cv2.cvtColor(umat_roi, cv2.COLOR_BGR2HSV)
         
-        # Red bumper (two ranges for HSV wrap-around)
-        red_mask1 = cv2.inRange(hsv, lower_red1, upper_red1)
-        red_mask2 = cv2.inRange(hsv, lower_red2, upper_red2)
-        red_mask = cv2.bitwise_or(red_mask1, red_mask2)
+        # Pull HSV back to CPU for the shared color builders.
+        hsv_cpu = hsv.get()
+        red_mask = _build_center_red_mask(field_region, hsv_cpu)
         
         # Blue bumper
-        blue_mask = _build_center_blue_mask(field_region, hsv.get())
+        blue_mask = _build_center_blue_mask(field_region, hsv_cpu)
+
+        # Apply the field-structure exclusion mask before morphology so excluded
+        # deep-red structures cannot seed dilated/bridged robot contours.
+        red_mask = cv2.bitwise_and(red_mask, active_exc_mask)
+        blue_mask = cv2.bitwise_and(blue_mask, active_exc_mask)
+        red_mask = cv2.UMat(red_mask)
+        blue_mask = cv2.UMat(blue_mask)
         
         # Morphology on GPU
         red_mask = cv2.morphologyEx(red_mask, cv2.MORPH_OPEN, _BUMPER_MORPH_KERNEL, iterations=1)
@@ -4239,10 +4360,11 @@ def detect_robots_by_bumper_color(frame_bgr: np.ndarray, person_mask: np.ndarray
         # CPU Fallback Path
         hsv = cv2.cvtColor(field_region, cv2.COLOR_BGR2HSV)
         
-        red_mask1 = cv2.inRange(hsv, lower_red1, upper_red1)
-        red_mask2 = cv2.inRange(hsv, lower_red2, upper_red2)
-        red_mask = cv2.bitwise_or(red_mask1, red_mask2)
+        red_mask = _build_center_red_mask(field_region, hsv)
         blue_mask = _build_center_blue_mask(field_region, hsv)
+
+        red_mask = cv2.bitwise_and(red_mask, active_exc_mask)
+        blue_mask = cv2.bitwise_and(blue_mask, active_exc_mask)
         
         red_mask = cv2.morphologyEx(red_mask, cv2.MORPH_OPEN, _BUMPER_MORPH_KERNEL, iterations=1)
         blue_mask = cv2.morphologyEx(blue_mask, cv2.MORPH_OPEN, _BUMPER_MORPH_KERNEL, iterations=1)
@@ -4616,8 +4738,13 @@ def process_single_video(video_path: str, camera_side: str = "blue", target_fps:
     # Ferry tracker for counting fuel ferries (cross out, cross back, shoot)
     ferry_tracker = FerryTracker(blue_robots=blue_robots, red_robots=red_robots)
     
-    # Persistent hidden robot tracking (label -> {'side': str, 'x_bucket': int})
-    persistent_hidden_robots = {}
+    # Latest hidden robot tracking from the side cameras.
+    hidden_side_robots = {}
+
+    # Keep labeled robot boxes alive for 2 seconds when neither the center nor
+    # side cameras currently sees them.
+    recent_robot_bboxes = {}
+    robot_bbox_persist_frames = max(1, int(round((original_fps or 30.0) * 2.0)))
     
     # Disabled tracker for detecting when robots stop moving
     disabled_tracker = DisabledTracker(fps=target_fps)
@@ -4845,14 +4972,22 @@ def process_single_video(video_path: str, camera_side: str = "blue", target_fps:
                 bounding_boxes_json = json.dumps(detections)
 
                 if camera_side == "center" and side_camera_visible_robots:
-                    bounding_boxes_json, persistent_hidden_robots = inject_hidden_robot_bboxes(
+                    bounding_boxes_json, hidden_side_robots = inject_hidden_robot_bboxes(
                         bounding_boxes_json,
-                        persistent_hidden_robots,
+                        hidden_side_robots,
                         side_camera_visible_robots,
                         frame_count,
                         width,
                         height,
-                        edge_persist_frames=max(30, int(round(original_fps * 2.0)))
+                        edge_persist_frames=robot_bbox_persist_frames
+                    )
+
+                if camera_side == "center":
+                    bounding_boxes_json, recent_robot_bboxes = persist_recent_robot_bboxes(
+                        bounding_boxes_json,
+                        recent_robot_bboxes,
+                        frame_count,
+                        max_age_frames=robot_bbox_persist_frames
                     )
             
             # Store for tracking
