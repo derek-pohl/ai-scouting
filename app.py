@@ -378,7 +378,8 @@ def query_side_camera_presence(
         timeout: Request timeout in seconds
         
     Returns:
-        List of dicts like [{'team': '1234', 'x_bucket': 2}]
+        List of dicts like
+        [{'team': '1234', 'description': 'low robot near left wall', 'position': 'left', 'x_bucket': 2}]
     """
     if not LMSTUDIO_ENABLED:
         return []
@@ -407,14 +408,18 @@ def query_side_camera_presence(
             "Think of the 3 possible positions as 'middle', 'right', and 'far right'. "
             "Use the JSON field 'position' with one of exactly these values: "
             "'middle', 'right', or 'far right'. "
+            "Use the JSON field 'description' to explain your reasoning for which robot you matched "
+            "and why it belongs in that position box. "
+            "Describe where the robot appears in the scene relative to the guide boxes, wall, lane, "
+            "or center area, and explain why you chose 'middle', 'right', or 'far right'. "
             "Each robot can appear in only one position, so do not assign multiple positions to the same team. "
             "Try to keep only one robot in each zone at a time whenever possible. "
             "Use 'far right' only if the robot is truly in the far-right edge lane, not merely somewhat right of center."
         )
         example_json = (
-            "[{\"team\":\"77235\",\"position\":\"middle\"},"
-            "{\"team\":\"4909\",\"position\":\"right\"},"
-            "{\"team\":\"5962\",\"position\":\"far right\"}]"
+            "[{\"team\":\"77235\",\"description\":\"This robot sits mainly inside the middle guide box and is not close enough to the right wall to count as right, so I placed it in middle.\",\"position\":\"middle\"},"
+            "{\"team\":\"4909\",\"description\":\"This robot is shifted into the right-side lane and aligns better with the right guide box than the middle one, but it is not extreme enough to be far right.\",\"position\":\"right\"},"
+            "{\"team\":\"5962\",\"description\":\"This robot is pushed all the way against the far-right edge lane near the wall, clearly beyond the normal right box, so it belongs in far right.\",\"position\":\"far right\"}]"
         )
     else:
         valid_positions = {
@@ -427,14 +432,18 @@ def query_side_camera_presence(
             "Think of the 3 possible positions as 'middle', 'left', and 'far left'. "
             "Use the JSON field 'position' with one of exactly these values: "
             "'middle', 'left', or 'far left'. "
+            "Use the JSON field 'description' to explain your reasoning for which robot you matched "
+            "and why it belongs in that position box. "
+            "Describe where the robot appears in the scene relative to the guide boxes, wall, lane, "
+            "or center area, and explain why you chose 'middle', 'left', or 'far left'. "
             "Each robot can appear in only one position, so do not assign multiple positions to the same team. "
             "Try to keep only one robot in each zone at a time whenever possible. "
             "Use 'far left' only if the robot is truly in the far-left edge lane, not merely somewhat left of center."
         )
         example_json = (
-            "[{\"team\":\"77235\",\"position\":\"middle\"},"
-            "{\"team\":\"4909\",\"position\":\"left\"},"
-            "{\"team\":\"5962\",\"position\":\"far left\"}]"
+            "[{\"team\":\"77235\",\"description\":\"This robot sits mainly inside the middle guide box and is not close enough to the left wall to count as left, so I placed it in middle.\",\"position\":\"middle\"},"
+            "{\"team\":\"4909\",\"description\":\"This robot is shifted into the left-side lane and aligns better with the left guide box than the middle one, but it is not extreme enough to be far left.\",\"position\":\"left\"},"
+            "{\"team\":\"5962\",\"description\":\"This robot is pushed all the way against the far-left edge lane near the wall, clearly beyond the normal left box, so it belongs in far left.\",\"position\":\"far left\"}]"
         )
     prompt = (
         f"Which of these robots are visible in this image: {numbers_str}? "
@@ -442,7 +451,9 @@ def query_side_camera_presence(
         f"You do not need to find every robot from the list; return only the ones you actually see. "
         f"{bucket_instructions} "
         f"Reply with ONLY a JSON array. "
-        f"Each item must be an object with keys 'team' and 'position'. "
+        f"Each item must be an object with keys 'team', 'description', and 'position', in that order. "
+        f"Use 'description' to explain the visual evidence for the match and the reasoning behind the position choice. "
+        f"The description does not need to be brief; 1-2 sentences is fine if needed. "
         f"You can return multiple robots. "
         f"Example: "
         f"{example_json}. "
@@ -492,12 +503,18 @@ def query_side_camera_presence(
                 team = str(item.get("team", "")).strip()
                 if team not in valid_robots or team in seen:
                     continue
+                description = " ".join(str(item.get("description", "")).strip().split())
                 position = str(item.get("position", "")).strip().lower()
                 position = " ".join(position.split())
                 x_bucket = valid_positions.get(position)
                 if x_bucket is None:
                     continue
-                found.append({"team": team, "position": position, "x_bucket": x_bucket})
+                found.append({
+                    "team": team,
+                    "description": description,
+                    "position": position,
+                    "x_bucket": x_bucket
+                })
                 seen.add(team)
 
             return found
