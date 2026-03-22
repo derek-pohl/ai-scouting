@@ -265,7 +265,6 @@ def query_local_llm_for_team_number(
                         ]
                     }
                 ],
-                "max_tokens": 10,
                 "temperature": 0.1
             },
             timeout=timeout
@@ -460,7 +459,6 @@ def query_side_camera_presence(
                         ]
                     }
                 ],
-                "max_tokens": 30,
                 "temperature": 0.1
             },
             timeout=timeout
