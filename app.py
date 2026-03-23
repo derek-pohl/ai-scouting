@@ -1456,6 +1456,13 @@ class BallTracker:
         self.frame_width = frame_width  # Stored for edge-robot detection
         self.frame_height = frame_height  # Stored for edge-robot detection
         self.possession_memory_frames = max(2, int(round(self.fps * 0.30)))
+        self.launch_anchor_y_ratio = 0.35
+        self.launch_zone_y_ratio = 0.65
+        self.launch_zone_x_ratio = 0.15
+        self.launch_anchor_max_distance = 175.0
+        self.min_launch_rise_pixels = max(4, int(round(self.min_upward_pixels * 0.5)))
+        self.min_launch_window_gain = max(8, int(round(self.min_upward_pixels * 1.5)))
+        self.motion_history_size = 4
         
         # Track balls: {ball_id: {'pos': (x, y, r), 'prev_pos': (x, y, r), 'shot_by': robot_label, ...}}
         self.tracked_balls = {}
@@ -1706,10 +1713,27 @@ class BallTracker:
                 return label
         
         return None
-    
-    def _find_nearest_alliance_robot(self, ball_x: int, ball_y: int, max_dist: float = 150.0) -> str:
+
+    def _get_robot_launch_geometry(self, y1: float, x1: float, y2: float, x2: float):
         """
-        Find the nearest alliance robot to a ball by center-to-center distance.
+        Build a launch anchor slightly above the robot plus a forgiving launch zone.
+
+        The anchor is where we measure "nearest robot" for shot credit, and the zone
+        lets us prefer robots that the ball is visibly lifting out of.
+        """
+        bbox_w = max(1.0, x2 - x1)
+        bbox_h = max(1.0, y2 - y1)
+        anchor_x = (x1 + x2) / 2.0
+        anchor_y = y1 - (bbox_h * self.launch_anchor_y_ratio)
+        zone_x1 = x1 - (bbox_w * self.launch_zone_x_ratio)
+        zone_x2 = x2 + (bbox_w * self.launch_zone_x_ratio)
+        zone_y1 = y1 - (bbox_h * self.launch_zone_y_ratio)
+        zone_y2 = y2
+        return anchor_x, anchor_y, zone_x1, zone_y1, zone_x2, zone_y2
+
+    def _find_nearest_alliance_robot(self, ball_x: int, ball_y: int, max_dist: float = None) -> str:
+        """
+        Find the nearest alliance robot using a launch anchor above each robot bbox.
         More forgiving than bbox overlap — works even when the ball has exited the bbox.
         
         Args:
@@ -1720,17 +1744,21 @@ class BallTracker:
         Returns:
             Robot label of nearest alliance robot, or None if none within max_dist
         """
+        if max_dist is None:
+            max_dist = self.launch_anchor_max_distance
+
         best_label = None
         best_dist = max_dist
         
         for (y1, x1, y2, x2, label) in self.robot_bboxes:
             if not self._is_robot_eligible_for_ball(label, ball_x):
                 continue
-            robot_cx = (x1 + x2) / 2
-            robot_cy = (y1 + y2) / 2
-            dist = ((ball_x - robot_cx) ** 2 + (ball_y - robot_cy) ** 2) ** 0.5
-            if dist < best_dist:
-                best_dist = dist
+            anchor_x, anchor_y, zone_x1, zone_y1, zone_x2, zone_y2 = self._get_robot_launch_geometry(y1, x1, y2, x2)
+            dist = ((ball_x - anchor_x) ** 2 + (ball_y - anchor_y) ** 2) ** 0.5
+            in_launch_zone = zone_x1 <= ball_x <= zone_x2 and zone_y1 <= ball_y <= zone_y2
+            score = dist * 0.75 if in_launch_zone else dist + 20.0
+            if score < best_dist:
+                best_dist = score
                 best_label = label
         
         return best_label
@@ -1756,6 +1784,30 @@ class BallTracker:
             return last_near_robot
 
         return None
+
+    def _get_shot_launch_metrics(self, prev_pos, recent_positions: list, current_y: int) -> tuple:
+        """
+        Measure whether the ball is lifting into a shot over a short window.
+        This is intentionally forgiving so a missed SAM 3 frame does not erase the event.
+        """
+        instant_rise = 0.0
+        if prev_pos is not None:
+            instant_rise = prev_pos[1] - current_y
+
+        recent_positions = list(recent_positions or [])
+        y_history = [pos[1] for pos in recent_positions[-(self.motion_history_size - 1):]]
+        y_history.append(current_y)
+
+        window_gain = 0.0
+        rising_steps = 0
+        if len(y_history) >= 2:
+            window_gain = y_history[0] - y_history[-1]
+            rising_steps = sum(
+                1 for prev_y, next_y in zip(y_history, y_history[1:])
+                if (prev_y - next_y) >= self.min_launch_rise_pixels
+            )
+
+        return instant_rise, window_gain, rising_steps
     
     def get_predicted_positions(self) -> list:
         """
@@ -2034,6 +2086,7 @@ class BallTracker:
                 last_overlap_robot = old_data.get('last_overlap_robot')
                 last_overlap_frame = old_data.get('last_overlap_frame')
                 was_ever_in_goal = old_data.get('last_seen_in_goal', False)
+                recent_positions = list(old_data.get('recent_positions') or ([prev_pos] if prev_pos else []))
                 
             elif ball_id is None:
                 # New ball
@@ -2052,7 +2105,8 @@ class BallTracker:
                     'last_overlap_robot': cur_overlap,
                     'last_overlap_frame': self.current_frame if cur_overlap else None,
                     'candidate_shot': None,
-                    'last_seen_in_goal': False
+                    'last_seen_in_goal': False,
+                    'recent_positions': [(x, y, r)]
                 }
                 robot_label = None
                 results.append((x, y, r, robot_label))
@@ -2070,57 +2124,39 @@ class BallTracker:
                 last_overlap_robot = old_data.get('last_overlap_robot')
                 last_overlap_frame = old_data.get('last_overlap_frame')
                 was_ever_in_goal = old_data.get('last_seen_in_goal', False)
+                recent_positions = list(old_data.get('recent_positions') or ([prev_pos] if prev_pos else []))
             
-            # Check for shot initiation (upward movement >= min_upward_pixels)
-            y_change = prev_pos[1] - y  # Positive if ball moved up
-            
+            recent_positions = recent_positions[-(self.motion_history_size - 1):]
+            cur_overlap = self._ball_overlaps_robot(x, y, r)
+            cur_nearest = self._find_nearest_alliance_robot(x, y)
 
-            
-            # If not currently a shot/candidate, check if we should start tracking a shot
-            # Prefer recent true possession/overlap over nearest-robot fallback.
-            if not shot_by and not candidate_shot:
+            # Check for shot initiation using a short upward-motion window.
+            instant_rise, window_gain, rising_steps = self._get_shot_launch_metrics(prev_pos, recent_positions, y)
+
+            # As soon as the ball is clearly lifting, credit the nearest launch anchor.
+            if not shot_by:
                 nearby_robot = self._get_shot_origin_robot(
                     x,
-                    overlapping_robot,
+                    cur_overlap or overlapping_robot,
                     last_overlap_robot,
                     last_overlap_frame,
-                    last_near_robot
+                    cur_nearest
                 )
-                if y_change >= self.min_upward_pixels and nearby_robot:
-                    # Start candidate tracking
-                    candidate_shot = {
-                        'robot': nearby_robot,
-                        'start_pos': prev_pos,
-                        'start_frame': self.current_frame
-                    }
-            
-            # Validate candidate shot - based on height gain ONLY
-            if candidate_shot:
-                frames_since_start = self.current_frame - candidate_shot['start_frame']
-                seconds_since_start = frames_since_start / self.fps
-                
-                if seconds_since_start >= 0.125:
-                    # Validation Check: Must be >= 25 pixels higher than start
-                    start_y = candidate_shot['start_pos'][1]
-                    current_y = y
-                    height_gain = start_y - current_y
-                    
-                    if height_gain >= 25:
-                        # Confirmed! Promoting to full shot - label the ball
-                        # NOTE: Attempts are NOT counted here - they're counted after 2 seconds
-                        shot_by = candidate_shot['robot']
-                        shot_time = self.current_frame
-                        shot_evaluated = False  # Haven't counted this shot yet
-                        candidate_shot = None
-                        print(f"[SHOT DETECTED] Ball {ball_id} shot by {shot_by} at pos=({x:.0f},{y:.0f}), height_gain={height_gain:.0f}px")
-                    else:
-                        # Failed validation - not enough height
-                        print(f"[SHOT FAILED] Ball {ball_id} height_gain={height_gain:.0f}px < 25px required")
-                        candidate_shot = None
-                        
-                elif y > candidate_shot['start_pos'][1] + 20:
-                    # Early failure check
+                launch_detected = (
+                    instant_rise >= self.min_launch_rise_pixels or
+                    window_gain >= self.min_launch_window_gain or
+                    rising_steps >= 2
+                )
+                if nearby_robot and launch_detected:
+                    shot_by = nearby_robot
+                    shot_time = self.current_frame
+                    shot_evaluated = False
                     candidate_shot = None
+                    print(
+                        f"[SHOT DETECTED] Ball {ball_id} shot by {shot_by} at "
+                        f"pos=({x:.0f},{y:.0f}), rise={instant_rise:.0f}px, "
+                        f"window_gain={window_gain:.0f}px, steps={rising_steps}"
+                    )
             
             # Check if 2 seconds have passed since shot - time to evaluate!
             # Only count MADE shots (ball in goal)
@@ -2157,12 +2193,11 @@ class BallTracker:
             if shot_by and is_in_goal:
                 print(f"[IN GOAL] Ball {ball_id} (shot by {shot_by}) at pos=({x:.0f},{y:.0f})")
             
-            cur_overlap = self._ball_overlaps_robot(x, y, r)
-            cur_nearest = self._find_nearest_alliance_robot(x, y)
             updated_last_overlap_robot = cur_overlap or last_overlap_robot
             updated_last_overlap_frame = self.current_frame if cur_overlap else last_overlap_frame
             # Update last_near_robot: prefer overlap, then nearest, then keep previous
             updated_near = cur_overlap or cur_nearest or last_near_robot
+            updated_recent_positions = recent_positions + [(x, y, r)]
             
             new_tracked[ball_id] = {
                 'pos': (x, y, r),
@@ -2175,7 +2210,8 @@ class BallTracker:
                 'last_overlap_robot': updated_last_overlap_robot,
                 'last_overlap_frame': updated_last_overlap_frame,
                 'candidate_shot': candidate_shot,
-                'last_seen_in_goal': ever_in_goal
+                'last_seen_in_goal': ever_in_goal,
+                'recent_positions': updated_recent_positions
             }
             
             # Add to results
