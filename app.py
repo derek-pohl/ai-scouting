@@ -6815,8 +6815,10 @@ MANUAL_TRACKER_HEAD = r"""
   #manual-tracker-video {
     width: 100%;
     display: block;
-    max-height: 520px;
+    max-height: 760px;
+    min-height: 620px;
     background: #020617;
+    object-fit: contain;
   }
   #manual-tracker-overlay {
     position: absolute;
@@ -6908,6 +6910,7 @@ MANUAL_TRACKER_HEAD = r"""
     const status = document.getElementById("manual-tracker-status");
     const timeLabel = document.getElementById("manual-tracker-time");
     const playBtn = document.getElementById("manual-tracker-play");
+    const restartBtn = document.getElementById("manual-tracker-restart");
     const backBtn = document.getElementById("manual-tracker-back");
     const forwardBtn = document.getElementById("manual-tracker-forward");
     const hiddenFieldRoot = document.querySelector("#manual-tracks-json");
@@ -7006,7 +7009,7 @@ MANUAL_TRACKER_HEAD = r"""
         if (slotState.skipped || slotState.x === null || slotState.y === null) return;
 
         const point = sourceToCanvas(slotState.x, slotState.y);
-        const radius = 12;
+        const radius = 8;
         ctx.fillStyle = slot.color;
         ctx.beginPath();
         ctx.arc(point.x, point.y, radius, 0, Math.PI * 2);
@@ -7014,19 +7017,19 @@ MANUAL_TRACKER_HEAD = r"""
 
         if (slot.id === state.activeSlotId) {
           ctx.strokeStyle = "rgba(255,255,255,0.9)";
-          ctx.lineWidth = 3;
+          ctx.lineWidth = 2;
           ctx.beginPath();
-          ctx.arc(point.x, point.y, radius + 4, 0, Math.PI * 2);
+          ctx.arc(point.x, point.y, radius + 3, 0, Math.PI * 2);
           ctx.stroke();
         }
 
         const label = getSlotLabel(slot);
-        ctx.font = "bold 13px sans-serif";
+        ctx.font = "bold 11px sans-serif";
         const textWidth = ctx.measureText(label).width;
         ctx.fillStyle = "rgba(15, 23, 42, 0.85)";
-        ctx.fillRect(point.x - textWidth / 2 - 6, point.y - 34, textWidth + 12, 18);
+        ctx.fillRect(point.x - textWidth / 2 - 5, point.y - 29, textWidth + 10, 16);
         ctx.fillStyle = "#ffffff";
-        ctx.fillText(label, point.x - textWidth / 2, point.y - 20);
+        ctx.fillText(label, point.x - textWidth / 2, point.y - 17);
       });
     }
 
@@ -7180,6 +7183,13 @@ MANUAL_TRACKER_HEAD = r"""
         video.pause();
       }
     });
+    restartBtn.addEventListener("click", () => {
+      if (!video.src) return;
+      video.pause();
+      state.lastSnapshotTime = -1;
+      video.currentTime = 0;
+      captureAllSlots(true);
+    });
     backBtn.addEventListener("click", () => {
       video.currentTime = Math.max(0, (video.currentTime || 0) - 5);
       captureAllSlots(true);
@@ -7286,6 +7296,7 @@ MANUAL_TRACKER_HTML = """
   <p><strong>Manual Center Tracking</strong> — Keep the marker on the middle of each robot while the center video plays at 2x. Track all six robots unless you intentionally mark one as skipped.</p>
   <div class="manual-tracker-toolbar">
     <button type="button" id="manual-tracker-play">Play / Pause</button>
+    <button type="button" id="manual-tracker-restart">Restart</button>
     <button type="button" id="manual-tracker-back">-5s</button>
     <button type="button" id="manual-tracker-forward">+5s</button>
     <span id="manual-tracker-time">0.0s / 0.0s</span>
@@ -7307,7 +7318,7 @@ def create_manual_demo():
 
     with gr.Blocks(title="Robot Scouter - Manual Center Tracking") as demo:
         with gr.Row():
-            with gr.Column(scale=1):
+            with gr.Column(scale=3):
                 gr.Markdown("<div class='panel-title'>Manual Center Tracking Mode</div>", elem_classes="input-panel")
                 gr.Markdown(
                     "This mode is enabled by `ROBOT_TRACKING_MODE=manual`. "
@@ -7398,7 +7409,7 @@ def create_manual_demo():
 
                 process_btn = gr.Button("Process Video")
 
-            with gr.Column(scale=1):
+            with gr.Column(scale=2):
                 gr.Markdown("<div class='panel-title'>Output</div>", elem_classes="output-panel")
                 center_video_output = gr.Video(label="Center Camera - Annotated")
                 map_video_output = gr.Video(label="Map Time-Lapse - Full Match Movement Overview")
