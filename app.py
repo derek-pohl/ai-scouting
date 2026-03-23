@@ -9,6 +9,7 @@ import json
 import shutil
 import subprocess
 import tempfile
+from bisect import bisect_left
 import cv2
 import numpy as np
 import gradio as gr
@@ -21,6 +22,12 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 
 # Load environment variables
 load_dotenv()
+
+ROBOT_TRACKING_MODE = os.getenv("ROBOT_TRACKING_MODE", "auto").strip().lower()
+if ROBOT_TRACKING_MODE not in {"auto", "manual"}:
+    print(f"Unknown ROBOT_TRACKING_MODE={ROBOT_TRACKING_MODE!r}; defaulting to 'auto'")
+    ROBOT_TRACKING_MODE = "auto"
+MANUAL_ROBOT_TRACKING = ROBOT_TRACKING_MODE == "manual"
 
 # YOLO person segmentation model (always loaded - used to exclude humans from bumper color detection)
 YOLO_PERSON_MODEL = None
@@ -4973,7 +4980,200 @@ class ThreadedVideoWriter:
         self.thread.join()
 
 
-def process_single_video(video_path: str, camera_side: str = "blue", target_fps: int = 3, start_seconds: float = 0, end_seconds: float = 0, blue_robots: list = None, red_robots: list = None, enable_robot_detection: bool = True, enable_fuel_detection: bool = True, progress=gr.Progress(), camera_name: str = "Camera", enable_person_detection: bool = True, calibration_points: list = None, calibration_image_size: tuple = None, side_box_points: list = None, side_box_image_size: tuple = None, side_camera_visible_robots: dict = None, show_unlabeled_robots: bool = True) -> tuple:
+MANUAL_TRACK_SLOT_IDS = [
+    ("blue_1", 0, "blue"),
+    ("blue_2", 1, "blue"),
+    ("blue_3", 2, "blue"),
+    ("red_1", 0, "red"),
+    ("red_2", 1, "red"),
+    ("red_3", 2, "red"),
+]
+
+
+def _iter_manual_track_slots(blue_robots: list, red_robots: list):
+    blue_robots = list(blue_robots or [])
+    red_robots = list(red_robots or [])
+    while len(blue_robots) < 3:
+        blue_robots.append("")
+    while len(red_robots) < 3:
+        red_robots.append("")
+
+    for slot_id, index, alliance in MANUAL_TRACK_SLOT_IDS:
+        label = blue_robots[index] if alliance == "blue" else red_robots[index]
+        yield slot_id, str(label).strip(), alliance
+
+
+def _dedupe_manual_track_samples(samples: list) -> list:
+    samples = sorted(samples, key=lambda item: item[0])
+    deduped = []
+    for t, x, y in samples:
+        if deduped and abs(t - deduped[-1][0]) <= 0.03:
+            deduped[-1] = (t, x, y)
+            continue
+        if deduped and abs(t - deduped[-1][0]) <= 0.20 and abs(x - deduped[-1][1]) <= 0.5 and abs(y - deduped[-1][2]) <= 0.5:
+            deduped[-1] = (t, x, y)
+            continue
+        deduped.append((t, x, y))
+    return deduped
+
+
+def _parse_manual_robot_tracks_json(manual_tracks_json: str, blue_robots: list, red_robots: list) -> dict:
+    """
+    Parse the browser-recorded manual robot tracks.
+
+    Returns:
+        Dict mapping robot label -> {'samples': [(t, x, y), ...], 'times': [t, ...], ...}
+    """
+    if not manual_tracks_json or not str(manual_tracks_json).strip():
+        raise gr.Error("Manual tracking mode is enabled, but no robot tracks were recorded.")
+
+    try:
+        payload = json.loads(parse_json(str(manual_tracks_json)))
+    except Exception as e:
+        raise gr.Error(f"Could not parse manual robot tracks: {e}")
+
+    slot_payload = payload.get("slots")
+    if not isinstance(slot_payload, dict):
+        raise gr.Error("Manual robot tracks are missing slot data.")
+
+    parsed_tracks = {}
+    missing_labels = []
+
+    for slot_id, label, alliance in _iter_manual_track_slots(blue_robots, red_robots):
+        if not label:
+            continue
+
+        slot_data = slot_payload.get(slot_id, {}) if isinstance(slot_payload.get(slot_id, {}), dict) else {}
+        if slot_data.get("skipped"):
+            continue
+
+        raw_samples = slot_data.get("samples") or []
+        cleaned_samples = []
+        for sample in raw_samples:
+            if not isinstance(sample, dict):
+                continue
+            try:
+                t = float(sample.get("t"))
+                x = float(sample.get("x"))
+                y = float(sample.get("y"))
+            except (TypeError, ValueError):
+                continue
+            if not (np.isfinite(t) and np.isfinite(x) and np.isfinite(y)):
+                continue
+            if t < 0:
+                continue
+            cleaned_samples.append((t, x, y))
+
+        deduped = _dedupe_manual_track_samples(cleaned_samples)
+        if not deduped:
+            missing_labels.append(label)
+            continue
+
+        parsed_tracks[label] = {
+            "slot_id": slot_id,
+            "alliance": alliance,
+            "samples": deduped,
+            "times": [sample[0] for sample in deduped],
+        }
+
+    if missing_labels:
+        joined = ", ".join(missing_labels)
+        raise gr.Error(
+            f"Manual tracks are missing for: {joined}. "
+            "Drag those robots for the match or mark them skipped in the manual tracker."
+        )
+
+    return parsed_tracks
+
+
+def _interpolate_manual_robot_position(robot_track: dict, target_time: float):
+    times = robot_track.get("times") or []
+    samples = robot_track.get("samples") or []
+    if not times or not samples:
+        return None
+
+    if target_time <= times[0]:
+        _, x, y = samples[0]
+        return x, y
+    if target_time >= times[-1]:
+        _, x, y = samples[-1]
+        return x, y
+
+    idx = bisect_left(times, target_time)
+    if idx <= 0:
+        _, x, y = samples[0]
+        return x, y
+    if idx >= len(samples):
+        _, x, y = samples[-1]
+        return x, y
+
+    t0, x0, y0 = samples[idx - 1]
+    t1, x1, y1 = samples[idx]
+    if t1 <= t0:
+        return x1, y1
+
+    alpha = (target_time - t0) / (t1 - t0)
+    x = x0 + ((x1 - x0) * alpha)
+    y = y0 + ((y1 - y0) * alpha)
+    return x, y
+
+
+def _estimate_manual_robot_bbox(center_x: float, center_y: float, frame_width: int, frame_height: int) -> tuple:
+    """
+    Convert a human-tracked robot center into a synthetic bbox.
+
+    We scale the box by vertical position because closer robots appear larger in the
+    center camera. This keeps shot attribution and map projection reasonably stable
+    without needing automatic robot detection.
+    """
+    y_norm = float(np.clip(center_y / max(1.0, frame_height), 0.0, 1.0))
+    bbox_h = frame_height * (0.045 + (0.115 * y_norm))
+    bbox_h = float(np.clip(bbox_h, frame_height * 0.05, frame_height * 0.18))
+    bbox_w = bbox_h * 1.10
+    bbox_w = float(np.clip(bbox_w, frame_width * 0.03, frame_width * 0.14))
+
+    x1 = max(0.0, center_x - (bbox_w / 2.0))
+    y1 = max(0.0, center_y - (bbox_h / 2.0))
+    x2 = min(float(frame_width - 1), center_x + (bbox_w / 2.0))
+    y2 = min(float(frame_height - 1), center_y + (bbox_h / 2.0))
+    return x1, y1, x2, y2
+
+
+def build_manual_robot_bboxes_json(manual_robot_tracks: dict, target_time: float, frame_width: int, frame_height: int, camera_side: str = "center") -> tuple:
+    """
+    Interpolate human-labeled robot tracks for a given video timestamp.
+
+    Returns:
+        (bounding_boxes_json, frame_tracks_dict)
+    """
+    detections = []
+    frame_tracks = {}
+
+    for label, robot_track in (manual_robot_tracks or {}).items():
+        interp = _interpolate_manual_robot_position(robot_track, target_time)
+        if interp is None:
+            continue
+
+        center_x, center_y = interp
+        x1, y1, x2, y2 = _estimate_manual_robot_bbox(center_x, center_y, frame_width, frame_height)
+        bbox_area = (x2 - x1) * (y2 - y1)
+        track_y = min(float(frame_height - 1), center_y + ((y2 - y1) / 6.0))
+
+        detections.append({
+            "box_2d": [
+                int((y1 / max(1, frame_height)) * 1000),
+                int((x1 / max(1, frame_width)) * 1000),
+                int((y2 / max(1, frame_height)) * 1000),
+                int((x2 / max(1, frame_width)) * 1000),
+            ],
+            "label": label,
+        })
+        frame_tracks[label] = (float(center_x), float(track_y), camera_side, float(bbox_area))
+
+    return json.dumps(detections), frame_tracks
+
+
+def process_single_video(video_path: str, camera_side: str = "blue", target_fps: int = 3, start_seconds: float = 0, end_seconds: float = 0, blue_robots: list = None, red_robots: list = None, enable_robot_detection: bool = True, enable_fuel_detection: bool = True, progress=gr.Progress(), camera_name: str = "Camera", enable_person_detection: bool = True, calibration_points: list = None, calibration_image_size: tuple = None, side_box_points: list = None, side_box_image_size: tuple = None, side_camera_visible_robots: dict = None, show_unlabeled_robots: bool = True, manual_robot_tracks: dict = None) -> tuple:
     """
     Process a single video, tracking objects at specified FPS.
     Uses bumper color detection for robot identification.
@@ -4992,6 +5192,7 @@ def process_single_video(video_path: str, camera_side: str = "blue", target_fps:
         camera_name: Display name for the camera (e.g., "Blue Camera")
         side_camera_visible_robots: Dict of side camera visibility data (for center camera hidden robot injection)
             Format: {'blue': {frame_num: [robot_labels]}, 'red': {frame_num: [robot_labels]}}
+        manual_robot_tracks: Optional dict of human-provided center-camera robot tracks.
         
     Returns:
         Tuple of (output_video_path, robot_tracks, tracks_by_frame, width, height, robot_stats, ferry_counts, disabled_statuses, shot_events, side_visible_robots)
@@ -5024,6 +5225,7 @@ def process_single_video(video_path: str, camera_side: str = "blue", target_fps:
     # Clamp to valid range
     start_frame = max(0, min(start_frame, total_frames - 1))
     end_frame = max(start_frame + 1, min(end_frame, total_frames))
+    using_manual_robot_tracks = manual_robot_tracks is not None and camera_side == "center"
     
     # Skip to start frame
     if start_frame > 0:
@@ -5165,7 +5367,7 @@ def process_single_video(video_path: str, camera_side: str = "blue", target_fps:
     
     # Pre-compute field pixel mask for bumper detection (center camera only)
     field_pixel_mask = None
-    if camera_side == "center":
+    if camera_side == "center" and not using_manual_robot_tracks:
         if progress is not None:
             progress(0, desc="Scanning video to build field pixel mask...")
         field_pixel_mask = compute_field_pixel_mask(video_path, start_seconds=start_seconds)
@@ -5199,6 +5401,7 @@ def process_single_video(video_path: str, camera_side: str = "blue", target_fps:
         # Person detection at 6fps (center camera only)
         if (frame_count % person_frame_interval == 0 and enable_person_detection
                 and camera_side == "center"
+                and not using_manual_robot_tracks
                 and YOLO_PERSON_MODEL is not None):
             current_person_mask, current_person_count = detect_people_yolo(frame)
             if current_person_count > 0:
@@ -5213,8 +5416,19 @@ def process_single_video(video_path: str, camera_side: str = "blue", target_fps:
             # Combine robot numbers
             robot_numbers = (blue_robots or []) + (red_robots or [])
             
+            if using_manual_robot_tracks:
+                current_bumper_red_mask = None
+                current_bumper_blue_mask = None
+                video_time = frame_count / max(1.0, original_fps)
+                bounding_boxes_json, frame_tracks = build_manual_robot_bboxes_json(
+                    manual_robot_tracks,
+                    video_time,
+                    width,
+                    height,
+                    camera_side=camera_side,
+                )
             # Bumper detection
-            if camera_side in ("blue", "red"):
+            elif camera_side in ("blue", "red"):
                 # Side camera: LLM presence query (no bounding boxes)
                 alliance_robots = blue_robots if camera_side == "blue" else red_robots
                 guided_pil_frame = annotate_side_camera_guides(
@@ -5364,19 +5578,28 @@ def process_single_video(video_path: str, camera_side: str = "blue", target_fps:
             # Store for tracking
             current_bboxes_json = bounding_boxes_json
             
-
-            
             # Update ball tracker with robot bounding boxes
             ball_tracker.update_robot_bboxes(bounding_boxes_json, width, height)
             
             # Extract and track robot positions
-            bbox_centers = extract_bbox_centers(bounding_boxes_json, width, height)
-            frame_tracks = {}
-            for label, (cx, cy, bbox_area) in bbox_centers.items():
+            if using_manual_robot_tracks:
+                frame_tracks = dict(frame_tracks)
+            else:
+                bbox_centers = extract_bbox_centers(bounding_boxes_json, width, height)
+                frame_tracks = {
+                    label: (cx, cy, camera_side, bbox_area)
+                    for label, (cx, cy, bbox_area) in bbox_centers.items()
+                }
+
+            for label, track_data in frame_tracks.items():
+                cx, cy = track_data[0], track_data[1]
+                bbox_area = track_data[3] if len(track_data) >= 4 else None
                 if label not in robot_tracks:
                     robot_tracks[label] = []
-                robot_tracks[label].append((cx, cy, camera_side, bbox_area))
-                frame_tracks[label] = (cx, cy, camera_side, bbox_area)
+                if bbox_area is not None:
+                    robot_tracks[label].append((cx, cy, camera_side, bbox_area))
+                else:
+                    robot_tracks[label].append((cx, cy, camera_side))
                 
                 # Update disabled tracker and ferry tracker with map coordinates
                 # Use rotated map dimensions (961x574)
@@ -5405,6 +5628,15 @@ def process_single_video(video_path: str, camera_side: str = "blue", target_fps:
                 calib_viz_data = center_calibrator.process_frame(frame, width, height)
             
             render_bboxes_json = current_bboxes_json
+            if using_manual_robot_tracks and enable_robot_detection:
+                video_time = frame_count / max(1.0, original_fps)
+                render_bboxes_json, _ = build_manual_robot_bboxes_json(
+                    manual_robot_tracks,
+                    video_time,
+                    width,
+                    height,
+                    camera_side=camera_side,
+                )
             
             # Draw bounding boxes with alliance colors (for robots) - only if robot detection enabled
             annotated_frame = pil_frame.copy()
@@ -5416,12 +5648,13 @@ def process_single_video(video_path: str, camera_side: str = "blue", target_fps:
                 )
             if enable_robot_detection:
                 # Draw bumper color highlights on center camera
-                if camera_side == "center":
+                if camera_side == "center" and not using_manual_robot_tracks:
                     # Reuse cached masks from last robot detection frame (fast)
                     annotated_frame = draw_bumper_highlights(annotated_frame, current_bumper_red_mask, current_bumper_blue_mask, field_pixel_mask=field_pixel_mask)
                 
                 # Draw person segmentation in grey
-                if current_person_mask is not None and enable_person_detection and np.any(current_person_mask):
+                if (current_person_mask is not None and enable_person_detection and np.any(current_person_mask)
+                        and not using_manual_robot_tracks):
                     frame_np = np.array(annotated_frame)  # RGB
                     overlay = frame_np.copy()
                     overlay[current_person_mask > 0] = (128, 128, 128)  # Grey
@@ -5868,6 +6101,155 @@ def split_composite_video(composite_path: str, progress=None) -> tuple:
     return paths['center'], paths['blue'], paths['red']
 
 
+def extract_center_video_from_composite(composite_path: str, progress=None) -> str:
+    """
+    Extract just the center-camera crop from the composite match video.
+    """
+    if not composite_path:
+        raise gr.Error("Please upload a match video.")
+
+    output_path = tempfile.NamedTemporaryFile(suffix="_center.mp4", delete=False).name
+    ffmpeg_exe = shutil.which('ffmpeg')
+
+    if ffmpeg_exe is None:
+        try:
+            import static_ffmpeg
+            static_ffmpeg.add_paths()
+            ffmpeg_exe = shutil.which('ffmpeg')
+        except ImportError:
+            pass
+
+    if ffmpeg_exe:
+        if progress:
+            progress(0.01, desc="Extracting center camera feed...")
+        cmd = [
+            ffmpeg_exe, '-y',
+            '-i', composite_path,
+            '-vf', 'crop=1918:709:1:0',
+            '-c:v', 'libx264', '-preset', 'ultrafast', '-crf', '18',
+            '-an',
+            output_path,
+        ]
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
+        if result.returncode != 0:
+            raise gr.Error(f"FFmpeg center extraction failed: {result.stderr[-500:]}")
+        return output_path
+
+    cap = cv2.VideoCapture(composite_path)
+    if not cap.isOpened():
+        raise gr.Error("Could not open composite video file.")
+
+    fps = cap.get(cv2.CAP_PROP_FPS)
+    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+    out = cv2.VideoWriter(output_path, fourcc, fps, (1918, 709))
+    if not out.isOpened():
+        cap.release()
+        raise gr.Error("Could not create center camera video.")
+
+    frame_idx = 0
+    while True:
+        ret, frame = cap.read()
+        if not ret:
+            break
+        cropped = frame[0:709, 1:1919]
+        out.write(cropped)
+        frame_idx += 1
+        if progress and frame_idx % 100 == 0 and total_frames > 0:
+            progress(frame_idx / total_frames * 0.1, desc=f"Extracting center camera... {frame_idx}/{total_frames}")
+
+    cap.release()
+    out.release()
+    return output_path
+
+
+def _build_stats_from_shot_events(all_shot_events: list) -> dict:
+    """
+    Deduplicate shot events within a short time window and rebuild per-robot stats.
+    """
+    dedup_window_seconds = 3.0
+    events_by_robot = {}
+    for elapsed, robot_label, made in all_shot_events:
+        events_by_robot.setdefault(robot_label, []).append((elapsed, made))
+
+    merged_stats = {}
+    for robot_label, events in events_by_robot.items():
+        events.sort(key=lambda e: e[0])
+        deduped_events = []
+        for elapsed, made in events:
+            is_duplicate = False
+            for idx, (prev_elapsed, prev_made) in enumerate(deduped_events):
+                if abs(elapsed - prev_elapsed) <= dedup_window_seconds:
+                    is_duplicate = True
+                    if made and not prev_made:
+                        deduped_events[idx] = (prev_elapsed, True)
+                    break
+            if not is_duplicate:
+                deduped_events.append((elapsed, made))
+
+        by_period = {name: {'attempts': 0, 'made': 0} for name, _, _ in MATCH_PERIODS}
+        total_attempts = 0
+        total_made = 0
+
+        for elapsed, made in deduped_events:
+            period = get_match_period(elapsed)
+            total_attempts += 1
+            if made:
+                total_made += 1
+            if period in by_period:
+                by_period[period]['attempts'] += 1
+                if made:
+                    by_period[period]['made'] += 1
+
+        merged_stats[robot_label] = {
+            'attempts': total_attempts,
+            'made': total_made,
+            'by_period': by_period
+        }
+
+    return merged_stats
+
+
+def format_robot_stats_md(stats: dict, robot_label: str, ferry_counts: dict, disabled_statuses: dict) -> str:
+    ferry_count = ferry_counts.get(robot_label, 0)
+    disabled_status, disabled_time = disabled_statuses.get(robot_label, ("None", 0))
+
+    if disabled_status == "Full":
+        disabled_line = f"**Disabled: Full** - Robot was disabled for the entire match ({disabled_time:.1f}s longest)"
+    elif disabled_status == "Partially":
+        disabled_line = f"**Disabled: Partially** - Robot was disabled for part of the match ({disabled_time:.1f}s longest)"
+    else:
+        disabled_line = "**Disabled: None** - Robot was not disabled"
+
+    if robot_label not in stats or not stats[robot_label].get('by_period'):
+        result = disabled_line + "\n\n"
+        if ferry_count > 0:
+            result += f"**Ferried Fuel: {ferry_count}x**\n\n"
+        result += "*No shots recorded*"
+        return result
+
+    robot_data = stats[robot_label]
+    total = f"**{robot_data['made']}/{robot_data['attempts']} shots made**"
+    if ferry_count > 0:
+        total += f" | **Ferried: {ferry_count}x**"
+
+    rows = ["| Period | Made | Missed |", "|--------|------|--------|"]
+    for period_name, _, _ in MATCH_PERIODS:
+        period_data = robot_data['by_period'].get(period_name, {'attempts': 0, 'made': 0})
+        missed = period_data['attempts'] - period_data['made']
+        if period_data['attempts'] > 0:
+            rows.append(f"| {period_name} | {period_data['made']} | {missed} |")
+
+    if len(rows) == 2:
+        result = disabled_line + "\n\n"
+        if ferry_count > 0:
+            result += f"**Ferried Fuel: {ferry_count}x**\n\n"
+        result += "*No shots recorded*"
+        return result
+
+    return f"{disabled_line}\n\n{total}\n\n" + "\n".join(rows)
+
+
 def process_dual_videos(blue_video_path: str, red_video_path: str, center_video_path: str = None, composite_video_path: str = None, target_fps: int = 3, start_seconds: float = 0, end_seconds: float = 0, blue_robot_1: str = "", blue_robot_2: str = "", blue_robot_3: str = "", red_robot_1: str = "", red_robot_2: str = "", red_robot_3: str = "", enable_robot_detection: bool = True, enable_fuel_detection: bool = True, side_ref_image: Image.Image = None, center_ref_image: Image.Image = None, enable_blue_camera: bool = True, enable_center_camera: bool = True, enable_red_camera: bool = True, enable_person_detection: bool = True, calibration_points: list = None, calibration_image_size: tuple = None, blue_side_box_points: list = None, blue_side_box_image_size: tuple = None, red_side_box_points: list = None, red_side_box_image_size: tuple = None, show_unlabeled_robots: bool = True, progress=gr.Progress()) -> tuple:
     """
     Process blue, red, and center camera videos using bumper detection.
@@ -6277,6 +6659,888 @@ def process_dual_videos(blue_video_path: str, red_video_path: str, center_video_
     )
 
 
+def process_manual_center_video(center_video_path: str = None, composite_video_path: str = None, target_fps: int = 3, start_seconds: float = 0, end_seconds: float = 0, blue_robot_1: str = "", blue_robot_2: str = "", blue_robot_3: str = "", red_robot_1: str = "", red_robot_2: str = "", red_robot_3: str = "", enable_fuel_detection: bool = True, calibration_points: list = None, calibration_image_size: tuple = None, manual_tracks_json: str = "", progress=gr.Progress()) -> tuple:
+    """
+    Process only the center camera using human-provided robot tracks and SAM 3 ball detection.
+    """
+    if not center_video_path and composite_video_path:
+        progress(0, desc="Extracting center camera feed...")
+        center_video_path = extract_center_video_from_composite(composite_video_path, progress=progress)
+
+    if not center_video_path:
+        raise gr.Error("Please upload a match video.")
+
+    blue_robots = [blue_robot_1, blue_robot_2, blue_robot_3]
+    red_robots = [red_robot_1, red_robot_2, red_robot_3]
+    manual_robot_tracks = _parse_manual_robot_tracks_json(manual_tracks_json, blue_robots, red_robots)
+
+    progress(0.05, desc="Processing center camera with manual robot tracks...")
+    center_output, robot_tracks, tracks_by_frame, width, height, _, ferry_counts, disabled_statuses, shot_events, _ = process_single_video(
+        center_video_path,
+        "center",
+        target_fps,
+        start_seconds,
+        end_seconds,
+        blue_robots,
+        red_robots,
+        True,
+        enable_fuel_detection,
+        progress,
+        "Center Camera",
+        enable_person_detection=False,
+        calibration_points=calibration_points,
+        calibration_image_size=calibration_image_size,
+        side_camera_visible_robots=None,
+        show_unlabeled_robots=True,
+        manual_robot_tracks=manual_robot_tracks,
+    )
+
+    all_robot_labels = blue_robots + red_robots
+    robot_map_paths = []
+
+    progress(0.75, desc="Generating individual robot maps...")
+    for robot_label in all_robot_labels:
+        if robot_label and robot_label.strip():
+            label = robot_label.strip()
+            single_robot_tracks = {label: robot_tracks.get(label, [])}
+            if single_robot_tracks[label]:
+                robot_map = draw_robot_paths(
+                    MAP_IMAGE_PATH,
+                    single_robot_tracks,
+                    width,
+                    height,
+                    "center",
+                    blue_robots,
+                    red_robots,
+                    max_seconds=15,
+                    fps=target_fps,
+                )
+                robot_map_path = tempfile.NamedTemporaryFile(suffix=".png", delete=False).name
+                robot_map.save(robot_map_path)
+                robot_map_paths.append(robot_map_path)
+            else:
+                robot_map_paths.append(None)
+        else:
+            robot_map_paths.append(None)
+
+    while len(robot_map_paths) < 6:
+        robot_map_paths.append(None)
+
+    smoothed_frames = interpolate_robot_tracks(tracks_by_frame, max_gap=15)
+    progress(0.9, desc="Generating map video...")
+    map_video_path = generate_map_video(
+        MAP_IMAGE_PATH,
+        smoothed_frames,
+        width,
+        height,
+        target_fps=target_fps,
+        blue_robots=blue_robots,
+        red_robots=red_robots,
+    )
+
+    progress(1.0, desc="Manual center-camera processing complete!")
+
+    merged_stats = _build_stats_from_shot_events(shot_events)
+    robot_stats_markdowns = []
+    for label in all_robot_labels:
+        if label and label.strip():
+            robot_stats_markdowns.append(format_robot_stats_md(merged_stats, label.strip(), ferry_counts, disabled_statuses))
+        else:
+            robot_stats_markdowns.append("*Robot not configured*")
+
+    while len(robot_stats_markdowns) < 6:
+        robot_stats_markdowns.append("*Robot not configured*")
+
+    robot_labels = []
+    for label in all_robot_labels:
+        if label and label.strip():
+            robot_labels.append(f"Team {label.strip()} - Autonomous")
+        else:
+            robot_labels.append("Not Configured")
+    while len(robot_labels) < 6:
+        robot_labels.append("Not Configured")
+
+    return (
+        center_output,
+        map_video_path,
+        gr.update(value=robot_map_paths[0], label=robot_labels[0]), robot_stats_markdowns[0],
+        gr.update(value=robot_map_paths[1], label=robot_labels[1]), robot_stats_markdowns[1],
+        gr.update(value=robot_map_paths[2], label=robot_labels[2]), robot_stats_markdowns[2],
+        gr.update(value=robot_map_paths[3], label=robot_labels[3]), robot_stats_markdowns[3],
+        gr.update(value=robot_map_paths[4], label=robot_labels[4]), robot_stats_markdowns[4],
+        gr.update(value=robot_map_paths[5], label=robot_labels[5]), robot_stats_markdowns[5],
+    )
+
+
+MANUAL_TRACKER_HEAD = r"""
+<style>
+  #manual-center-preview-source,
+  #manual-tracks-json {
+    display: none !important;
+  }
+  #manual-center-tracker {
+    border: 1px solid #d7dde8;
+    border-radius: 14px;
+    padding: 14px;
+    background: linear-gradient(180deg, #fbfcff 0%, #f2f5fb 100%);
+  }
+  .manual-tracker-toolbar {
+    display: flex;
+    gap: 8px;
+    align-items: center;
+    flex-wrap: wrap;
+    margin-bottom: 10px;
+  }
+  .manual-tracker-toolbar button {
+    border: none;
+    border-radius: 999px;
+    padding: 8px 12px;
+    background: #113b74;
+    color: white;
+    cursor: pointer;
+    font-weight: 600;
+  }
+  .manual-tracker-stage {
+    position: relative;
+    width: 100%;
+    overflow: hidden;
+    border-radius: 12px;
+    background: #0f172a;
+    margin-bottom: 12px;
+  }
+  .manual-tracker-video-shell {
+    position: relative;
+    width: 100%;
+  }
+  #manual-tracker-video {
+    width: 100%;
+    display: block;
+    max-height: 520px;
+    background: #020617;
+  }
+  #manual-tracker-overlay {
+    position: absolute;
+    inset: 0;
+    width: 100%;
+    height: 100%;
+    cursor: crosshair;
+  }
+  .manual-tracker-slot-list {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+    gap: 10px;
+    margin-top: 12px;
+  }
+  .manual-slot-card {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 10px;
+    border-radius: 12px;
+    background: white;
+    border: 1px solid #d7dde8;
+  }
+  .manual-slot-pick {
+    border: none;
+    border-radius: 10px;
+    padding: 8px 10px;
+    color: white;
+    cursor: pointer;
+    font-weight: 700;
+    min-width: 84px;
+  }
+  .manual-slot-pick.active {
+    outline: 3px solid rgba(17, 59, 116, 0.18);
+  }
+  .manual-slot-meta {
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+    flex: 1;
+    font-size: 12px;
+  }
+  .manual-slot-actions {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+  }
+  .manual-slot-actions button {
+    border: none;
+    border-radius: 8px;
+    padding: 6px 8px;
+    cursor: pointer;
+    background: #e2e8f0;
+  }
+  #manual-tracker-status {
+    margin-top: 10px;
+    font-size: 13px;
+    color: #334155;
+  }
+</style>
+<script>
+(() => {
+  const SLOT_ORDER = [
+    { id: "blue_1", selector: "#blue-robot-1-input", color: "#1d4ed8", short: "B1" },
+    { id: "blue_2", selector: "#blue-robot-2-input", color: "#2563eb", short: "B2" },
+    { id: "blue_3", selector: "#blue-robot-3-input", color: "#3b82f6", short: "B3" },
+    { id: "red_1", selector: "#red-robot-1-input", color: "#b91c1c", short: "R1" },
+    { id: "red_2", selector: "#red-robot-2-input", color: "#dc2626", short: "R2" },
+    { id: "red_3", selector: "#red-robot-3-input", color: "#ef4444", short: "R3" },
+  ];
+
+  function getInputValue(selector, fallback) {
+    const root = document.querySelector(selector);
+    if (!root) return fallback;
+    const input = root.querySelector("input, textarea");
+    if (!input) return fallback;
+    const value = (input.value || "").trim();
+    return value || fallback;
+  }
+
+  function initManualTracker() {
+    const root = document.getElementById("manual-center-tracker");
+    if (!root || root.dataset.ready === "1") return;
+    root.dataset.ready = "1";
+
+    const video = document.getElementById("manual-tracker-video");
+    const canvas = document.getElementById("manual-tracker-overlay");
+    const slotList = document.getElementById("manual-tracker-slot-list");
+    const status = document.getElementById("manual-tracker-status");
+    const timeLabel = document.getElementById("manual-tracker-time");
+    const playBtn = document.getElementById("manual-tracker-play");
+    const backBtn = document.getElementById("manual-tracker-back");
+    const forwardBtn = document.getElementById("manual-tracker-forward");
+    const hiddenFieldRoot = document.querySelector("#manual-tracks-json");
+    const hiddenField = hiddenFieldRoot ? hiddenFieldRoot.querySelector("textarea, input") : null;
+    const shell = root.querySelector(".manual-tracker-video-shell");
+
+    const state = {
+      sourceSrc: null,
+      activeSlotId: SLOT_ORDER[0].id,
+      dragging: null,
+      lastSnapshotTime: -1,
+      slots: {},
+    };
+    SLOT_ORDER.forEach((slot) => {
+      state.slots[slot.id] = { x: null, y: null, skipped: false, samples: [] };
+    });
+
+    function getSlotLabel(slot) {
+      return getInputValue(slot.selector, slot.short);
+    }
+
+    function toPayload() {
+      const slotPayload = {};
+      SLOT_ORDER.forEach((slot) => {
+        const slotState = state.slots[slot.id];
+        slotPayload[slot.id] = {
+          label: getSlotLabel(slot),
+          skipped: !!slotState.skipped,
+          samples: slotState.samples.map((sample) => ({
+            t: Number(sample.t.toFixed(3)),
+            x: Number(sample.x.toFixed(1)),
+            y: Number(sample.y.toFixed(1)),
+          })),
+        };
+      });
+
+      return {
+        mode: "manual_center",
+        video: {
+          width: video.videoWidth || 0,
+          height: video.videoHeight || 0,
+          duration: Number.isFinite(video.duration) ? Number(video.duration.toFixed(3)) : 0,
+        },
+        slots: slotPayload,
+      };
+    }
+
+    function syncHiddenField(force = false) {
+      const payload = JSON.stringify(toPayload());
+      if (hiddenField && (force || hiddenField.value !== payload)) {
+        hiddenField.value = payload;
+        hiddenField.dispatchEvent(new Event("input", { bubbles: true }));
+        hiddenField.dispatchEvent(new Event("change", { bubbles: true }));
+      }
+      return payload;
+    }
+
+    function updateStatus() {
+      const tracked = SLOT_ORDER.filter((slot) => !state.slots[slot.id].skipped && state.slots[slot.id].samples.length > 0).length;
+      const skipped = SLOT_ORDER.filter((slot) => state.slots[slot.id].skipped).length;
+      const total = SLOT_ORDER.length;
+      const durationText = Number.isFinite(video.duration) ? `${video.duration.toFixed(1)}s` : "0.0s";
+      status.textContent = `Track all 6 robots unless skipped. Active: ${tracked}/${total} tracked, ${skipped} skipped. Video duration: ${durationText}.`;
+    }
+
+    function resizeCanvas() {
+      const width = Math.max(1, Math.round(video.clientWidth || shell.clientWidth || 1));
+      const height = Math.max(1, Math.round(video.clientHeight || (width * 709 / 1918) || 1));
+      if (canvas.width !== width) canvas.width = width;
+      if (canvas.height !== height) canvas.height = height;
+      drawOverlay();
+    }
+
+    function sourceToCanvas(x, y) {
+      return {
+        x: x * canvas.width / Math.max(1, video.videoWidth || canvas.width),
+        y: y * canvas.height / Math.max(1, video.videoHeight || canvas.height),
+      };
+    }
+
+    function pointerToSource(event) {
+      const rect = canvas.getBoundingClientRect();
+      const localX = Math.min(1, Math.max(0, (event.clientX - rect.left) / Math.max(rect.width, 1)));
+      const localY = Math.min(1, Math.max(0, (event.clientY - rect.top) / Math.max(rect.height, 1)));
+      return {
+        x: localX * Math.max(1, video.videoWidth || canvas.width),
+        y: localY * Math.max(1, video.videoHeight || canvas.height),
+      };
+    }
+
+    function drawOverlay() {
+      const ctx = canvas.getContext("2d");
+      ctx.clearRect(0, 0, canvas.width, canvas.height);
+      SLOT_ORDER.forEach((slot) => {
+        const slotState = state.slots[slot.id];
+        if (slotState.skipped || slotState.x === null || slotState.y === null) return;
+
+        const point = sourceToCanvas(slotState.x, slotState.y);
+        const radius = 12;
+        ctx.fillStyle = slot.color;
+        ctx.beginPath();
+        ctx.arc(point.x, point.y, radius, 0, Math.PI * 2);
+        ctx.fill();
+
+        if (slot.id === state.activeSlotId) {
+          ctx.strokeStyle = "rgba(255,255,255,0.9)";
+          ctx.lineWidth = 3;
+          ctx.beginPath();
+          ctx.arc(point.x, point.y, radius + 4, 0, Math.PI * 2);
+          ctx.stroke();
+        }
+
+        const label = getSlotLabel(slot);
+        ctx.font = "bold 13px sans-serif";
+        const textWidth = ctx.measureText(label).width;
+        ctx.fillStyle = "rgba(15, 23, 42, 0.85)";
+        ctx.fillRect(point.x - textWidth / 2 - 6, point.y - 34, textWidth + 12, 18);
+        ctx.fillStyle = "#ffffff";
+        ctx.fillText(label, point.x - textWidth / 2, point.y - 20);
+      });
+    }
+
+    function refreshSlotCards() {
+      SLOT_ORDER.forEach((slot) => {
+        const slotState = state.slots[slot.id];
+        const pickBtn = slotList.querySelector(`[data-pick="${slot.id}"]`);
+        const labelNode = slotList.querySelector(`[data-label="${slot.id}"]`);
+        const countNode = slotList.querySelector(`[data-count="${slot.id}"]`);
+        const skipInput = slotList.querySelector(`[data-skip="${slot.id}"]`);
+        if (pickBtn) {
+          pickBtn.textContent = getSlotLabel(slot);
+          pickBtn.classList.toggle("active", slot.id === state.activeSlotId);
+        }
+        if (labelNode) {
+          labelNode.textContent = slot.short;
+        }
+        if (countNode) {
+          countNode.textContent = slotState.skipped ? "Skipped" : `${slotState.samples.length} samples`;
+        }
+        if (skipInput) {
+          skipInput.checked = !!slotState.skipped;
+        }
+      });
+      updateStatus();
+    }
+
+    function recordSlotSample(slotId, time, x, y) {
+      const slotState = state.slots[slotId];
+      if (!slotState || slotState.skipped) return;
+      const entry = {
+        t: Number((time || 0).toFixed(3)),
+        x: Number(x.toFixed(1)),
+        y: Number(y.toFixed(1)),
+      };
+      const last = slotState.samples[slotState.samples.length - 1];
+      if (last && Math.abs(last.t - entry.t) <= 0.04) {
+        slotState.samples[slotState.samples.length - 1] = entry;
+      } else {
+        slotState.samples.push(entry);
+      }
+    }
+
+    function captureAllSlots(force = false) {
+      if (!video.src) return;
+      const time = Number((video.currentTime || 0).toFixed(3));
+      if (!force && Math.abs(time - state.lastSnapshotTime) < 0.15) return;
+      state.lastSnapshotTime = time;
+      SLOT_ORDER.forEach((slot) => {
+        const slotState = state.slots[slot.id];
+        if (!slotState.skipped && slotState.x !== null && slotState.y !== null) {
+          recordSlotSample(slot.id, time, slotState.x, slotState.y);
+        }
+      });
+      syncHiddenField();
+      refreshSlotCards();
+      drawOverlay();
+    }
+
+    function resetForNewVideo() {
+      SLOT_ORDER.forEach((slot) => {
+        const slotState = state.slots[slot.id];
+        slotState.x = null;
+        slotState.y = null;
+        slotState.samples = [];
+      });
+      state.lastSnapshotTime = -1;
+      syncHiddenField(true);
+      refreshSlotCards();
+      drawOverlay();
+    }
+
+    function syncFromPreview() {
+      const previewVideo = document.querySelector("#manual-center-preview-source video");
+      if (!previewVideo) return;
+      const nextSrc = previewVideo.currentSrc || previewVideo.src || (previewVideo.querySelector("source") ? previewVideo.querySelector("source").src : "");
+      if (nextSrc && nextSrc !== state.sourceSrc) {
+        state.sourceSrc = nextSrc;
+        video.src = nextSrc;
+        video.load();
+        resetForNewVideo();
+      }
+    }
+
+    window.manualTrackerSync = function () {
+      syncFromPreview();
+      return syncHiddenField(true);
+    };
+
+    SLOT_ORDER.forEach((slot) => {
+      const card = document.createElement("div");
+      card.className = "manual-slot-card";
+      card.innerHTML = `
+        <button type="button" class="manual-slot-pick" data-pick="${slot.id}" style="background:${slot.color};"></button>
+        <div class="manual-slot-meta">
+          <strong data-label="${slot.id}">${slot.short}</strong>
+          <span data-count="${slot.id}">0 samples</span>
+        </div>
+        <div class="manual-slot-actions">
+          <label><input type="checkbox" data-skip="${slot.id}"> Skip</label>
+          <button type="button" data-clear="${slot.id}">Clear</button>
+        </div>
+      `;
+      slotList.appendChild(card);
+    });
+
+    slotList.addEventListener("click", (event) => {
+      const pick = event.target.closest("[data-pick]");
+      if (pick) {
+        state.activeSlotId = pick.getAttribute("data-pick");
+        refreshSlotCards();
+        drawOverlay();
+        return;
+      }
+
+      const clear = event.target.closest("[data-clear]");
+      if (clear) {
+        const slotId = clear.getAttribute("data-clear");
+        const slotState = state.slots[slotId];
+        slotState.x = null;
+        slotState.y = null;
+        slotState.samples = [];
+        syncHiddenField(true);
+        refreshSlotCards();
+        drawOverlay();
+      }
+    });
+
+    slotList.addEventListener("change", (event) => {
+      const skip = event.target.closest("[data-skip]");
+      if (!skip) return;
+      const slotId = skip.getAttribute("data-skip");
+      const slotState = state.slots[slotId];
+      slotState.skipped = !!skip.checked;
+      if (slotState.skipped) {
+        slotState.x = null;
+        slotState.y = null;
+        slotState.samples = [];
+      }
+      syncHiddenField(true);
+      refreshSlotCards();
+      drawOverlay();
+    });
+
+    playBtn.addEventListener("click", () => {
+      if (!video.src) return;
+      if (video.paused) {
+        video.playbackRate = 2.0;
+        video.play();
+      } else {
+        video.pause();
+      }
+    });
+    backBtn.addEventListener("click", () => {
+      video.currentTime = Math.max(0, (video.currentTime || 0) - 5);
+      captureAllSlots(true);
+    });
+    forwardBtn.addEventListener("click", () => {
+      const duration = Number.isFinite(video.duration) ? video.duration : 0;
+      video.currentTime = Math.min(duration, (video.currentTime || 0) + 5);
+      captureAllSlots(true);
+    });
+
+    canvas.addEventListener("pointerdown", (event) => {
+      resizeCanvas();
+      const rect = canvas.getBoundingClientRect();
+      let hitSlotId = null;
+      SLOT_ORDER.forEach((slot) => {
+        const slotState = state.slots[slot.id];
+        if (hitSlotId || slotState.skipped || slotState.x === null || slotState.y === null) return;
+        const point = sourceToCanvas(slotState.x, slotState.y);
+        const dx = (event.clientX - rect.left) - point.x;
+        const dy = (event.clientY - rect.top) - point.y;
+        if ((dx * dx) + (dy * dy) <= (20 * 20)) {
+          hitSlotId = slot.id;
+        }
+      });
+
+      if (hitSlotId) {
+        state.activeSlotId = hitSlotId;
+        state.dragging = hitSlotId;
+        canvas.setPointerCapture(event.pointerId);
+      } else {
+        const point = pointerToSource(event);
+        const slotState = state.slots[state.activeSlotId];
+        slotState.skipped = false;
+        slotState.x = point.x;
+        slotState.y = point.y;
+        recordSlotSample(state.activeSlotId, video.currentTime || 0, point.x, point.y);
+        syncHiddenField(true);
+      }
+
+      refreshSlotCards();
+      drawOverlay();
+    });
+
+    canvas.addEventListener("pointermove", (event) => {
+      if (!state.dragging) return;
+      const point = pointerToSource(event);
+      const slotState = state.slots[state.dragging];
+      slotState.x = point.x;
+      slotState.y = point.y;
+      recordSlotSample(state.dragging, video.currentTime || 0, point.x, point.y);
+      syncHiddenField();
+      drawOverlay();
+    });
+
+    function stopDrag() {
+      state.dragging = null;
+    }
+    canvas.addEventListener("pointerup", stopDrag);
+    canvas.addEventListener("pointercancel", stopDrag);
+
+    video.addEventListener("loadedmetadata", () => {
+      video.playbackRate = 2.0;
+      resizeCanvas();
+      syncHiddenField(true);
+      refreshSlotCards();
+    });
+    video.addEventListener("timeupdate", () => {
+      const duration = Number.isFinite(video.duration) ? video.duration : 0;
+      timeLabel.textContent = `${(video.currentTime || 0).toFixed(1)}s / ${duration.toFixed(1)}s`;
+      captureAllSlots(false);
+    });
+
+    if (window.ResizeObserver) {
+      new ResizeObserver(resizeCanvas).observe(shell);
+    }
+    window.addEventListener("resize", resizeCanvas);
+    setInterval(syncFromPreview, 800);
+    setInterval(refreshSlotCards, 500);
+    setInterval(() => {
+      if (!video.paused && !video.ended) {
+        captureAllSlots(false);
+      }
+    }, 200);
+
+    refreshSlotCards();
+    updateStatus();
+    resizeCanvas();
+    syncHiddenField(true);
+  }
+
+  if (document.readyState === "loading") {
+    document.addEventListener("DOMContentLoaded", () => setTimeout(initManualTracker, 0));
+  } else {
+    setTimeout(initManualTracker, 0);
+  }
+  setInterval(initManualTracker, 1000);
+})();
+</script>
+"""
+
+
+MANUAL_TRACKER_HTML = """
+<div id="manual-center-tracker">
+  <p><strong>Manual Center Tracking</strong> — Keep the marker on the middle of each robot while the center video plays at 2x. Track all six robots unless you intentionally mark one as skipped.</p>
+  <div class="manual-tracker-toolbar">
+    <button type="button" id="manual-tracker-play">Play / Pause</button>
+    <button type="button" id="manual-tracker-back">-5s</button>
+    <button type="button" id="manual-tracker-forward">+5s</button>
+    <span id="manual-tracker-time">0.0s / 0.0s</span>
+  </div>
+  <div class="manual-tracker-stage">
+    <div class="manual-tracker-video-shell">
+      <video id="manual-tracker-video" playsinline preload="metadata"></video>
+      <canvas id="manual-tracker-overlay"></canvas>
+    </div>
+  </div>
+  <div id="manual-tracker-slot-list" class="manual-tracker-slot-list"></div>
+  <div id="manual-tracker-status">Upload a video to begin.</div>
+</div>
+"""
+
+
+def create_manual_demo():
+    """Create the center-camera manual tracking interface."""
+
+    with gr.Blocks(title="Robot Scouter - Manual Center Tracking") as demo:
+        with gr.Row():
+            with gr.Column(scale=1):
+                gr.Markdown("<div class='panel-title'>Manual Center Tracking Mode</div>", elem_classes="input-panel")
+                gr.Markdown(
+                    "This mode is enabled by `ROBOT_TRACKING_MODE=manual`. "
+                    "Only the center camera is used. Side cameras, field-mask robot detection, and LLM robot labeling are skipped."
+                )
+
+                composite_video_input = gr.Video(
+                    label="Match Video (manual robot tracking on center camera only)",
+                    sources=["upload"],
+                )
+                center_video_input = gr.State(None)
+
+                preview_source_video = gr.Video(
+                    label="Center Preview Source",
+                    interactive=False,
+                    elem_id="manual-center-preview-source",
+                )
+
+                gr.Markdown("### Center Camera Calibration")
+                gr.Markdown(
+                    "Click the 8 field landmarks in order (B1→B4, R1→R4). "
+                    "Extra clicks after that are grouped into 4-point no-scan polygons."
+                )
+
+                calibration_base_image = gr.State(None)
+                calibration_points_state = gr.State([])
+                calibration_image_size_state = gr.State(None)
+
+                calibration_image = gr.Image(
+                    label="Click calibration points here",
+                    type="pil",
+                    interactive=False,
+                    height=300,
+                )
+                calibration_status = gr.Markdown("*Upload a video to begin calibration*")
+                with gr.Row():
+                    undo_btn = gr.Button("Undo Last Point", size="sm")
+                    skip_calib_btn = gr.Button("Skip Calibration", size="sm")
+
+                gr.Markdown("### Blue Alliance")
+                with gr.Row():
+                    blue_robot_1 = gr.Textbox(label="Robot 1", value="1768", max_lines=1, elem_id="blue-robot-1-input")
+                    blue_robot_2 = gr.Textbox(label="Robot 2", value="4909", max_lines=1, elem_id="blue-robot-2-input")
+                    blue_robot_3 = gr.Textbox(label="Robot 3", value="5962", max_lines=1, elem_id="blue-robot-3-input")
+
+                gr.Markdown("### Red Alliance")
+                with gr.Row():
+                    red_robot_1 = gr.Textbox(label="Robot 1", value="2342", max_lines=1, elem_id="red-robot-1-input")
+                    red_robot_2 = gr.Textbox(label="Robot 2", value="6328", max_lines=1, elem_id="red-robot-2-input")
+                    red_robot_3 = gr.Textbox(label="Robot 3", value="2877", max_lines=1, elem_id="red-robot-3-input")
+
+                with gr.Row():
+                    fps_slider = gr.Slider(
+                        minimum=1,
+                        maximum=30,
+                        value=8,
+                        step=1,
+                        label="Map / Tracker FPS",
+                        info="Used for map output, ferry counts, and disabled detection"
+                    )
+                    detect_fuel_checkbox = gr.Checkbox(
+                        label="Detect Yellow Fuel",
+                        value=True,
+                        info="Run SAM 3 ball detection and shot calculations"
+                    )
+
+                with gr.Row():
+                    start_seconds_input = gr.Number(
+                        minimum=0,
+                        value=0,
+                        label="Start Time (seconds)",
+                        info="Start processing at this time (0 = from beginning)"
+                    )
+                    end_seconds_input = gr.Number(
+                        minimum=0,
+                        value=0,
+                        label="End Time (seconds)",
+                        info="Stop processing at this time (0 = process to end)"
+                    )
+
+                manual_tracks_json = gr.Textbox(
+                    label="Manual Track Cache",
+                    elem_id="manual-tracks-json",
+                    lines=2,
+                    value="{}",
+                )
+                gr.HTML(MANUAL_TRACKER_HTML)
+
+                process_btn = gr.Button("Process Video")
+
+            with gr.Column(scale=1):
+                gr.Markdown("<div class='panel-title'>Output</div>", elem_classes="output-panel")
+                center_video_output = gr.Video(label="Center Camera - Annotated")
+                map_video_output = gr.Video(label="Map Time-Lapse - Full Match Movement Overview")
+
+                gr.Markdown("<div class='panel-title'>Blue Alliance - Autonomous Movement (15 sec)</div>")
+                with gr.Row():
+                    with gr.Column():
+                        blue1_map = gr.Image(label="Blue Robot 1 - Movement")
+                        blue1_stats = gr.Markdown("*Waiting for processing...*")
+                    with gr.Column():
+                        blue2_map = gr.Image(label="Blue Robot 2 - Movement")
+                        blue2_stats = gr.Markdown("*Waiting for processing...*")
+                    with gr.Column():
+                        blue3_map = gr.Image(label="Blue Robot 3 - Movement")
+                        blue3_stats = gr.Markdown("*Waiting for processing...*")
+
+                gr.Markdown("<div class='panel-title'>Red Alliance - Autonomous Movement (15 sec)</div>")
+                with gr.Row():
+                    with gr.Column():
+                        red1_map = gr.Image(label="Red Robot 1 - Movement")
+                        red1_stats = gr.Markdown("*Waiting for processing...*")
+                    with gr.Column():
+                        red2_map = gr.Image(label="Red Robot 2 - Movement")
+                        red2_stats = gr.Markdown("*Waiting for processing...*")
+                    with gr.Column():
+                        red3_map = gr.Image(label="Red Robot 3 - Movement")
+                        red3_stats = gr.Markdown("*Waiting for processing...*")
+
+        def handle_manual_video_upload(video_path, start_seconds):
+            if video_path is None:
+                return None, None, None, None, [], None, "*Upload a video to begin calibration*", "{}"
+
+            center_frame, _, _ = _extract_composite_calibration_frames(video_path, start_seconds or 0)
+            if center_frame is None:
+                return None, None, None, None, [], None, "Failed to extract center calibration frame", "{}"
+
+            center_video_path = extract_center_video_from_composite(video_path)
+            return (
+                center_video_path,
+                center_video_path,
+                center_frame,
+                center_frame,
+                [],
+                center_frame.size,
+                _get_calibration_status_text(0),
+                "{}",
+            )
+
+        composite_video_input.change(
+            fn=handle_manual_video_upload,
+            inputs=[composite_video_input, start_seconds_input],
+            outputs=[
+                preview_source_video,
+                center_video_input,
+                calibration_image,
+                calibration_base_image,
+                calibration_points_state,
+                calibration_image_size_state,
+                calibration_status,
+                manual_tracks_json,
+            ]
+        )
+
+        def handle_image_click(base_image, clicked_points, evt: gr.SelectData):
+            if base_image is None:
+                return None, clicked_points, "Upload a video first"
+            x, y = evt.index
+            clicked_points = list(clicked_points) + [(x, y)]
+            annotated = _redraw_calibration_image(base_image, clicked_points)
+            return annotated, clicked_points, _get_calibration_status_text(len(clicked_points))
+
+        calibration_image.select(
+            fn=handle_image_click,
+            inputs=[calibration_base_image, calibration_points_state],
+            outputs=[calibration_image, calibration_points_state, calibration_status]
+        )
+
+        def handle_undo(base_image, clicked_points):
+            if not clicked_points:
+                return base_image, clicked_points, "No points to undo"
+            clicked_points = list(clicked_points)[:-1]
+            annotated = _redraw_calibration_image(base_image, clicked_points) if clicked_points else base_image
+            return annotated, clicked_points, _get_calibration_status_text(len(clicked_points)) + " — Undid last point"
+
+        undo_btn.click(
+            fn=handle_undo,
+            inputs=[calibration_base_image, calibration_points_state],
+            outputs=[calibration_image, calibration_points_state, calibration_status]
+        )
+
+        skip_calib_btn.click(
+            fn=lambda: ([], "**Calibration skipped** — will use default alignment"),
+            inputs=[],
+            outputs=[calibration_points_state, calibration_status]
+        )
+
+        process_btn.click(
+            fn=process_manual_center_video,
+            inputs=[
+                center_video_input,
+                composite_video_input,
+                fps_slider,
+                start_seconds_input,
+                end_seconds_input,
+                blue_robot_1,
+                blue_robot_2,
+                blue_robot_3,
+                red_robot_1,
+                red_robot_2,
+                red_robot_3,
+                detect_fuel_checkbox,
+                calibration_points_state,
+                calibration_image_size_state,
+                manual_tracks_json,
+            ],
+            outputs=[
+                center_video_output,
+                map_video_output,
+                blue1_map, blue1_stats,
+                blue2_map, blue2_stats,
+                blue3_map, blue3_stats,
+                red1_map, red1_stats,
+                red2_map, red2_stats,
+                red3_map, red3_stats,
+            ],
+            js="""
+            (centerVideoPath, compositeVideoPath, fps, startSeconds, endSeconds,
+             blue1, blue2, blue3, red1, red2, red3, detectFuel,
+             calibrationPoints, calibrationImageSize, manualTracksJson) => {
+                const synced = window.manualTrackerSync ? window.manualTrackerSync() : manualTracksJson;
+                return [
+                    centerVideoPath, compositeVideoPath, fps, startSeconds, endSeconds,
+                    blue1, blue2, blue3, red1, red2, red3, detectFuel,
+                    calibrationPoints, calibrationImageSize, synced
+                ];
+            }
+            """
+        )
+
+    return demo
+
+
 def create_demo():
     """Create and return the Gradio interface."""
     
@@ -6677,9 +7941,10 @@ def create_demo():
 
 
 if __name__ == "__main__":
-    demo = create_demo()
+    demo = create_manual_demo() if MANUAL_ROBOT_TRACKING else create_demo()
     demo.launch(
         server_name="0.0.0.0",
         server_port=7860,
-        share=False
+        share=False,
+        head=MANUAL_TRACKER_HEAD if MANUAL_ROBOT_TRACKING else None,
     )
