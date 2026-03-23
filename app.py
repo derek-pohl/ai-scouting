@@ -5127,10 +5127,10 @@ def _estimate_manual_robot_bbox(center_x: float, center_y: float, frame_width: i
     without needing automatic robot detection.
     """
     y_norm = float(np.clip(center_y / max(1.0, frame_height), 0.0, 1.0))
-    bbox_h = frame_height * (0.045 + (0.115 * y_norm))
-    bbox_h = float(np.clip(bbox_h, frame_height * 0.05, frame_height * 0.18))
-    bbox_w = bbox_h * 1.10
-    bbox_w = float(np.clip(bbox_w, frame_width * 0.03, frame_width * 0.14))
+    bbox_h = frame_height * (0.042 + (0.103 * y_norm))
+    bbox_h = float(np.clip(bbox_h, frame_height * 0.045, frame_height * 0.16))
+    bbox_w = bbox_h * 1.04
+    bbox_w = float(np.clip(bbox_w, frame_width * 0.028, frame_width * 0.125))
 
     x1 = max(0.0, center_x - (bbox_w / 2.0))
     y1 = max(0.0, center_y - (bbox_h / 2.0))
@@ -6774,6 +6774,9 @@ def process_manual_center_video(center_video_path: str = None, composite_video_p
 
 MANUAL_TRACKER_HEAD = r"""
 <style>
+  .gradio-container {
+    max-width: min(96vw, 1800px) !important;
+  }
   #manual-center-preview-source,
   #manual-tracks-json {
     display: none !important;
@@ -6800,6 +6803,15 @@ MANUAL_TRACKER_HEAD = r"""
     cursor: pointer;
     font-weight: 600;
   }
+  .manual-tracker-toolbar .manual-tracker-readout {
+    display: inline-flex;
+    align-items: center;
+    padding: 7px 12px;
+    border-radius: 999px;
+    background: rgba(15, 23, 42, 0.08);
+    color: #0f172a;
+    font-weight: 600;
+  }
   .manual-tracker-stage {
     position: relative;
     width: 100%;
@@ -6807,16 +6819,21 @@ MANUAL_TRACKER_HEAD = r"""
     border-radius: 12px;
     background: #0f172a;
     margin-bottom: 12px;
+    padding: 10px;
+    display: flex;
+    justify-content: center;
   }
   .manual-tracker-video-shell {
     position: relative;
-    width: 100%;
+    width: min(100%, 1520px);
+    aspect-ratio: 16 / 9;
   }
   #manual-tracker-video {
     width: 100%;
+    height: 100%;
     display: block;
-    max-height: 760px;
-    min-height: 620px;
+    max-height: min(82vh, 860px);
+    min-height: 0;
     background: #020617;
     object-fit: contain;
   }
@@ -6878,6 +6895,14 @@ MANUAL_TRACKER_HEAD = r"""
     font-size: 13px;
     color: #334155;
   }
+  @media (max-width: 1100px) {
+    .gradio-container {
+      max-width: 98vw !important;
+    }
+    .manual-tracker-stage {
+      padding: 6px;
+    }
+  }
 </style>
 <script>
 (() => {
@@ -6909,8 +6934,11 @@ MANUAL_TRACKER_HEAD = r"""
     const slotList = document.getElementById("manual-tracker-slot-list");
     const status = document.getElementById("manual-tracker-status");
     const timeLabel = document.getElementById("manual-tracker-time");
+    const rateLabel = document.getElementById("manual-tracker-rate");
     const playBtn = document.getElementById("manual-tracker-play");
     const restartBtn = document.getElementById("manual-tracker-restart");
+    const slowerBtn = document.getElementById("manual-tracker-slower");
+    const fasterBtn = document.getElementById("manual-tracker-faster");
     const backBtn = document.getElementById("manual-tracker-back");
     const forwardBtn = document.getElementById("manual-tracker-forward");
     const hiddenFieldRoot = document.querySelector("#manual-tracks-json");
@@ -6922,6 +6950,7 @@ MANUAL_TRACKER_HEAD = r"""
       activeSlotId: SLOT_ORDER[0].id,
       dragging: null,
       lastSnapshotTime: -1,
+      playbackRate: 2.0,
       slots: {},
     };
     SLOT_ORDER.forEach((slot) => {
@@ -6930,6 +6959,18 @@ MANUAL_TRACKER_HEAD = r"""
 
     function getSlotLabel(slot) {
       return getInputValue(slot.selector, slot.short);
+    }
+
+    function updateRateLabel() {
+      if (rateLabel) {
+        rateLabel.textContent = `${state.playbackRate.toFixed(2).replace(/\.00$/, "")}x`;
+      }
+    }
+
+    function setPlaybackRate(nextRate) {
+      state.playbackRate = Math.max(0.25, Math.min(4.0, Number(nextRate) || 2.0));
+      video.playbackRate = state.playbackRate;
+      updateRateLabel();
     }
 
     function toPayload() {
@@ -6984,20 +7025,39 @@ MANUAL_TRACKER_HEAD = r"""
       drawOverlay();
     }
 
-    function sourceToCanvas(x, y) {
+    function getDisplayedVideoRect() {
+      const sourceWidth = Math.max(1, video.videoWidth || canvas.width || 1);
+      const sourceHeight = Math.max(1, video.videoHeight || canvas.height || 1);
+      const scale = Math.min(canvas.width / sourceWidth, canvas.height / sourceHeight);
+      const drawWidth = sourceWidth * scale;
+      const drawHeight = sourceHeight * scale;
       return {
-        x: x * canvas.width / Math.max(1, video.videoWidth || canvas.width),
-        y: y * canvas.height / Math.max(1, video.videoHeight || canvas.height),
+        scale,
+        width: drawWidth,
+        height: drawHeight,
+        offsetX: (canvas.width - drawWidth) / 2,
+        offsetY: (canvas.height - drawHeight) / 2,
+      };
+    }
+
+    function sourceToCanvas(x, y) {
+      const rect = getDisplayedVideoRect();
+      return {
+        x: rect.offsetX + (x * rect.scale),
+        y: rect.offsetY + (y * rect.scale),
       };
     }
 
     function pointerToSource(event) {
-      const rect = canvas.getBoundingClientRect();
-      const localX = Math.min(1, Math.max(0, (event.clientX - rect.left) / Math.max(rect.width, 1)));
-      const localY = Math.min(1, Math.max(0, (event.clientY - rect.top) / Math.max(rect.height, 1)));
+      const canvasRect = canvas.getBoundingClientRect();
+      const displayed = getDisplayedVideoRect();
+      const canvasX = event.clientX - canvasRect.left;
+      const canvasY = event.clientY - canvasRect.top;
+      const localX = Math.min(displayed.width, Math.max(0, canvasX - displayed.offsetX));
+      const localY = Math.min(displayed.height, Math.max(0, canvasY - displayed.offsetY));
       return {
-        x: localX * Math.max(1, video.videoWidth || canvas.width),
-        y: localY * Math.max(1, video.videoHeight || canvas.height),
+        x: localX / Math.max(displayed.scale, 1e-6),
+        y: localY / Math.max(displayed.scale, 1e-6),
       };
     }
 
@@ -7005,11 +7065,12 @@ MANUAL_TRACKER_HEAD = r"""
       const ctx = canvas.getContext("2d");
       ctx.clearRect(0, 0, canvas.width, canvas.height);
       SLOT_ORDER.forEach((slot) => {
+        if (slot.id !== state.activeSlotId) return;
         const slotState = state.slots[slot.id];
         if (slotState.skipped || slotState.x === null || slotState.y === null) return;
 
         const point = sourceToCanvas(slotState.x, slotState.y);
-        const radius = 8;
+        const radius = 7;
         ctx.fillStyle = slot.color;
         ctx.beginPath();
         ctx.arc(point.x, point.y, radius, 0, Math.PI * 2);
@@ -7024,12 +7085,12 @@ MANUAL_TRACKER_HEAD = r"""
         }
 
         const label = getSlotLabel(slot);
-        ctx.font = "bold 11px sans-serif";
+        ctx.font = "bold 10px sans-serif";
         const textWidth = ctx.measureText(label).width;
         ctx.fillStyle = "rgba(15, 23, 42, 0.85)";
-        ctx.fillRect(point.x - textWidth / 2 - 5, point.y - 29, textWidth + 10, 16);
+        ctx.fillRect(point.x - textWidth / 2 - 5, point.y - 27, textWidth + 10, 15);
         ctx.fillStyle = "#ffffff";
-        ctx.fillText(label, point.x - textWidth / 2, point.y - 17);
+        ctx.fillText(label, point.x - textWidth / 2, point.y - 16);
       });
     }
 
@@ -7177,7 +7238,7 @@ MANUAL_TRACKER_HEAD = r"""
     playBtn.addEventListener("click", () => {
       if (!video.src) return;
       if (video.paused) {
-        video.playbackRate = 2.0;
+        video.playbackRate = state.playbackRate;
         video.play();
       } else {
         video.pause();
@@ -7199,6 +7260,12 @@ MANUAL_TRACKER_HEAD = r"""
       video.currentTime = Math.min(duration, (video.currentTime || 0) + 5);
       captureAllSlots(true);
     });
+    slowerBtn.addEventListener("click", () => {
+      setPlaybackRate(state.playbackRate - 0.25);
+    });
+    fasterBtn.addEventListener("click", () => {
+      setPlaybackRate(state.playbackRate + 0.25);
+    });
 
     canvas.addEventListener("pointerdown", (event) => {
       resizeCanvas();
@@ -7210,7 +7277,7 @@ MANUAL_TRACKER_HEAD = r"""
         const point = sourceToCanvas(slotState.x, slotState.y);
         const dx = (event.clientX - rect.left) - point.x;
         const dy = (event.clientY - rect.top) - point.y;
-        if ((dx * dx) + (dy * dy) <= (20 * 20)) {
+        if ((dx * dx) + (dy * dy) <= (16 * 16)) {
           hitSlotId = slot.id;
         }
       });
@@ -7251,7 +7318,7 @@ MANUAL_TRACKER_HEAD = r"""
     canvas.addEventListener("pointercancel", stopDrag);
 
     video.addEventListener("loadedmetadata", () => {
-      video.playbackRate = 2.0;
+      setPlaybackRate(state.playbackRate);
       resizeCanvas();
       syncHiddenField(true);
       refreshSlotCards();
@@ -7277,6 +7344,7 @@ MANUAL_TRACKER_HEAD = r"""
     refreshSlotCards();
     updateStatus();
     resizeCanvas();
+    updateRateLabel();
     syncHiddenField(true);
   }
 
@@ -7297,8 +7365,11 @@ MANUAL_TRACKER_HTML = """
   <div class="manual-tracker-toolbar">
     <button type="button" id="manual-tracker-play">Play / Pause</button>
     <button type="button" id="manual-tracker-restart">Restart</button>
+    <button type="button" id="manual-tracker-slower">Slower</button>
+    <button type="button" id="manual-tracker-faster">Faster</button>
     <button type="button" id="manual-tracker-back">-5s</button>
     <button type="button" id="manual-tracker-forward">+5s</button>
+    <span id="manual-tracker-rate" class="manual-tracker-readout">2x</span>
     <span id="manual-tracker-time">0.0s / 0.0s</span>
   </div>
   <div class="manual-tracker-stage">
@@ -7318,7 +7389,7 @@ def create_manual_demo():
 
     with gr.Blocks(title="Robot Scouter - Manual Center Tracking") as demo:
         with gr.Row():
-            with gr.Column(scale=3):
+            with gr.Column(scale=1):
                 gr.Markdown("<div class='panel-title'>Manual Center Tracking Mode</div>", elem_classes="input-panel")
                 gr.Markdown(
                     "This mode is enabled by `ROBOT_TRACKING_MODE=manual`. "
@@ -7405,38 +7476,41 @@ def create_manual_demo():
                     lines=2,
                     value="{}",
                 )
-                gr.HTML(MANUAL_TRACKER_HTML)
 
-                process_btn = gr.Button("Process Video")
+        with gr.Row():
+            gr.HTML(MANUAL_TRACKER_HTML)
 
-            with gr.Column(scale=2):
+        process_btn = gr.Button("Process Video")
+
+        with gr.Row():
+            with gr.Column(scale=1):
                 gr.Markdown("<div class='panel-title'>Output</div>", elem_classes="output-panel")
                 center_video_output = gr.Video(label="Center Camera - Annotated")
                 map_video_output = gr.Video(label="Map Time-Lapse - Full Match Movement Overview")
 
-                gr.Markdown("<div class='panel-title'>Blue Alliance - Autonomous Movement (15 sec)</div>")
-                with gr.Row():
-                    with gr.Column():
-                        blue1_map = gr.Image(label="Blue Robot 1 - Movement")
-                        blue1_stats = gr.Markdown("*Waiting for processing...*")
-                    with gr.Column():
-                        blue2_map = gr.Image(label="Blue Robot 2 - Movement")
-                        blue2_stats = gr.Markdown("*Waiting for processing...*")
-                    with gr.Column():
-                        blue3_map = gr.Image(label="Blue Robot 3 - Movement")
-                        blue3_stats = gr.Markdown("*Waiting for processing...*")
+        gr.Markdown("<div class='panel-title'>Blue Alliance - Autonomous Movement (15 sec)</div>")
+        with gr.Row():
+            with gr.Column():
+                blue1_map = gr.Image(label="Blue Robot 1 - Movement")
+                blue1_stats = gr.Markdown("*Waiting for processing...*")
+            with gr.Column():
+                blue2_map = gr.Image(label="Blue Robot 2 - Movement")
+                blue2_stats = gr.Markdown("*Waiting for processing...*")
+            with gr.Column():
+                blue3_map = gr.Image(label="Blue Robot 3 - Movement")
+                blue3_stats = gr.Markdown("*Waiting for processing...*")
 
-                gr.Markdown("<div class='panel-title'>Red Alliance - Autonomous Movement (15 sec)</div>")
-                with gr.Row():
-                    with gr.Column():
-                        red1_map = gr.Image(label="Red Robot 1 - Movement")
-                        red1_stats = gr.Markdown("*Waiting for processing...*")
-                    with gr.Column():
-                        red2_map = gr.Image(label="Red Robot 2 - Movement")
-                        red2_stats = gr.Markdown("*Waiting for processing...*")
-                    with gr.Column():
-                        red3_map = gr.Image(label="Red Robot 3 - Movement")
-                        red3_stats = gr.Markdown("*Waiting for processing...*")
+        gr.Markdown("<div class='panel-title'>Red Alliance - Autonomous Movement (15 sec)</div>")
+        with gr.Row():
+            with gr.Column():
+                red1_map = gr.Image(label="Red Robot 1 - Movement")
+                red1_stats = gr.Markdown("*Waiting for processing...*")
+            with gr.Column():
+                red2_map = gr.Image(label="Red Robot 2 - Movement")
+                red2_stats = gr.Markdown("*Waiting for processing...*")
+            with gr.Column():
+                red3_map = gr.Image(label="Red Robot 3 - Movement")
+                red3_stats = gr.Markdown("*Waiting for processing...*")
 
         def handle_manual_video_upload(video_path, start_seconds):
             if video_path is None:
