@@ -6782,10 +6782,17 @@ MANUAL_TRACKER_HEAD = r"""
     display: none !important;
   }
   #manual-center-tracker {
-    border: 1px solid #d7dde8;
+    border: 1px solid var(--block-border-color, #d7dde8);
     border-radius: 14px;
     padding: 14px;
-    background: linear-gradient(180deg, #fbfcff 0%, #f2f5fb 100%);
+    background: var(--block-background-fill, #0f172a);
+    color: var(--body-text-color, #e5e7eb);
+  }
+  #manual-center-tracker p,
+  #manual-center-tracker strong,
+  #manual-center-tracker span,
+  #manual-center-tracker label {
+    color: inherit;
   }
   .manual-tracker-toolbar {
     display: flex;
@@ -6795,21 +6802,25 @@ MANUAL_TRACKER_HEAD = r"""
     margin-bottom: 10px;
   }
   .manual-tracker-toolbar button {
-    border: none;
+    border: 1px solid var(--button-secondary-border-color, transparent);
     border-radius: 999px;
     padding: 8px 12px;
-    background: #113b74;
-    color: white;
+    background: var(--button-secondary-background-fill, #1f2937);
+    color: var(--button-secondary-text-color, #f8fafc);
     cursor: pointer;
     font-weight: 600;
+  }
+  .manual-tracker-toolbar button:hover {
+    background: var(--button-secondary-background-fill-hover, #374151);
   }
   .manual-tracker-toolbar .manual-tracker-readout {
     display: inline-flex;
     align-items: center;
     padding: 7px 12px;
     border-radius: 999px;
-    background: rgba(15, 23, 42, 0.08);
-    color: #0f172a;
+    background: var(--input-background-fill, rgba(148, 163, 184, 0.18));
+    color: var(--body-text-color, #e5e7eb);
+    border: 1px solid var(--block-border-color, rgba(148, 163, 184, 0.25));
     font-weight: 600;
   }
   .manual-tracker-stage {
@@ -6846,21 +6857,22 @@ MANUAL_TRACKER_HEAD = r"""
   }
   .manual-tracker-slot-list {
     display: grid;
-    grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
-    gap: 10px;
+    grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+    gap: 12px;
     margin-top: 12px;
   }
   .manual-slot-card {
-    display: flex;
+    display: grid;
+    grid-template-columns: minmax(96px, auto) minmax(70px, 1fr) auto;
     align-items: center;
-    gap: 8px;
-    padding: 10px;
+    gap: 10px;
+    padding: 12px;
     border-radius: 12px;
-    background: white;
-    border: 1px solid #d7dde8;
+    background: var(--body-background-fill, #111827);
+    border: 1px solid var(--block-border-color, #374151);
   }
   .manual-slot-pick {
-    border: none;
+    border: 1px solid rgba(255, 255, 255, 0.08);
     border-radius: 10px;
     padding: 8px 10px;
     color: white;
@@ -6869,7 +6881,7 @@ MANUAL_TRACKER_HEAD = r"""
     min-width: 84px;
   }
   .manual-slot-pick.active {
-    outline: 3px solid rgba(17, 59, 116, 0.18);
+    outline: 3px solid rgba(96, 165, 250, 0.35);
   }
   .manual-slot-meta {
     display: flex;
@@ -6877,23 +6889,55 @@ MANUAL_TRACKER_HEAD = r"""
     gap: 4px;
     flex: 1;
     font-size: 12px;
+    min-width: 0;
+  }
+  .manual-slot-meta strong {
+    font-size: 12px;
+    opacity: 0.7;
+  }
+  .manual-slot-meta span {
+    font-size: 13px;
+    font-weight: 600;
   }
   .manual-slot-actions {
     display: flex;
     align-items: center;
     gap: 8px;
+    justify-content: flex-end;
+    flex-wrap: wrap;
   }
   .manual-slot-actions button {
-    border: none;
+    border: 1px solid var(--button-secondary-border-color, transparent);
     border-radius: 8px;
-    padding: 6px 8px;
+    padding: 6px 10px;
     cursor: pointer;
-    background: #e2e8f0;
+    background: var(--button-secondary-background-fill, #374151);
+    color: var(--button-secondary-text-color, #f8fafc);
+    font-weight: 600;
+  }
+  .manual-slot-actions label {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    white-space: nowrap;
+    opacity: 0.9;
   }
   #manual-tracker-status {
     margin-top: 10px;
     font-size: 13px;
-    color: #334155;
+    color: var(--body-text-color-subdued, var(--body-text-color, #cbd5e1));
+  }
+  @media (max-width: 900px) {
+    .manual-tracker-slot-list {
+      grid-template-columns: 1fr;
+    }
+    .manual-slot-card {
+      grid-template-columns: minmax(96px, auto) 1fr;
+    }
+    .manual-slot-actions {
+      grid-column: 1 / -1;
+      justify-content: flex-start;
+    }
   }
   @media (max-width: 1100px) {
     .gradio-container {
@@ -6906,6 +6950,7 @@ MANUAL_TRACKER_HEAD = r"""
 </style>
 <script>
 (() => {
+  const MANUAL_TRACK_REACTION_SECONDS = 0.5;
   const SLOT_ORDER = [
     { id: "blue_1", selector: "#blue-robot-1-input", color: "#1d4ed8", short: "B1" },
     { id: "blue_2", selector: "#blue-robot-2-input", color: "#2563eb", short: "B2" },
@@ -6971,6 +7016,13 @@ MANUAL_TRACKER_HEAD = r"""
       state.playbackRate = Math.max(0.25, Math.min(4.0, Number(nextRate) || 2.0));
       video.playbackRate = state.playbackRate;
       updateRateLabel();
+      updateStatus();
+    }
+
+    function getCompensatedTrackTime(rawTime) {
+      const numericTime = Number(rawTime) || 0;
+      const leadSeconds = MANUAL_TRACK_REACTION_SECONDS * state.playbackRate;
+      return Math.max(0, numericTime - leadSeconds);
     }
 
     function toPayload() {
@@ -7014,7 +7066,8 @@ MANUAL_TRACKER_HEAD = r"""
       const skipped = SLOT_ORDER.filter((slot) => state.slots[slot.id].skipped).length;
       const total = SLOT_ORDER.length;
       const durationText = Number.isFinite(video.duration) ? `${video.duration.toFixed(1)}s` : "0.0s";
-      status.textContent = `Track all 6 robots unless skipped. Active: ${tracked}/${total} tracked, ${skipped} skipped. Video duration: ${durationText}.`;
+      const reactionLead = (MANUAL_TRACK_REACTION_SECONDS * state.playbackRate).toFixed(2).replace(/0+$/, "").replace(/\.$/, "");
+      status.textContent = `Track all 6 robots unless skipped. Active: ${tracked}/${total} tracked, ${skipped} skipped. Video duration: ${durationText}. Reaction lead: ${reactionLead}s.`;
     }
 
     function resizeCanvas() {
@@ -7121,8 +7174,9 @@ MANUAL_TRACKER_HEAD = r"""
     function recordSlotSample(slotId, time, x, y) {
       const slotState = state.slots[slotId];
       if (!slotState || slotState.skipped) return;
+      const adjustedTime = getCompensatedTrackTime(time);
       const entry = {
-        t: Number((time || 0).toFixed(3)),
+        t: Number(adjustedTime.toFixed(3)),
         x: Number(x.toFixed(1)),
         y: Number(y.toFixed(1)),
       };
