@@ -13,6 +13,7 @@ from bisect import bisect_left
 import cv2
 import numpy as np
 import gradio as gr
+import torch
 from PIL import Image, ImageDraw, ImageFont, ImageColor
 
 from dotenv import load_dotenv
@@ -44,21 +45,24 @@ except ImportError:
 except Exception as e:
     print(f"Error loading YOLO person model: {e}")
 
-# SAM 3 predictor for ball detection (text-prompted semantic segmentation)
+# SAM 3 predictors for ball detection and native video tracking.
 SAM3_PREDICTOR = None
+SAM3_VIDEO_PREDICTOR_CLS = None
+SAM3_OVERRIDES = None
 SAM3_MODEL_PATH = Path(__file__).parent / "sam3.pt"
 try:
-    from ultralytics.models.sam import SAM3SemanticPredictor
-    sam3_overrides = dict(
+    from ultralytics.models.sam import SAM3SemanticPredictor, SAM3VideoSemanticPredictor
+    SAM3_OVERRIDES = dict(
         conf=0.25,
         task="segment",
         mode="predict",
         model=str(SAM3_MODEL_PATH),
-        half=True,  # Use FP16 for faster inference
+        half=torch.cuda.is_available(),
         save=False,  # We handle drawing ourselves
     )
-    SAM3_PREDICTOR = SAM3SemanticPredictor(overrides=sam3_overrides)
-    print(f"SAM 3 predictor initialized successfully (model: {SAM3_MODEL_PATH})")
+    SAM3_PREDICTOR = SAM3SemanticPredictor(overrides=SAM3_OVERRIDES)
+    SAM3_VIDEO_PREDICTOR_CLS = SAM3VideoSemanticPredictor
+    print(f"SAM 3 predictors initialized successfully (model: {SAM3_MODEL_PATH})")
 except ImportError:
     print("SAM 3 not available (ultralytics version may not support it) - using HSV ball detection")
 except Exception as e:
@@ -1839,7 +1843,11 @@ class BallTracker:
         
         # Lost balls — use their extrapolated prediction
         for lost_data in self.lost_balls.values():
-            px, py = lost_data['predicted_pos']
+            pred_pos = lost_data.get('predicted_pos')
+            if pred_pos is None:
+                px, py, _ = lost_data['data']['pos']
+            else:
+                px, py = pred_pos
             _, _, cr = lost_data['data']['pos']
             positions.append((px, py, cr))
         
@@ -2225,6 +2233,202 @@ class BallTracker:
             robot_label = new_tracked[ball_id].get('shot_by')
             results.append((x, y, r, robot_label))
         
+        self.tracked_balls = new_tracked
+        return results
+
+    def update_native_tracks(self, fuel_tracks: list) -> list:
+        """
+        Update ball shot attribution using native SAM 3 track IDs.
+
+        Args:
+            fuel_tracks: List of dicts with keys `ball_id`, `x`, `y`, and `radius`
+
+        Returns:
+            List of (x, y, radius, robot_label_or_None, ball_id) tuples
+        """
+        self.current_frame += 1
+
+        incoming_tracks = []
+        seen_ids = set()
+        for track in fuel_tracks or []:
+            if not isinstance(track, dict):
+                continue
+            try:
+                ball_id = int(track.get('ball_id'))
+                x = int(track.get('x'))
+                y = int(track.get('y'))
+                radius = int(track.get('radius'))
+            except (TypeError, ValueError):
+                continue
+            if ball_id in seen_ids:
+                continue
+            seen_ids.add(ball_id)
+            incoming_tracks.append((ball_id, x, y, radius))
+
+        active_ids = {ball_id for ball_id, _, _, _ in incoming_tracks}
+        original_lost_balls = self.lost_balls
+
+        new_lost_balls = {}
+        for ball_id, ball_data in self.tracked_balls.items():
+            if ball_id not in active_ids:
+                new_lost_balls[ball_id] = {
+                    'data': ball_data,
+                    'frames_lost': 1,
+                }
+
+        updated_lost_balls = {}
+        for ball_id, lost_data in self.lost_balls.items():
+            if ball_id in active_ids:
+                continue
+
+            lost_data['frames_lost'] = lost_data.get('frames_lost', 0) + 1
+            if lost_data['frames_lost'] <= self.max_frames_lost:
+                updated_lost_balls[ball_id] = lost_data
+                continue
+
+            shot_by = lost_data['data'].get('shot_by')
+            shot_evaluated = lost_data['data'].get('shot_evaluated', False)
+            if shot_by and not shot_evaluated:
+                x, y, _ = lost_data['data']['pos']
+                in_goal = lost_data['data'].get('last_seen_in_goal', False) or self._is_in_goal(x, y)
+                if in_goal:
+                    self._record_shot(shot_by, made=True)
+                    period = get_match_period(self._get_elapsed_seconds())
+                    print(f"[SHOT MADE] Robot {shot_by} @ {period}: native SAM 3 track expired in goal")
+                else:
+                    print(f"[SHOT NOT SCORED] Robot {shot_by}: native SAM 3 track expired outside goal")
+
+        self.lost_balls = {**updated_lost_balls, **new_lost_balls}
+
+        new_tracked = {}
+        results = []
+
+        for ball_id, x, y, r in incoming_tracks:
+            if ball_id in self.tracked_balls:
+                old_data = self.tracked_balls[ball_id]
+                prev_pos = old_data['pos']
+                shot_by = old_data.get('shot_by')
+                shot_time = old_data.get('shot_time')
+                shot_evaluated = old_data.get('shot_evaluated', False)
+                candidate_shot = old_data.get('candidate_shot')
+                overlapping_robot = old_data.get('overlapping_robot')
+                last_near_robot = old_data.get('last_near_robot')
+                last_overlap_robot = old_data.get('last_overlap_robot')
+                last_overlap_frame = old_data.get('last_overlap_frame')
+                was_ever_in_goal = old_data.get('last_seen_in_goal', False)
+                recent_positions = list(old_data.get('recent_positions') or ([prev_pos] if prev_pos else []))
+            elif ball_id in original_lost_balls:
+                old_data = original_lost_balls[ball_id]['data']
+                prev_pos = old_data['pos']
+                shot_by = old_data.get('shot_by')
+                shot_time = old_data.get('shot_time')
+                shot_evaluated = old_data.get('shot_evaluated', False)
+                candidate_shot = old_data.get('candidate_shot')
+                overlapping_robot = old_data.get('overlapping_robot')
+                last_near_robot = old_data.get('last_near_robot')
+                last_overlap_robot = old_data.get('last_overlap_robot')
+                last_overlap_frame = old_data.get('last_overlap_frame')
+                was_ever_in_goal = old_data.get('last_seen_in_goal', False)
+                recent_positions = list(old_data.get('recent_positions') or ([prev_pos] if prev_pos else []))
+            else:
+                cur_overlap = self._ball_overlaps_robot(x, y, r)
+                cur_nearest = self._find_nearest_alliance_robot(x, y)
+                new_tracked[ball_id] = {
+                    'pos': (x, y, r),
+                    'prev_pos': None,
+                    'shot_by': None,
+                    'shot_time': None,
+                    'shot_evaluated': False,
+                    'overlapping_robot': cur_overlap,
+                    'last_near_robot': cur_overlap or cur_nearest,
+                    'last_overlap_robot': cur_overlap,
+                    'last_overlap_frame': self.current_frame if cur_overlap else None,
+                    'candidate_shot': None,
+                    'last_seen_in_goal': False,
+                    'recent_positions': [(x, y, r)]
+                }
+                results.append((x, y, r, None, ball_id))
+                continue
+
+            recent_positions = recent_positions[-(self.motion_history_size - 1):]
+            cur_overlap = self._ball_overlaps_robot(x, y, r)
+            cur_nearest = self._find_nearest_alliance_robot(x, y)
+
+            instant_rise, window_gain, rising_steps = self._get_shot_launch_metrics(prev_pos, recent_positions, y)
+
+            if not shot_by:
+                nearby_robot = self._get_shot_origin_robot(
+                    x,
+                    cur_overlap or overlapping_robot,
+                    last_overlap_robot,
+                    last_overlap_frame,
+                    cur_nearest
+                )
+                launch_detected = (
+                    instant_rise >= self.min_launch_rise_pixels or
+                    window_gain >= self.min_launch_window_gain or
+                    rising_steps >= 2
+                )
+                if nearby_robot and launch_detected:
+                    shot_by = nearby_robot
+                    shot_time = self.current_frame
+                    shot_evaluated = False
+                    candidate_shot = None
+                    print(
+                        f"[SHOT DETECTED] Ball {ball_id} shot by {shot_by} at "
+                        f"pos=({x:.0f},{y:.0f}), rise={instant_rise:.0f}px, "
+                        f"window_gain={window_gain:.0f}px, steps={rising_steps}"
+                    )
+
+            if shot_time is not None and not shot_evaluated:
+                frames_since_shot = self.current_frame - shot_time
+                seconds_since_shot = frames_since_shot / self.fps
+
+                if seconds_since_shot >= 2.0:
+                    is_in_goal_now = was_ever_in_goal or self._is_in_goal(x, y)
+                    if is_in_goal_now:
+                        self._record_shot(shot_by, made=True)
+                        period = get_match_period(self._get_elapsed_seconds())
+                        print(f"[SHOT MADE] Robot {shot_by} @ {period}: native SAM 3 2sec eval, in goal")
+                    else:
+                        print(f"[SHOT NOT SCORED] Robot {shot_by}: native SAM 3 2sec eval, not in goal")
+                    shot_evaluated = True
+
+            if shot_time is not None:
+                frames_since_shot = self.current_frame - shot_time
+                seconds_since_shot = frames_since_shot / self.fps
+                if seconds_since_shot > self.shot_label_duration:
+                    shot_by = None
+                    shot_time = None
+
+            is_in_goal = self._is_in_goal(x, y)
+            ever_in_goal = was_ever_in_goal or is_in_goal
+
+            if shot_by and is_in_goal:
+                print(f"[IN GOAL] Ball {ball_id} (shot by {shot_by}) at pos=({x:.0f},{y:.0f})")
+
+            updated_last_overlap_robot = cur_overlap or last_overlap_robot
+            updated_last_overlap_frame = self.current_frame if cur_overlap else last_overlap_frame
+            updated_near = cur_overlap or cur_nearest or last_near_robot
+            updated_recent_positions = recent_positions + [(x, y, r)]
+
+            new_tracked[ball_id] = {
+                'pos': (x, y, r),
+                'prev_pos': prev_pos,
+                'shot_by': shot_by,
+                'shot_time': shot_time,
+                'shot_evaluated': shot_evaluated,
+                'overlapping_robot': cur_overlap,
+                'last_near_robot': updated_near,
+                'last_overlap_robot': updated_last_overlap_robot,
+                'last_overlap_frame': updated_last_overlap_frame,
+                'candidate_shot': candidate_shot,
+                'last_seen_in_goal': ever_in_goal,
+                'recent_positions': updated_recent_positions
+            }
+
+            results.append((x, y, r, new_tracked[ball_id].get('shot_by'), ball_id))
+
         self.tracked_balls = new_tracked
         return results
     
@@ -3760,6 +3964,216 @@ _CENTER_CAM_ROIS = [
 ]
 
 
+def _get_center_camera_roi_rects(frame_width: int, frame_height: int) -> list:
+    """Scale the reference SAM 3 ROI windows to the current frame size."""
+    if frame_width <= 0 or frame_height <= 0:
+        return []
+
+    sx = frame_width / 1918.0
+    sy = frame_height / 709.0
+    roi_rects = []
+    for rx1, ry1, rx2, ry2 in _CENTER_CAM_ROIS:
+        x1 = int(max(0, min(frame_width, round(rx1 * sx))))
+        y1 = int(max(0, min(frame_height, round(ry1 * sy))))
+        x2 = int(max(0, min(frame_width, round(rx2 * sx))))
+        y2 = int(max(0, min(frame_height, round(ry2 * sy))))
+        if x2 > x1 and y2 > y1:
+            roi_rects.append((x1, y1, x2, y2))
+    return roi_rects
+
+
+def _point_is_inside_rectangles(x: int, y: int, rectangles: list) -> bool:
+    """Check whether a point lies inside any rectangle in `(x1, y1, x2, y2)` format."""
+    return any(x1 <= x <= x2 and y1 <= y <= y2 for x1, y1, x2, y2 in rectangles)
+
+
+def build_ball_tracking_video(
+    video_path: str,
+    start_frame: int,
+    end_frame: int,
+    frame_interval: int,
+    output_fps: float,
+) -> str:
+    """
+    Build the exact frame stream used for ball processing so native SAM 3 tracking
+    stays aligned one-to-one with the app's annotation loop.
+    """
+    cap = cv2.VideoCapture(video_path)
+    if not cap.isOpened():
+        raise RuntimeError("Could not open video for SAM 3 ball tracking.")
+
+    width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    output_path = tempfile.NamedTemporaryFile(suffix="_sam3_ball_track.mp4", delete=False).name
+    fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+    writer = cv2.VideoWriter(output_path, fourcc, max(1.0, output_fps), (width, height))
+    if not writer.isOpened():
+        cap.release()
+        raise RuntimeError("Could not create SAM 3 ball tracking video.")
+
+    if start_frame > 0:
+        cap.set(cv2.CAP_PROP_POS_FRAMES, start_frame)
+
+    frame_idx = start_frame
+    try:
+        while frame_idx < end_frame:
+            ret, frame = cap.read()
+            if not ret:
+                break
+            if frame_idx % max(1, frame_interval) == 0:
+                writer.write(frame)
+            frame_idx += 1
+    finally:
+        cap.release()
+        writer.release()
+
+    return output_path
+
+
+class SAM3BallVideoTrackerSession:
+    """Run native SAM 3 video semantic tracking and emit persistent per-ball IDs."""
+
+    def __init__(
+        self,
+        video_path: str,
+        start_frame: int,
+        end_frame: int,
+        frame_interval: int,
+        ball_fps: float,
+        frame_width: int,
+        frame_height: int,
+        camera_side: str = "center",
+        min_radius: int = 3,
+        max_radius: int = 30,
+    ):
+        if SAM3_VIDEO_PREDICTOR_CLS is None or SAM3_OVERRIDES is None:
+            raise RuntimeError("SAM 3 native video tracking is unavailable.")
+
+        self.video_path = build_ball_tracking_video(
+            video_path=video_path,
+            start_frame=start_frame,
+            end_frame=end_frame,
+            frame_interval=frame_interval,
+            output_fps=ball_fps,
+        )
+        self.camera_side = camera_side
+        self.min_radius = min_radius
+        self.max_radius = max_radius
+        self.frame_width = frame_width
+        self.frame_height = frame_height
+        self.roi_rects = (
+            _get_center_camera_roi_rects(frame_width, frame_height)
+            if camera_side == "center"
+            else []
+        )
+        predictor_overrides = dict(SAM3_OVERRIDES)
+        predictor_overrides.update(
+            conf=0.20,
+            mode="predict",
+            save=False,
+            vid_stride=1,
+            stream_buffer=False,
+            verbose=False,
+        )
+        keep_alive_frames = max(12, int(round(ball_fps * 1.0)))
+        self.predictor = SAM3_VIDEO_PREDICTOR_CLS(
+            overrides=predictor_overrides,
+            score_threshold_detection=0.20,
+            assoc_iou_thresh=0.20,
+            trk_assoc_iou_thresh=0.20,
+            new_det_thresh=0.15,
+            init_trk_keep_alive=keep_alive_frames,
+            max_trk_keep_alive=max(keep_alive_frames, int(round(ball_fps * 2.0))),
+            o2o_matching_masklets_enable=True,
+            recondition_every_nth_frame=max(1, int(round(ball_fps / 3.0))),
+            suppress_overlapping_based_on_recent_occlusion_threshold=0.10,
+        )
+        self._results_iter = iter(self.predictor(source=self.video_path, stream=True, text=["yellow ball"]))
+
+    @staticmethod
+    def _as_numpy(value):
+        """Convert Ultralytics tensor-like outputs into numpy arrays."""
+        if value is None:
+            return None
+        if isinstance(value, np.ndarray):
+            return value
+        if torch.is_tensor(value):
+            return value.detach().cpu().numpy()
+        return np.asarray(value)
+
+    def _extract_radius_and_center(self, result, index: int, box_xyxy: np.ndarray) -> tuple:
+        """Prefer the propagated SAM mask for center/radius, then fall back to the box."""
+        x1, y1, x2, y2 = box_xyxy
+        fallback_cx = float((x1 + x2) / 2.0)
+        fallback_cy = float((y1 + y2) / 2.0)
+        fallback_radius = float(max(x2 - x1, y2 - y1) / 2.0)
+
+        if result.masks is None or result.masks.data is None or index >= len(result.masks.data):
+            return fallback_cx, fallback_cy, fallback_radius
+
+        mask = self._as_numpy(result.masks.data[index]).astype(np.uint8, copy=False)
+        if mask.ndim != 2 or not np.any(mask):
+            return fallback_cx, fallback_cy, fallback_radius
+
+        contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        if not contours:
+            return fallback_cx, fallback_cy, fallback_radius
+
+        contour = max(contours, key=cv2.contourArea)
+        (cx, cy), radius = cv2.minEnclosingCircle(contour)
+        return float(cx), float(cy), float(radius)
+
+    def _filter_tracks(self, result) -> list:
+        """Convert SAM 3 results into the app's tracked-ball format."""
+        if result is None or result.boxes is None or len(result.boxes) == 0:
+            return []
+
+        boxes = result.boxes
+        if not boxes.is_track or boxes.id is None:
+            return []
+
+        xyxy = self._as_numpy(boxes.xyxy)
+        track_ids = self._as_numpy(boxes.id)
+        scores = self._as_numpy(boxes.conf) if boxes.conf is not None else np.ones(len(track_ids))
+
+        tracks = []
+        for idx, track_id in enumerate(track_ids):
+            cx, cy, radius = self._extract_radius_and_center(result, idx, xyxy[idx])
+            cx_i = int(round(cx))
+            cy_i = int(round(cy))
+            radius_i = int(round(radius))
+
+            if self.camera_side == "center" and self.roi_rects and not _point_is_inside_rectangles(cx_i, cy_i, self.roi_rects):
+                continue
+            if not (self.min_radius <= radius_i <= self.max_radius):
+                continue
+
+            tracks.append({
+                "ball_id": int(track_id),
+                "x": cx_i,
+                "y": cy_i,
+                "radius": radius_i,
+                "score": float(scores[idx]),
+            })
+        return tracks
+
+    def get_next_tracks(self) -> list:
+        """Advance SAM 3 by one processed ball frame and return tracked detections."""
+        try:
+            result = next(self._results_iter)
+        except StopIteration:
+            return []
+        return self._filter_tracks(result)
+
+    def close(self):
+        """Release temporary resources used for the native SAM 3 tracking session."""
+        try:
+            if self.video_path and os.path.exists(self.video_path):
+                os.unlink(self.video_path)
+        except OSError:
+            pass
+
+
 def detect_fuel_sam3(frame_bgr: np.ndarray, predictor,
                      min_radius: int = 3, max_radius: int = 30,
                      camera_side: str = "blue") -> list:
@@ -3813,11 +4227,12 @@ def detect_fuel_sam3(frame_bgr: np.ndarray, predictor,
 
 def draw_fuel_detections(frame: Image.Image, fuel_detections: list, blue_robots: list = None, red_robots: list = None) -> Image.Image:
     """
-    Draw bounding boxes around detected fuel, including robot labels for shot balls.
+    Draw fuel circles with optional robot-credit labels and native SAM track IDs.
     
     Args:
         frame: PIL Image
-        fuel_detections: List of (x, y, radius) or (x, y, radius, robot_label) tuples
+        fuel_detections: List of `(x, y, radius)`, `(x, y, radius, robot_label)`,
+            or `(x, y, radius, robot_label, ball_id)` tuples
         blue_robots: List of blue alliance team numbers for color coding
         red_robots: List of red alliance team numbers for color coding
         
@@ -3837,12 +4252,16 @@ def draw_fuel_detections(frame: Image.Image, fuel_detections: list, blue_robots:
     red_robots = red_robots or []
     
     for detection in fuel_detections:
-        # Handle both 3-tuple and 4-tuple formats
-        if len(detection) == 4:
+        # Handle 3-tuple, 4-tuple, and 5-tuple formats.
+        if len(detection) == 5:
+            x, y, radius, robot_label, ball_id = detection
+        elif len(detection) == 4:
             x, y, radius, robot_label = detection
+            ball_id = None
         else:
             x, y, radius = detection
             robot_label = None
+            ball_id = None
         
         # Choose color based on whether ball was shot
         if robot_label:
@@ -3861,15 +4280,16 @@ def draw_fuel_detections(frame: Image.Image, fuel_detections: list, blue_robots:
             width=outline_width
         )
         
-        # Draw label
-        if robot_label:
-            # Draw robot number above ball
-            label_text = f"🎯 {robot_label}"
-            draw.text((x - 20, y - radius - 18), label_text, fill=circle_color, font=label_font)
+        id_text = f"ID {ball_id}" if ball_id is not None else None
+        if robot_label and id_text:
+            label_text = f"{id_text} | {robot_label}"
+            draw.text((x - 28, y - radius - 18), label_text, fill=circle_color, font=label_font)
+        elif robot_label:
+            draw.text((x - 20, y - radius - 18), str(robot_label), fill=circle_color, font=label_font)
+        elif id_text:
+            draw.text((x - 18, y - radius - 16), id_text, fill=circle_color, font=font)
         else:
-            # Draw simple fuel indicator
-            label = "⚽"
-            draw.text((x - 8, y - radius - 15), label, fill=circle_color, font=font)
+            draw.text((x - 8, y - radius - 15), "ball", fill=circle_color, font=font)
     
     return frame
 
@@ -5307,6 +5727,27 @@ def process_single_video(video_path: str, camera_side: str = "blue", target_fps:
         frame_width=width,
         frame_height=height
     )
+    sam3_ball_video_tracker = None
+    if enable_fuel_detection and SAM3_VIDEO_PREDICTOR_CLS is not None:
+        try:
+            if progress is not None:
+                progress(0, desc=f"Preparing native SAM 3 ball tracking for {camera_name}...")
+            sam3_ball_video_tracker = SAM3BallVideoTrackerSession(
+                video_path=video_path,
+                start_frame=start_frame,
+                end_frame=end_frame,
+                frame_interval=ball_frame_interval,
+                ball_fps=ball_fps,
+                frame_width=width,
+                frame_height=height,
+                camera_side=camera_side,
+                min_radius=3,
+                max_radius=30,
+            )
+            print(f"[SAM3 Native] Using native SAM 3 video tracking for {camera_name}")
+        except Exception as e:
+            sam3_ball_video_tracker = None
+            print(f"[SAM3 Native] Failed to initialize native tracking for {camera_name}: {e}")
     
     # Center Camera Auto-Calibrator (uses user-clicked points for homography)
     center_calibrator = None
@@ -5678,16 +6119,33 @@ def process_single_video(video_path: str, camera_side: str = "blue", target_fps:
             
             # Detect and draw fuel using color-based detection if enabled
             if enable_fuel_detection:
-                if SAM3_PREDICTOR is not None:
+                if sam3_ball_video_tracker is not None:
+                    try:
+                        tracked_balls = ball_tracker.update_native_tracks(
+                            sam3_ball_video_tracker.get_next_tracks()
+                        )
+                    except Exception as e:
+                        print(f"[SAM3 Native] Tracking error on {camera_name}: {e}")
+                        sam3_ball_video_tracker.close()
+                        sam3_ball_video_tracker = None
+                        if SAM3_PREDICTOR is not None:
+                            fuel_detections = detect_fuel_sam3(frame, SAM3_PREDICTOR,
+                                                               min_radius=3, max_radius=30,
+                                                               camera_side=camera_side)
+                        else:
+                            fuel_detections = detect_fuel(frame, min_radius=3, max_radius=30,
+                                                          tracked_positions=ball_tracker.get_predicted_positions())
+                        tracked_balls = ball_tracker.update(fuel_detections)
+                elif SAM3_PREDICTOR is not None:
                     fuel_detections = detect_fuel_sam3(frame, SAM3_PREDICTOR,
                                                        min_radius=3, max_radius=30,
                                                        camera_side=camera_side)
+                    # Fallback path if native video tracking is unavailable.
+                    tracked_balls = ball_tracker.update(fuel_detections)
                 else:
                     fuel_detections = detect_fuel(frame, min_radius=3, max_radius=30,
                                                   tracked_positions=ball_tracker.get_predicted_positions())
-                
-                # Track balls and detect shots
-                tracked_balls = ball_tracker.update(fuel_detections)
+                    tracked_balls = ball_tracker.update(fuel_detections)
                 
                 # Draw with shot attribution
                 annotated_frame = draw_fuel_detections(annotated_frame, tracked_balls, blue_robots, red_robots)
@@ -5774,6 +6232,8 @@ def process_single_video(video_path: str, camera_side: str = "blue", target_fps:
     writer.stop()
     cap.release()
     out.release()
+    if sam3_ball_video_tracker is not None:
+        sam3_ball_video_tracker.close()
     
     # Finalize all remaining tracked balls to ensure all shots are counted
     # This is critical for counting misses that exit the frame
