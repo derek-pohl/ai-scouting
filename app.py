@@ -13,7 +13,6 @@ from bisect import bisect_left
 import cv2
 import numpy as np
 import gradio as gr
-import torch
 from PIL import Image, ImageDraw, ImageFont, ImageColor
 
 from dotenv import load_dotenv
@@ -45,24 +44,21 @@ except ImportError:
 except Exception as e:
     print(f"Error loading YOLO person model: {e}")
 
-# SAM 3 predictors for ball detection and native video tracking.
+# SAM 3 predictor for ball detection (text-prompted semantic segmentation)
 SAM3_PREDICTOR = None
-SAM3_VIDEO_PREDICTOR_CLS = None
-SAM3_OVERRIDES = None
 SAM3_MODEL_PATH = Path(__file__).parent / "sam3.pt"
 try:
-    from ultralytics.models.sam import SAM3SemanticPredictor, SAM3VideoSemanticPredictor
-    SAM3_OVERRIDES = dict(
+    from ultralytics.models.sam import SAM3SemanticPredictor
+    sam3_overrides = dict(
         conf=0.25,
         task="segment",
         mode="predict",
         model=str(SAM3_MODEL_PATH),
-        half=torch.cuda.is_available(),
+        half=True,  # Use FP16 for faster inference
         save=False,  # We handle drawing ourselves
     )
-    SAM3_PREDICTOR = SAM3SemanticPredictor(overrides=SAM3_OVERRIDES)
-    SAM3_VIDEO_PREDICTOR_CLS = SAM3VideoSemanticPredictor
-    print(f"SAM 3 predictors initialized successfully (model: {SAM3_MODEL_PATH})")
+    SAM3_PREDICTOR = SAM3SemanticPredictor(overrides=sam3_overrides)
+    print(f"SAM 3 predictor initialized successfully (model: {SAM3_MODEL_PATH})")
 except ImportError:
     print("SAM 3 not available (ultralytics version may not support it) - using HSV ball detection")
 except Exception as e:
@@ -1474,6 +1470,10 @@ class BallTracker:
         self.min_launch_rise_pixels = max(4, int(round(self.min_upward_pixels * 0.5)))
         self.min_launch_window_gain = max(8, int(round(self.min_upward_pixels * 1.5)))
         self.motion_history_size = 4
+        self.trajectory_gravity = 0.5
+        self.prediction_horizon_frames = max(18, int(round(self.fps * 2.0)))
+        self.prediction_substeps = 3
+        self.prediction_bounds_padding = 40.0
         
         # Track balls: {ball_id: {'pos': (x, y, r), 'prev_pos': (x, y, r), 'shot_by': robot_label, ...}}
         self.tracked_balls = {}
@@ -1819,6 +1819,161 @@ class BallTracker:
             )
 
         return instant_rise, window_gain, rising_steps
+
+    def _estimate_motion_vector(self, prev_pos, recent_positions: list, current_pos, velocity_hint: tuple = None) -> tuple:
+        """
+        Estimate current per-frame velocity from recent observations.
+
+        If a velocity hint is provided (used for lost balls), prefer it so the
+        prediction continues smoothly through occlusions.
+        """
+        if velocity_hint is not None:
+            vx, vy = velocity_hint
+            if abs(vx) > 0.01 or abs(vy) > 0.01:
+                return float(vx), float(vy)
+
+        positions = list(recent_positions or [])
+        if current_pos is not None:
+            positions.append(current_pos)
+        elif prev_pos is not None:
+            positions.append(prev_pos)
+
+        if len(positions) < 2 and prev_pos is not None and current_pos is not None:
+            positions = [prev_pos, current_pos]
+
+        deltas = []
+        for start, end in zip(positions, positions[1:]):
+            deltas.append((float(end[0] - start[0]), float(end[1] - start[1])))
+
+        if not deltas:
+            return 0.0, 0.0
+
+        weighted_vx = 0.0
+        weighted_vy = 0.0
+        total_weight = 0.0
+        for idx, (dx, dy) in enumerate(deltas, start=1):
+            weighted_vx += dx * idx
+            weighted_vy += dy * idx
+            total_weight += idx
+
+        if total_weight <= 0:
+            return 0.0, 0.0
+
+        return weighted_vx / total_weight, weighted_vy / total_weight
+
+    def _is_prediction_in_bounds(self, x: float, y: float) -> bool:
+        """Stop trajectory simulation once the ball is well outside the frame."""
+        pad = self.prediction_bounds_padding
+        if self.frame_width > 0 and (x < -pad or x > self.frame_width + pad):
+            return False
+        if self.frame_height > 0 and (y < -pad or y > self.frame_height + pad):
+            return False
+        return True
+
+    def _simulate_trajectory(self, start_x: float, start_y: float, vx: float, vy: float,
+                             max_steps: int = None) -> tuple:
+        """
+        Simulate a short future path using constant horizontal velocity and a
+        simple gravity term for vertical acceleration.
+
+        Returns:
+            Tuple of (path_points, enters_goal, goal_frame_index)
+        """
+        if max_steps is None:
+            max_steps = self.prediction_horizon_frames
+
+        x = float(start_x)
+        y = float(start_y)
+        draw_path = [(x, y)]
+        enters_goal = self._is_in_goal(x, y)
+        goal_frame_index = 0 if enters_goal else None
+
+        if enters_goal:
+            return draw_path, enters_goal, goal_frame_index
+
+        for step in range(1, max_steps + 1):
+            next_x = x + vx
+            next_y = y + vy
+
+            for substep in range(1, self.prediction_substeps + 1):
+                t = substep / float(self.prediction_substeps)
+                sample_x = x + ((next_x - x) * t)
+                sample_y = y + ((next_y - y) * t)
+                if self._is_in_goal(sample_x, sample_y):
+                    enters_goal = True
+                    goal_frame_index = step
+                    next_x, next_y = sample_x, sample_y
+                    break
+
+            draw_path.append((next_x, next_y))
+            x, y = next_x, next_y
+            if enters_goal:
+                break
+
+            vy += self.trajectory_gravity
+            if not self._is_prediction_in_bounds(x, y):
+                break
+
+        return draw_path, enters_goal, goal_frame_index
+
+    def _build_shot_prediction(self, current_pos, prev_pos=None, recent_positions: list = None,
+                               velocity_hint: tuple = None, previous_prediction: dict = None) -> dict:
+        """
+        Build a predicted future path for a shot ball and determine whether it
+        intersects a goal polygon.
+        """
+        if current_pos is None:
+            return None
+
+        vx, vy = self._estimate_motion_vector(prev_pos, recent_positions, current_pos, velocity_hint=velocity_hint)
+        if abs(vx) < 0.01 and abs(vy) < 0.01:
+            return None
+
+        path, will_score, goal_frame_index = self._simulate_trajectory(
+            current_pos[0],
+            current_pos[1],
+            vx,
+            vy,
+        )
+
+        stable_frames = 1
+        if previous_prediction and previous_prediction.get('will_score') == will_score:
+            stable_frames = int(previous_prediction.get('stable_frames', 1)) + 1
+
+        return {
+            'path': [(int(round(px)), int(round(py))) for px, py in path],
+            'will_score': will_score,
+            'goal_frame_index': goal_frame_index,
+            'velocity': (vx, vy),
+            'stable_frames': stable_frames,
+            'updated_at_frame': self.current_frame,
+        }
+
+    @staticmethod
+    def _prediction_will_score(prediction: dict) -> bool:
+        """Return True when the latest shot prediction intersects the goal."""
+        return bool(prediction and prediction.get('will_score'))
+
+    def _resolve_shot_result(self, robot_label: str, x: float, y: float,
+                             was_ever_in_goal: bool = False, prediction: dict = None,
+                             context: str = "") -> bool:
+        """
+        Finalize a shot using observed goal entry if available, otherwise the
+        latest trajectory prediction.
+        """
+        observed_make = bool(was_ever_in_goal or self._is_in_goal(x, y))
+        predicted_make = self._prediction_will_score(prediction)
+        made = observed_make or predicted_make
+        self._record_shot(robot_label, made=made)
+
+        period = get_match_period(self._get_elapsed_seconds())
+        reason = "observed goal entry" if observed_make else (
+            "predicted path intersects goal" if predicted_make else "predicted path misses goal"
+        )
+        outcome = "SHOT MADE" if made else "SHOT MISSED"
+        suffix = f" ({context})" if context else ""
+        print(f"[{outcome}] Robot {robot_label} @ {period}{suffix}: {reason}")
+        return made
     
     def get_predicted_positions(self) -> list:
         """
@@ -1843,11 +1998,7 @@ class BallTracker:
         
         # Lost balls — use their extrapolated prediction
         for lost_data in self.lost_balls.values():
-            pred_pos = lost_data.get('predicted_pos')
-            if pred_pos is None:
-                px, py, _ = lost_data['data']['pos']
-            else:
-                px, py = pred_pos
+            px, py = lost_data['predicted_pos']
             _, _, cr = lost_data['data']['pos']
             positions.append((px, py, cr))
         
@@ -1992,7 +2143,7 @@ class BallTracker:
             fuel_detections: List of (x, y, radius) tuples
             
         Returns:
-            List of (x, y, radius, robot_label_or_None) tuples
+            List of visualization dicts for tracked and predicted balls.
         """
         self.current_frame += 1
         
@@ -2051,6 +2202,19 @@ class BallTracker:
                 pred_y += vy
                 lost_data['velocity'] = (vx, vy)
                 lost_data['predicted_pos'] = (pred_x, pred_y)
+
+            shot_by = ball_data.get('shot_by')
+            shot_evaluated = ball_data.get('shot_evaluated', False)
+            candidate_shot = ball_data.get('candidate_shot')
+            if shot_by and not shot_evaluated:
+                predicted_ball = (pred_x, pred_y, ball_data['pos'][2])
+                ball_data['candidate_shot'] = self._build_shot_prediction(
+                    predicted_ball,
+                    prev_pos=curr_pos,
+                    recent_positions=ball_data.get('recent_positions'),
+                    velocity_hint=lost_data.get('velocity'),
+                    previous_prediction=candidate_shot,
+                )
             
             # Check if ball has been lost too long
             if lost_data['frames_lost'] <= self.max_frames_lost:
@@ -2060,17 +2224,16 @@ class BallTracker:
                 shot_by = lost_data['data'].get('shot_by')
                 shot_evaluated = lost_data['data'].get('shot_evaluated', False)
                 
-                # Only count MADE shots (ball disappeared into goal)
                 if shot_by and not shot_evaluated:
                     x, y, _ = lost_data['data']['pos']
-                    in_goal = lost_data['data'].get('last_seen_in_goal', False) or self._is_in_goal(x, y)
-                    
-                    if in_goal:
-                        self._record_shot(shot_by, made=True)
-                        period = get_match_period(self._get_elapsed_seconds())
-                        print(f"[SHOT MADE] Robot {shot_by} @ {period}: pos=({x:.0f},{y:.0f})")
-                    else:
-                        print(f"[SHOT NOT SCORED] Robot {shot_by}: pos=({x:.0f},{y:.0f}) - not in goal")
+                    self._resolve_shot_result(
+                        shot_by,
+                        x,
+                        y,
+                        was_ever_in_goal=lost_data['data'].get('last_seen_in_goal', False),
+                        prediction=lost_data['data'].get('candidate_shot'),
+                        context="lost timeout",
+                    )
         
         # Merge new and updated lost balls
         # Save reference to original for recovery lookup
@@ -2123,8 +2286,15 @@ class BallTracker:
                     'last_seen_in_goal': False,
                     'recent_positions': [(x, y, r)]
                 }
-                robot_label = None
-                results.append((x, y, r, robot_label))
+                results.append({
+                    'x': x,
+                    'y': y,
+                    'radius': r,
+                    'robot_label': None,
+                    'predicted_path': [],
+                    'predicted_make': None,
+                    'predicted_only': False,
+                })
                 continue
             else:
                 # Existing active ball
@@ -2172,6 +2342,15 @@ class BallTracker:
                         f"pos=({x:.0f},{y:.0f}), rise={instant_rise:.0f}px, "
                         f"window_gain={window_gain:.0f}px, steps={rising_steps}"
                     )
+
+            updated_recent_positions = recent_positions + [(x, y, r)]
+            if shot_by:
+                candidate_shot = self._build_shot_prediction(
+                    (x, y, r),
+                    prev_pos=prev_pos,
+                    recent_positions=recent_positions,
+                    previous_prediction=candidate_shot,
+                )
             
             # Check if 2 seconds have passed since shot - time to evaluate!
             # Only count MADE shots (ball in goal)
@@ -2180,15 +2359,14 @@ class BallTracker:
                 seconds_since_shot = frames_since_shot / self.fps
                 
                 if seconds_since_shot >= 2.0:
-                    is_in_goal_now = was_ever_in_goal or self._is_in_goal(x, y)
-                    
-                    if is_in_goal_now:
-                        self._record_shot(shot_by, made=True)
-                        period = get_match_period(self._get_elapsed_seconds())
-                        print(f"[SHOT MADE] Robot {shot_by} @ {period}: 2sec eval, in goal")
-                    else:
-                        print(f"[SHOT NOT SCORED] Robot {shot_by}: 2sec eval, not in goal")
-                    
+                    self._resolve_shot_result(
+                        shot_by,
+                        x,
+                        y,
+                        was_ever_in_goal=was_ever_in_goal,
+                        prediction=candidate_shot,
+                        context="2sec eval",
+                    )
                     shot_evaluated = True
             
             # Check if shot label should expire (keep the visual label for duration)
@@ -2212,7 +2390,6 @@ class BallTracker:
             updated_last_overlap_frame = self.current_frame if cur_overlap else last_overlap_frame
             # Update last_near_robot: prefer overlap, then nearest, then keep previous
             updated_near = cur_overlap or cur_nearest or last_near_robot
-            updated_recent_positions = recent_positions + [(x, y, r)]
             
             new_tracked[ball_id] = {
                 'pos': (x, y, r),
@@ -2231,204 +2408,42 @@ class BallTracker:
             
             # Add to results
             robot_label = new_tracked[ball_id].get('shot_by')
-            results.append((x, y, r, robot_label))
+            results.append({
+                'x': x,
+                'y': y,
+                'radius': r,
+                'robot_label': robot_label,
+                'predicted_path': list((candidate_shot or {}).get('path') or []),
+                'predicted_make': (
+                    (candidate_shot or {}).get('will_score')
+                    if candidate_shot is not None else None
+                ),
+                'predicted_only': False,
+            })
+
+        for lost_data in self.lost_balls.values():
+            ball_data = lost_data.get('data', {})
+            prediction = ball_data.get('candidate_shot')
+            robot_label = ball_data.get('shot_by')
+            if not robot_label and not prediction:
+                continue
+
+            pred_x, pred_y = lost_data.get('predicted_pos', (0, 0))
+            pos = ball_data.get('pos', (pred_x, pred_y, 0))
+            radius = pos[2] if len(pos) >= 3 else 0
+            results.append({
+                'x': int(round(pred_x)),
+                'y': int(round(pred_y)),
+                'radius': radius,
+                'robot_label': robot_label,
+                'predicted_path': list((prediction or {}).get('path') or []),
+                'predicted_make': (
+                    (prediction or {}).get('will_score')
+                    if prediction is not None else None
+                ),
+                'predicted_only': True,
+            })
         
-        self.tracked_balls = new_tracked
-        return results
-
-    def update_native_tracks(self, fuel_tracks: list) -> list:
-        """
-        Update ball shot attribution using native SAM 3 track IDs.
-
-        Args:
-            fuel_tracks: List of dicts with keys `ball_id`, `x`, `y`, and `radius`
-
-        Returns:
-            List of (x, y, radius, robot_label_or_None, ball_id) tuples
-        """
-        self.current_frame += 1
-
-        incoming_tracks = []
-        seen_ids = set()
-        for track in fuel_tracks or []:
-            if not isinstance(track, dict):
-                continue
-            try:
-                ball_id = int(track.get('ball_id'))
-                x = int(track.get('x'))
-                y = int(track.get('y'))
-                radius = int(track.get('radius'))
-            except (TypeError, ValueError):
-                continue
-            if ball_id in seen_ids:
-                continue
-            seen_ids.add(ball_id)
-            incoming_tracks.append((ball_id, x, y, radius))
-
-        active_ids = {ball_id for ball_id, _, _, _ in incoming_tracks}
-        original_lost_balls = self.lost_balls
-
-        new_lost_balls = {}
-        for ball_id, ball_data in self.tracked_balls.items():
-            if ball_id not in active_ids:
-                new_lost_balls[ball_id] = {
-                    'data': ball_data,
-                    'frames_lost': 1,
-                }
-
-        updated_lost_balls = {}
-        for ball_id, lost_data in self.lost_balls.items():
-            if ball_id in active_ids:
-                continue
-
-            lost_data['frames_lost'] = lost_data.get('frames_lost', 0) + 1
-            if lost_data['frames_lost'] <= self.max_frames_lost:
-                updated_lost_balls[ball_id] = lost_data
-                continue
-
-            shot_by = lost_data['data'].get('shot_by')
-            shot_evaluated = lost_data['data'].get('shot_evaluated', False)
-            if shot_by and not shot_evaluated:
-                x, y, _ = lost_data['data']['pos']
-                in_goal = lost_data['data'].get('last_seen_in_goal', False) or self._is_in_goal(x, y)
-                if in_goal:
-                    self._record_shot(shot_by, made=True)
-                    period = get_match_period(self._get_elapsed_seconds())
-                    print(f"[SHOT MADE] Robot {shot_by} @ {period}: native SAM 3 track expired in goal")
-                else:
-                    print(f"[SHOT NOT SCORED] Robot {shot_by}: native SAM 3 track expired outside goal")
-
-        self.lost_balls = {**updated_lost_balls, **new_lost_balls}
-
-        new_tracked = {}
-        results = []
-
-        for ball_id, x, y, r in incoming_tracks:
-            if ball_id in self.tracked_balls:
-                old_data = self.tracked_balls[ball_id]
-                prev_pos = old_data['pos']
-                shot_by = old_data.get('shot_by')
-                shot_time = old_data.get('shot_time')
-                shot_evaluated = old_data.get('shot_evaluated', False)
-                candidate_shot = old_data.get('candidate_shot')
-                overlapping_robot = old_data.get('overlapping_robot')
-                last_near_robot = old_data.get('last_near_robot')
-                last_overlap_robot = old_data.get('last_overlap_robot')
-                last_overlap_frame = old_data.get('last_overlap_frame')
-                was_ever_in_goal = old_data.get('last_seen_in_goal', False)
-                recent_positions = list(old_data.get('recent_positions') or ([prev_pos] if prev_pos else []))
-            elif ball_id in original_lost_balls:
-                old_data = original_lost_balls[ball_id]['data']
-                prev_pos = old_data['pos']
-                shot_by = old_data.get('shot_by')
-                shot_time = old_data.get('shot_time')
-                shot_evaluated = old_data.get('shot_evaluated', False)
-                candidate_shot = old_data.get('candidate_shot')
-                overlapping_robot = old_data.get('overlapping_robot')
-                last_near_robot = old_data.get('last_near_robot')
-                last_overlap_robot = old_data.get('last_overlap_robot')
-                last_overlap_frame = old_data.get('last_overlap_frame')
-                was_ever_in_goal = old_data.get('last_seen_in_goal', False)
-                recent_positions = list(old_data.get('recent_positions') or ([prev_pos] if prev_pos else []))
-            else:
-                cur_overlap = self._ball_overlaps_robot(x, y, r)
-                cur_nearest = self._find_nearest_alliance_robot(x, y)
-                new_tracked[ball_id] = {
-                    'pos': (x, y, r),
-                    'prev_pos': None,
-                    'shot_by': None,
-                    'shot_time': None,
-                    'shot_evaluated': False,
-                    'overlapping_robot': cur_overlap,
-                    'last_near_robot': cur_overlap or cur_nearest,
-                    'last_overlap_robot': cur_overlap,
-                    'last_overlap_frame': self.current_frame if cur_overlap else None,
-                    'candidate_shot': None,
-                    'last_seen_in_goal': False,
-                    'recent_positions': [(x, y, r)]
-                }
-                results.append((x, y, r, None, ball_id))
-                continue
-
-            recent_positions = recent_positions[-(self.motion_history_size - 1):]
-            cur_overlap = self._ball_overlaps_robot(x, y, r)
-            cur_nearest = self._find_nearest_alliance_robot(x, y)
-
-            instant_rise, window_gain, rising_steps = self._get_shot_launch_metrics(prev_pos, recent_positions, y)
-
-            if not shot_by:
-                nearby_robot = self._get_shot_origin_robot(
-                    x,
-                    cur_overlap or overlapping_robot,
-                    last_overlap_robot,
-                    last_overlap_frame,
-                    cur_nearest
-                )
-                launch_detected = (
-                    instant_rise >= self.min_launch_rise_pixels or
-                    window_gain >= self.min_launch_window_gain or
-                    rising_steps >= 2
-                )
-                if nearby_robot and launch_detected:
-                    shot_by = nearby_robot
-                    shot_time = self.current_frame
-                    shot_evaluated = False
-                    candidate_shot = None
-                    print(
-                        f"[SHOT DETECTED] Ball {ball_id} shot by {shot_by} at "
-                        f"pos=({x:.0f},{y:.0f}), rise={instant_rise:.0f}px, "
-                        f"window_gain={window_gain:.0f}px, steps={rising_steps}"
-                    )
-
-            if shot_time is not None and not shot_evaluated:
-                frames_since_shot = self.current_frame - shot_time
-                seconds_since_shot = frames_since_shot / self.fps
-
-                if seconds_since_shot >= 2.0:
-                    is_in_goal_now = was_ever_in_goal or self._is_in_goal(x, y)
-                    if is_in_goal_now:
-                        self._record_shot(shot_by, made=True)
-                        period = get_match_period(self._get_elapsed_seconds())
-                        print(f"[SHOT MADE] Robot {shot_by} @ {period}: native SAM 3 2sec eval, in goal")
-                    else:
-                        print(f"[SHOT NOT SCORED] Robot {shot_by}: native SAM 3 2sec eval, not in goal")
-                    shot_evaluated = True
-
-            if shot_time is not None:
-                frames_since_shot = self.current_frame - shot_time
-                seconds_since_shot = frames_since_shot / self.fps
-                if seconds_since_shot > self.shot_label_duration:
-                    shot_by = None
-                    shot_time = None
-
-            is_in_goal = self._is_in_goal(x, y)
-            ever_in_goal = was_ever_in_goal or is_in_goal
-
-            if shot_by and is_in_goal:
-                print(f"[IN GOAL] Ball {ball_id} (shot by {shot_by}) at pos=({x:.0f},{y:.0f})")
-
-            updated_last_overlap_robot = cur_overlap or last_overlap_robot
-            updated_last_overlap_frame = self.current_frame if cur_overlap else last_overlap_frame
-            updated_near = cur_overlap or cur_nearest or last_near_robot
-            updated_recent_positions = recent_positions + [(x, y, r)]
-
-            new_tracked[ball_id] = {
-                'pos': (x, y, r),
-                'prev_pos': prev_pos,
-                'shot_by': shot_by,
-                'shot_time': shot_time,
-                'shot_evaluated': shot_evaluated,
-                'overlapping_robot': cur_overlap,
-                'last_near_robot': updated_near,
-                'last_overlap_robot': updated_last_overlap_robot,
-                'last_overlap_frame': updated_last_overlap_frame,
-                'candidate_shot': candidate_shot,
-                'last_seen_in_goal': ever_in_goal,
-                'recent_positions': updated_recent_positions
-            }
-
-            results.append((x, y, r, new_tracked[ball_id].get('shot_by'), ball_id))
-
         self.tracked_balls = new_tracked
         return results
     
@@ -2453,13 +2468,14 @@ class BallTracker:
             
             if shot_by and not shot_evaluated:
                 x, y, _ = ball_data['pos']
-                in_goal = ball_data.get('last_seen_in_goal', False) or self._is_in_goal(x, y)
-                
-                if in_goal:
-                    self._record_shot(shot_by, made=True)
-                    print(f"[FINALIZE MADE] Robot {shot_by}: pos=({x:.0f},{y:.0f})")
-                else:
-                    print(f"[FINALIZE NOT SCORED] Robot {shot_by}: pos=({x:.0f},{y:.0f})")
+                self._resolve_shot_result(
+                    shot_by,
+                    x,
+                    y,
+                    was_ever_in_goal=ball_data.get('last_seen_in_goal', False),
+                    prediction=ball_data.get('candidate_shot'),
+                    context="finalize tracked",
+                )
         
         # Finalize all balls in the lost pool — only count MADE shots
         for ball_id, lost_data in self.lost_balls.items():
@@ -2468,13 +2484,14 @@ class BallTracker:
             
             if shot_by and not shot_evaluated:
                 x, y, _ = lost_data['data']['pos']
-                in_goal = lost_data['data'].get('last_seen_in_goal', False) or self._is_in_goal(x, y)
-                
-                if in_goal:
-                    self._record_shot(shot_by, made=True)
-                    print(f"[FINALIZE LOST MADE] Robot {shot_by}: pos=({x:.0f},{y:.0f})")
-                else:
-                    print(f"[FINALIZE LOST NOT SCORED] Robot {shot_by}: pos=({x:.0f},{y:.0f})")
+                self._resolve_shot_result(
+                    shot_by,
+                    x,
+                    y,
+                    was_ever_in_goal=lost_data['data'].get('last_seen_in_goal', False),
+                    prediction=lost_data['data'].get('candidate_shot'),
+                    context="finalize lost",
+                )
         
         print(f"[FINAL STATS] {self.robot_stats}")
 
@@ -3964,216 +3981,6 @@ _CENTER_CAM_ROIS = [
 ]
 
 
-def _get_center_camera_roi_rects(frame_width: int, frame_height: int) -> list:
-    """Scale the reference SAM 3 ROI windows to the current frame size."""
-    if frame_width <= 0 or frame_height <= 0:
-        return []
-
-    sx = frame_width / 1918.0
-    sy = frame_height / 709.0
-    roi_rects = []
-    for rx1, ry1, rx2, ry2 in _CENTER_CAM_ROIS:
-        x1 = int(max(0, min(frame_width, round(rx1 * sx))))
-        y1 = int(max(0, min(frame_height, round(ry1 * sy))))
-        x2 = int(max(0, min(frame_width, round(rx2 * sx))))
-        y2 = int(max(0, min(frame_height, round(ry2 * sy))))
-        if x2 > x1 and y2 > y1:
-            roi_rects.append((x1, y1, x2, y2))
-    return roi_rects
-
-
-def _point_is_inside_rectangles(x: int, y: int, rectangles: list) -> bool:
-    """Check whether a point lies inside any rectangle in `(x1, y1, x2, y2)` format."""
-    return any(x1 <= x <= x2 and y1 <= y <= y2 for x1, y1, x2, y2 in rectangles)
-
-
-def build_ball_tracking_video(
-    video_path: str,
-    start_frame: int,
-    end_frame: int,
-    frame_interval: int,
-    output_fps: float,
-) -> str:
-    """
-    Build the exact frame stream used for ball processing so native SAM 3 tracking
-    stays aligned one-to-one with the app's annotation loop.
-    """
-    cap = cv2.VideoCapture(video_path)
-    if not cap.isOpened():
-        raise RuntimeError("Could not open video for SAM 3 ball tracking.")
-
-    width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-    height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-    output_path = tempfile.NamedTemporaryFile(suffix="_sam3_ball_track.mp4", delete=False).name
-    fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-    writer = cv2.VideoWriter(output_path, fourcc, max(1.0, output_fps), (width, height))
-    if not writer.isOpened():
-        cap.release()
-        raise RuntimeError("Could not create SAM 3 ball tracking video.")
-
-    if start_frame > 0:
-        cap.set(cv2.CAP_PROP_POS_FRAMES, start_frame)
-
-    frame_idx = start_frame
-    try:
-        while frame_idx < end_frame:
-            ret, frame = cap.read()
-            if not ret:
-                break
-            if frame_idx % max(1, frame_interval) == 0:
-                writer.write(frame)
-            frame_idx += 1
-    finally:
-        cap.release()
-        writer.release()
-
-    return output_path
-
-
-class SAM3BallVideoTrackerSession:
-    """Run native SAM 3 video semantic tracking and emit persistent per-ball IDs."""
-
-    def __init__(
-        self,
-        video_path: str,
-        start_frame: int,
-        end_frame: int,
-        frame_interval: int,
-        ball_fps: float,
-        frame_width: int,
-        frame_height: int,
-        camera_side: str = "center",
-        min_radius: int = 3,
-        max_radius: int = 30,
-    ):
-        if SAM3_VIDEO_PREDICTOR_CLS is None or SAM3_OVERRIDES is None:
-            raise RuntimeError("SAM 3 native video tracking is unavailable.")
-
-        self.video_path = build_ball_tracking_video(
-            video_path=video_path,
-            start_frame=start_frame,
-            end_frame=end_frame,
-            frame_interval=frame_interval,
-            output_fps=ball_fps,
-        )
-        self.camera_side = camera_side
-        self.min_radius = min_radius
-        self.max_radius = max_radius
-        self.frame_width = frame_width
-        self.frame_height = frame_height
-        self.roi_rects = (
-            _get_center_camera_roi_rects(frame_width, frame_height)
-            if camera_side == "center"
-            else []
-        )
-        predictor_overrides = dict(SAM3_OVERRIDES)
-        predictor_overrides.update(
-            conf=0.20,
-            mode="predict",
-            save=False,
-            vid_stride=1,
-            stream_buffer=False,
-            verbose=False,
-        )
-        keep_alive_frames = max(12, int(round(ball_fps * 1.0)))
-        self.predictor = SAM3_VIDEO_PREDICTOR_CLS(
-            overrides=predictor_overrides,
-            score_threshold_detection=0.20,
-            assoc_iou_thresh=0.20,
-            trk_assoc_iou_thresh=0.20,
-            new_det_thresh=0.15,
-            init_trk_keep_alive=keep_alive_frames,
-            max_trk_keep_alive=max(keep_alive_frames, int(round(ball_fps * 2.0))),
-            o2o_matching_masklets_enable=True,
-            recondition_every_nth_frame=max(1, int(round(ball_fps / 3.0))),
-            suppress_overlapping_based_on_recent_occlusion_threshold=0.10,
-        )
-        self._results_iter = iter(self.predictor(source=self.video_path, stream=True, text=["yellow ball"]))
-
-    @staticmethod
-    def _as_numpy(value):
-        """Convert Ultralytics tensor-like outputs into numpy arrays."""
-        if value is None:
-            return None
-        if isinstance(value, np.ndarray):
-            return value
-        if torch.is_tensor(value):
-            return value.detach().cpu().numpy()
-        return np.asarray(value)
-
-    def _extract_radius_and_center(self, result, index: int, box_xyxy: np.ndarray) -> tuple:
-        """Prefer the propagated SAM mask for center/radius, then fall back to the box."""
-        x1, y1, x2, y2 = box_xyxy
-        fallback_cx = float((x1 + x2) / 2.0)
-        fallback_cy = float((y1 + y2) / 2.0)
-        fallback_radius = float(max(x2 - x1, y2 - y1) / 2.0)
-
-        if result.masks is None or result.masks.data is None or index >= len(result.masks.data):
-            return fallback_cx, fallback_cy, fallback_radius
-
-        mask = self._as_numpy(result.masks.data[index]).astype(np.uint8, copy=False)
-        if mask.ndim != 2 or not np.any(mask):
-            return fallback_cx, fallback_cy, fallback_radius
-
-        contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        if not contours:
-            return fallback_cx, fallback_cy, fallback_radius
-
-        contour = max(contours, key=cv2.contourArea)
-        (cx, cy), radius = cv2.minEnclosingCircle(contour)
-        return float(cx), float(cy), float(radius)
-
-    def _filter_tracks(self, result) -> list:
-        """Convert SAM 3 results into the app's tracked-ball format."""
-        if result is None or result.boxes is None or len(result.boxes) == 0:
-            return []
-
-        boxes = result.boxes
-        if not boxes.is_track or boxes.id is None:
-            return []
-
-        xyxy = self._as_numpy(boxes.xyxy)
-        track_ids = self._as_numpy(boxes.id)
-        scores = self._as_numpy(boxes.conf) if boxes.conf is not None else np.ones(len(track_ids))
-
-        tracks = []
-        for idx, track_id in enumerate(track_ids):
-            cx, cy, radius = self._extract_radius_and_center(result, idx, xyxy[idx])
-            cx_i = int(round(cx))
-            cy_i = int(round(cy))
-            radius_i = int(round(radius))
-
-            if self.camera_side == "center" and self.roi_rects and not _point_is_inside_rectangles(cx_i, cy_i, self.roi_rects):
-                continue
-            if not (self.min_radius <= radius_i <= self.max_radius):
-                continue
-
-            tracks.append({
-                "ball_id": int(track_id),
-                "x": cx_i,
-                "y": cy_i,
-                "radius": radius_i,
-                "score": float(scores[idx]),
-            })
-        return tracks
-
-    def get_next_tracks(self) -> list:
-        """Advance SAM 3 by one processed ball frame and return tracked detections."""
-        try:
-            result = next(self._results_iter)
-        except StopIteration:
-            return []
-        return self._filter_tracks(result)
-
-    def close(self):
-        """Release temporary resources used for the native SAM 3 tracking session."""
-        try:
-            if self.video_path and os.path.exists(self.video_path):
-                os.unlink(self.video_path)
-        except OSError:
-            pass
-
-
 def detect_fuel_sam3(frame_bgr: np.ndarray, predictor,
                      min_radius: int = 3, max_radius: int = 30,
                      camera_side: str = "blue") -> list:
@@ -4225,14 +4032,13 @@ def detect_fuel_sam3(frame_bgr: np.ndarray, predictor,
         return _run_sam3_on_region(frame_bgr, predictor, min_radius, max_radius)
 
 
-def draw_fuel_detections(frame: Image.Image, fuel_detections: list, blue_robots: list = None, red_robots: list = None) -> Image.Image:
+def _draw_fuel_detections_legacy(frame: Image.Image, fuel_detections: list, blue_robots: list = None, red_robots: list = None) -> Image.Image:
     """
-    Draw fuel circles with optional robot-credit labels and native SAM track IDs.
+    Draw bounding boxes around detected fuel, including robot labels for shot balls.
     
     Args:
         frame: PIL Image
-        fuel_detections: List of `(x, y, radius)`, `(x, y, radius, robot_label)`,
-            or `(x, y, radius, robot_label, ball_id)` tuples
+        fuel_detections: List of (x, y, radius) or (x, y, radius, robot_label) tuples
         blue_robots: List of blue alliance team numbers for color coding
         red_robots: List of red alliance team numbers for color coding
         
@@ -4252,16 +4058,12 @@ def draw_fuel_detections(frame: Image.Image, fuel_detections: list, blue_robots:
     red_robots = red_robots or []
     
     for detection in fuel_detections:
-        # Handle 3-tuple, 4-tuple, and 5-tuple formats.
-        if len(detection) == 5:
-            x, y, radius, robot_label, ball_id = detection
-        elif len(detection) == 4:
+        # Handle both 3-tuple and 4-tuple formats
+        if len(detection) == 4:
             x, y, radius, robot_label = detection
-            ball_id = None
         else:
             x, y, radius = detection
             robot_label = None
-            ball_id = None
         
         # Choose color based on whether ball was shot
         if robot_label:
@@ -4280,18 +4082,129 @@ def draw_fuel_detections(frame: Image.Image, fuel_detections: list, blue_robots:
             width=outline_width
         )
         
-        id_text = f"ID {ball_id}" if ball_id is not None else None
-        if robot_label and id_text:
-            label_text = f"{id_text} | {robot_label}"
-            draw.text((x - 28, y - radius - 18), label_text, fill=circle_color, font=label_font)
-        elif robot_label:
-            draw.text((x - 20, y - radius - 18), str(robot_label), fill=circle_color, font=label_font)
-        elif id_text:
-            draw.text((x - 18, y - radius - 16), id_text, fill=circle_color, font=font)
+        # Draw label
+        if robot_label:
+            # Draw robot number above ball
+            label_text = f"🎯 {robot_label}"
+            draw.text((x - 20, y - radius - 18), label_text, fill=circle_color, font=label_font)
         else:
-            draw.text((x - 8, y - radius - 15), "ball", fill=circle_color, font=font)
+            # Draw simple fuel indicator
+            label = "⚽"
+            draw.text((x - 8, y - radius - 15), label, fill=circle_color, font=font)
     
     return frame
+
+
+def draw_fuel_detections(frame: Image.Image, fuel_detections: list, blue_robots: list = None, red_robots: list = None) -> Image.Image:
+    """
+    Draw fuel detections plus optional predicted trajectories.
+
+    Args:
+        frame: PIL Image
+        fuel_detections: List of tuples or dict payloads from BallTracker.update()
+        blue_robots: List of blue alliance team numbers for color coding
+        red_robots: List of red alliance team numbers for color coding
+
+    Returns:
+        PIL Image with fuel detections drawn
+    """
+    frame = frame.copy().convert("RGBA")
+    overlay = Image.new("RGBA", frame.size, (0, 0, 0, 0))
+    draw = ImageDraw.Draw(overlay)
+
+    font = get_font(12)
+    label_font = get_font(14)
+
+    blue_robots = blue_robots or []
+    red_robots = red_robots or []
+
+    def _normalize_detection(detection):
+        if isinstance(detection, dict):
+            return {
+                'x': detection.get('x', 0),
+                'y': detection.get('y', 0),
+                'radius': detection.get('radius', 0),
+                'robot_label': detection.get('robot_label'),
+                'predicted_path': list(detection.get('predicted_path') or []),
+                'predicted_make': detection.get('predicted_make'),
+                'predicted_only': bool(detection.get('predicted_only', False)),
+            }
+
+        if len(detection) == 4:
+            x, y, radius, robot_label = detection
+        else:
+            x, y, radius = detection
+            robot_label = None
+
+        return {
+            'x': x,
+            'y': y,
+            'radius': radius,
+            'robot_label': robot_label,
+            'predicted_path': [],
+            'predicted_make': None,
+            'predicted_only': False,
+        }
+
+    for detection in fuel_detections:
+        payload = _normalize_detection(detection)
+        x = int(round(payload['x']))
+        y = int(round(payload['y']))
+        radius = max(1, int(round(payload['radius'])))
+        robot_label = payload['robot_label']
+        predicted_path = [
+            (int(round(px)), int(round(py)))
+            for px, py in payload['predicted_path']
+        ]
+        predicted_make = payload['predicted_make']
+        predicted_only = payload['predicted_only']
+
+        if robot_label:
+            color_rgb = get_robot_color(robot_label, blue_robots, red_robots)
+            outline_width = 3
+        else:
+            color_rgb = (255, 215, 0)
+            outline_width = 2
+
+        circle_rgba = (*color_rgb, 220 if not predicted_only else 150)
+        if predicted_make is True:
+            path_rgba = (90, 255, 120, 210 if not predicted_only else 150)
+        elif predicted_make is False:
+            path_rgba = (255, 140, 60, 210 if not predicted_only else 150)
+        else:
+            path_rgba = (*color_rgb, 170 if not predicted_only else 110)
+
+        if len(predicted_path) >= 2:
+            draw.line(predicted_path, fill=path_rgba, width=3)
+            for idx, (px, py) in enumerate(predicted_path[1:], start=1):
+                if predicted_only and idx % 2 == 1:
+                    continue
+                dot_radius = 2 if idx < len(predicted_path) - 1 else 3
+                draw.ellipse(
+                    [(px - dot_radius, py - dot_radius), (px + dot_radius, py + dot_radius)],
+                    fill=path_rgba
+                )
+
+        draw.ellipse(
+            [(x - radius, y - radius), (x + radius, y + radius)],
+            outline=circle_rgba,
+            width=outline_width
+        )
+
+        if robot_label:
+            if predicted_make is True:
+                suffix = " IN"
+            elif predicted_make is False:
+                suffix = " OUT"
+            else:
+                suffix = ""
+            prefix = "PRED " if predicted_only else ""
+            label_text = f"{prefix}{robot_label}{suffix}"
+            draw.text((x - 24, y - radius - 18), label_text, fill=circle_rgba, font=label_font)
+        else:
+            draw.text((x - 10, y - radius - 15), "fuel", fill=circle_rgba, font=font)
+
+    return Image.alpha_composite(frame, overlay).convert("RGB")
 
 
 def extract_bbox_centers(bounding_boxes_json: str, frame_width: int, frame_height: int, filter_unknown: bool = True) -> dict:
@@ -5727,27 +5640,6 @@ def process_single_video(video_path: str, camera_side: str = "blue", target_fps:
         frame_width=width,
         frame_height=height
     )
-    sam3_ball_video_tracker = None
-    if enable_fuel_detection and SAM3_VIDEO_PREDICTOR_CLS is not None:
-        try:
-            if progress is not None:
-                progress(0, desc=f"Preparing native SAM 3 ball tracking for {camera_name}...")
-            sam3_ball_video_tracker = SAM3BallVideoTrackerSession(
-                video_path=video_path,
-                start_frame=start_frame,
-                end_frame=end_frame,
-                frame_interval=ball_frame_interval,
-                ball_fps=ball_fps,
-                frame_width=width,
-                frame_height=height,
-                camera_side=camera_side,
-                min_radius=3,
-                max_radius=30,
-            )
-            print(f"[SAM3 Native] Using native SAM 3 video tracking for {camera_name}")
-        except Exception as e:
-            sam3_ball_video_tracker = None
-            print(f"[SAM3 Native] Failed to initialize native tracking for {camera_name}: {e}")
     
     # Center Camera Auto-Calibrator (uses user-clicked points for homography)
     center_calibrator = None
@@ -6119,33 +6011,16 @@ def process_single_video(video_path: str, camera_side: str = "blue", target_fps:
             
             # Detect and draw fuel using color-based detection if enabled
             if enable_fuel_detection:
-                if sam3_ball_video_tracker is not None:
-                    try:
-                        tracked_balls = ball_tracker.update_native_tracks(
-                            sam3_ball_video_tracker.get_next_tracks()
-                        )
-                    except Exception as e:
-                        print(f"[SAM3 Native] Tracking error on {camera_name}: {e}")
-                        sam3_ball_video_tracker.close()
-                        sam3_ball_video_tracker = None
-                        if SAM3_PREDICTOR is not None:
-                            fuel_detections = detect_fuel_sam3(frame, SAM3_PREDICTOR,
-                                                               min_radius=3, max_radius=30,
-                                                               camera_side=camera_side)
-                        else:
-                            fuel_detections = detect_fuel(frame, min_radius=3, max_radius=30,
-                                                          tracked_positions=ball_tracker.get_predicted_positions())
-                        tracked_balls = ball_tracker.update(fuel_detections)
-                elif SAM3_PREDICTOR is not None:
+                if SAM3_PREDICTOR is not None:
                     fuel_detections = detect_fuel_sam3(frame, SAM3_PREDICTOR,
                                                        min_radius=3, max_radius=30,
                                                        camera_side=camera_side)
-                    # Fallback path if native video tracking is unavailable.
-                    tracked_balls = ball_tracker.update(fuel_detections)
                 else:
                     fuel_detections = detect_fuel(frame, min_radius=3, max_radius=30,
                                                   tracked_positions=ball_tracker.get_predicted_positions())
-                    tracked_balls = ball_tracker.update(fuel_detections)
+                
+                # Track balls and detect shots
+                tracked_balls = ball_tracker.update(fuel_detections)
                 
                 # Draw with shot attribution
                 annotated_frame = draw_fuel_detections(annotated_frame, tracked_balls, blue_robots, red_robots)
@@ -6232,8 +6107,6 @@ def process_single_video(video_path: str, camera_side: str = "blue", target_fps:
     writer.stop()
     cap.release()
     out.release()
-    if sam3_ball_video_tracker is not None:
-        sam3_ball_video_tracker.close()
     
     # Finalize all remaining tracked balls to ensure all shots are counted
     # This is critical for counting misses that exit the frame
