@@ -6950,7 +6950,12 @@ MANUAL_TRACKER_HEAD = r"""
 </style>
 <script>
 (() => {
-  const MANUAL_TRACK_REACTION_SECONDS = 0.5;
+  const MANUAL_TRACK_REACTION_SECONDS = 0.025;
+  const MANUAL_TRACK_AUTO_SAMPLE_SECONDS = 0.04;
+  const MANUAL_TRACK_PLAYING_POLL_MS = 40;
+  const MANUAL_TRACK_SAMPLE_REPLACE_SECONDS = 0.02;
+  const MANUAL_TRACK_DRAG_REPLACE_SECONDS = 0.005;
+  const MANUAL_TRACK_FORWARD_REWRITE_SECONDS = 0.2;
   const SLOT_ORDER = [
     { id: "blue_1", selector: "#blue-robot-1-input", color: "#1d4ed8", short: "B1" },
     { id: "blue_2", selector: "#blue-robot-2-input", color: "#2563eb", short: "B2" },
@@ -7023,6 +7028,44 @@ MANUAL_TRACKER_HEAD = r"""
       const numericTime = Number(rawTime) || 0;
       const leadSeconds = MANUAL_TRACK_REACTION_SECONDS * state.playbackRate;
       return Math.max(0, numericTime - leadSeconds);
+    }
+
+    function getInterpolatedSlotPosition(slotId, rawTime) {
+      const slotState = state.slots[slotId];
+      if (!slotState || slotState.skipped || !slotState.samples.length) return null;
+      const targetTime = getCompensatedTrackTime(rawTime);
+      const samples = slotState.samples;
+
+      if (targetTime <= samples[0].t) {
+        return { x: samples[0].x, y: samples[0].y };
+      }
+      if (targetTime >= samples[samples.length - 1].t) {
+        const last = samples[samples.length - 1];
+        return { x: last.x, y: last.y };
+      }
+
+      for (let i = 1; i < samples.length; i += 1) {
+        const prev = samples[i - 1];
+        const next = samples[i];
+        if (targetTime <= next.t) {
+          const span = Math.max(next.t - prev.t, 1e-6);
+          const alpha = (targetTime - prev.t) / span;
+          return {
+            x: prev.x + ((next.x - prev.x) * alpha),
+            y: prev.y + ((next.y - prev.y) * alpha),
+          };
+        }
+      }
+
+      return null;
+    }
+
+    function syncSlotCursorToTime(slotId, rawTime) {
+      const interp = getInterpolatedSlotPosition(slotId, rawTime);
+      if (!interp) return;
+      const slotState = state.slots[slotId];
+      slotState.x = interp.x;
+      slotState.y = interp.y;
     }
 
     function toPayload() {
@@ -7171,7 +7214,14 @@ MANUAL_TRACKER_HEAD = r"""
       updateStatus();
     }
 
-    function recordSlotSample(slotId, time, x, y) {
+    function recordSlotSample(
+      slotId,
+      time,
+      x,
+      y,
+      replaceWindow = MANUAL_TRACK_SAMPLE_REPLACE_SECONDS,
+      rewriteForwardWindow = MANUAL_TRACK_FORWARD_REWRITE_SECONDS
+    ) {
       const slotState = state.slots[slotId];
       if (!slotState || slotState.skipped) return;
       const adjustedTime = getCompensatedTrackTime(time);
@@ -7180,10 +7230,28 @@ MANUAL_TRACKER_HEAD = r"""
         x: Number(x.toFixed(1)),
         y: Number(y.toFixed(1)),
       };
-      const last = slotState.samples[slotState.samples.length - 1];
-      if (last && Math.abs(last.t - entry.t) <= 0.04) {
-        slotState.samples[slotState.samples.length - 1] = entry;
-      } else {
+      if (rewriteForwardWindow > 0) {
+        slotState.samples = slotState.samples.filter((sample) => {
+          if (sample.t <= entry.t) return true;
+          if (sample.t > (entry.t + rewriteForwardWindow)) return true;
+          return Math.abs(sample.t - entry.t) <= replaceWindow;
+        });
+      }
+      let inserted = false;
+      for (let i = 0; i < slotState.samples.length; i += 1) {
+        const sample = slotState.samples[i];
+        if (Math.abs(sample.t - entry.t) <= replaceWindow) {
+          slotState.samples[i] = entry;
+          inserted = true;
+          break;
+        }
+        if (sample.t > entry.t) {
+          slotState.samples.splice(i, 0, entry);
+          inserted = true;
+          break;
+        }
+      }
+      if (!inserted) {
         slotState.samples.push(entry);
       }
     }
@@ -7191,14 +7259,12 @@ MANUAL_TRACKER_HEAD = r"""
     function captureAllSlots(force = false) {
       if (!video.src) return;
       const time = Number((video.currentTime || 0).toFixed(3));
-      if (!force && Math.abs(time - state.lastSnapshotTime) < 0.15) return;
+      if (!force && Math.abs(time - state.lastSnapshotTime) < MANUAL_TRACK_AUTO_SAMPLE_SECONDS) return;
       state.lastSnapshotTime = time;
-      SLOT_ORDER.forEach((slot) => {
-        const slotState = state.slots[slot.id];
-        if (!slotState.skipped && slotState.x !== null && slotState.y !== null) {
-          recordSlotSample(slot.id, time, slotState.x, slotState.y);
-        }
-      });
+      const slotState = state.slots[state.activeSlotId];
+      if (slotState && !slotState.skipped && slotState.x !== null && slotState.y !== null) {
+        recordSlotSample(state.activeSlotId, time, slotState.x, slotState.y);
+      }
       syncHiddenField();
       refreshSlotCards();
       drawOverlay();
@@ -7255,6 +7321,7 @@ MANUAL_TRACKER_HEAD = r"""
       const pick = event.target.closest("[data-pick]");
       if (pick) {
         state.activeSlotId = pick.getAttribute("data-pick");
+        syncSlotCursorToTime(state.activeSlotId, video.currentTime || 0);
         refreshSlotCards();
         drawOverlay();
         return;
@@ -7303,16 +7370,21 @@ MANUAL_TRACKER_HEAD = r"""
       video.pause();
       state.lastSnapshotTime = -1;
       video.currentTime = 0;
-      captureAllSlots(true);
+      syncSlotCursorToTime(state.activeSlotId, 0);
+      drawOverlay();
     });
     backBtn.addEventListener("click", () => {
+      state.lastSnapshotTime = -1;
       video.currentTime = Math.max(0, (video.currentTime || 0) - 5);
-      captureAllSlots(true);
+      syncSlotCursorToTime(state.activeSlotId, video.currentTime || 0);
+      drawOverlay();
     });
     forwardBtn.addEventListener("click", () => {
       const duration = Number.isFinite(video.duration) ? video.duration : 0;
+      state.lastSnapshotTime = -1;
       video.currentTime = Math.min(duration, (video.currentTime || 0) + 5);
-      captureAllSlots(true);
+      syncSlotCursorToTime(state.activeSlotId, video.currentTime || 0);
+      drawOverlay();
     });
     slowerBtn.addEventListener("click", () => {
       setPlaybackRate(state.playbackRate - 0.25);
@@ -7325,16 +7397,15 @@ MANUAL_TRACKER_HEAD = r"""
       resizeCanvas();
       const rect = canvas.getBoundingClientRect();
       let hitSlotId = null;
-      SLOT_ORDER.forEach((slot) => {
-        const slotState = state.slots[slot.id];
-        if (hitSlotId || slotState.skipped || slotState.x === null || slotState.y === null) return;
-        const point = sourceToCanvas(slotState.x, slotState.y);
+      const activeSlotState = state.slots[state.activeSlotId];
+      if (activeSlotState && !activeSlotState.skipped && activeSlotState.x !== null && activeSlotState.y !== null) {
+        const point = sourceToCanvas(activeSlotState.x, activeSlotState.y);
         const dx = (event.clientX - rect.left) - point.x;
         const dy = (event.clientY - rect.top) - point.y;
         if ((dx * dx) + (dy * dy) <= (16 * 16)) {
-          hitSlotId = slot.id;
+          hitSlotId = state.activeSlotId;
         }
-      });
+      }
 
       if (hitSlotId) {
         state.activeSlotId = hitSlotId;
@@ -7346,7 +7417,7 @@ MANUAL_TRACKER_HEAD = r"""
         slotState.skipped = false;
         slotState.x = point.x;
         slotState.y = point.y;
-        recordSlotSample(state.activeSlotId, video.currentTime || 0, point.x, point.y);
+        recordSlotSample(state.activeSlotId, video.currentTime || 0, point.x, point.y, MANUAL_TRACK_DRAG_REPLACE_SECONDS);
         syncHiddenField(true);
       }
 
@@ -7360,7 +7431,7 @@ MANUAL_TRACKER_HEAD = r"""
       const slotState = state.slots[state.dragging];
       slotState.x = point.x;
       slotState.y = point.y;
-      recordSlotSample(state.dragging, video.currentTime || 0, point.x, point.y);
+      recordSlotSample(state.dragging, video.currentTime || 0, point.x, point.y, MANUAL_TRACK_DRAG_REPLACE_SECONDS);
       syncHiddenField();
       drawOverlay();
     });
@@ -7393,7 +7464,7 @@ MANUAL_TRACKER_HEAD = r"""
       if (!video.paused && !video.ended) {
         captureAllSlots(false);
       }
-    }, 200);
+    }, MANUAL_TRACK_PLAYING_POLL_MS);
 
     refreshSlotCards();
     updateStatus();
