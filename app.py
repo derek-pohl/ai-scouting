@@ -1820,6 +1820,55 @@ class BallTracker:
 
         return instant_rise, window_gain, rising_steps
 
+    def _dedupe_frame_detections(self, detections: list) -> list:
+        """
+        Collapse near-identical detections in the same frame into a single ball.
+
+        This is especially important for head-on views where one physical ball can
+        generate multiple nested circles/boxes with almost the same center.
+        """
+        if len(detections or []) <= 1:
+            return list(detections or [])
+
+        merged = []
+        original_count = len(detections)
+
+        for x, y, radius in sorted(detections, key=lambda item: item[2], reverse=True):
+            x = float(x)
+            y = float(y)
+            radius = float(radius)
+            matched_index = None
+
+            for idx, (mx, my, mr, votes) in enumerate(merged):
+                dist = ((x - mx) ** 2 + (y - my) ** 2) ** 0.5
+                same_center_limit = max(4.0, min(radius, mr) * 0.75)
+                nested_detection = dist + min(radius, mr) <= max(radius, mr) * 1.15
+                if dist <= same_center_limit or nested_detection:
+                    weight_old = max(1.0, mr * mr) * votes
+                    weight_new = max(1.0, radius * radius)
+                    total_weight = weight_old + weight_new
+                    merged[idx] = (
+                        ((mx * weight_old) + (x * weight_new)) / total_weight,
+                        ((my * weight_old) + (y * weight_new)) / total_weight,
+                        max(mr, radius),
+                        votes + 1,
+                    )
+                    matched_index = idx
+                    break
+
+            if matched_index is None:
+                merged.append((x, y, radius, 1))
+
+        deduped = [
+            (int(round(mx)), int(round(my)), int(round(mr)))
+            for mx, my, mr, _ in merged
+        ]
+
+        if len(deduped) < original_count:
+            print(f"[BALL DEDUPE] Collapsed {original_count} raw detections into {len(deduped)} unique balls")
+
+        return deduped
+
     def _estimate_motion_vector(self, prev_pos, recent_positions: list, current_pos, velocity_hint: tuple = None) -> tuple:
         """
         Estimate current per-frame velocity from recent observations.
@@ -2146,6 +2195,7 @@ class BallTracker:
             List of visualization dicts for tracked and predicted balls.
         """
         self.current_frame += 1
+        fuel_detections = self._dedupe_frame_detections(fuel_detections)
         
         # Match new detections to existing balls (and lost balls)
         matches, recovered_lost = self._match_balls(fuel_detections)
