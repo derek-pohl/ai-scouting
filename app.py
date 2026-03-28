@@ -1227,11 +1227,58 @@ def _allocate_proportional_integers(raw_values: dict, target_total: int) -> dict
     return allocation
 
 
+def _get_marked_shooters_for_ocr_event(shooting_snapshots: list, alliance: str, event_time: float,
+                                       max_gap_seconds: float = CENTER_SCORE_OCR_EVENT_WINDOW_SECONDS) -> list:
+    """Return the nearest set of manually marked shooters for an OCR score event."""
+    if not shooting_snapshots:
+        return []
+
+    try:
+        target_time = float(event_time)
+    except (TypeError, ValueError):
+        return []
+
+    snapshot_times = [float(snapshot[0]) for snapshot in shooting_snapshots]
+    if not snapshot_times:
+        return []
+
+    insert_idx = bisect_right(snapshot_times, target_time)
+    candidate_indices = []
+    if insert_idx > 0:
+        candidate_indices.append(insert_idx - 1)
+    if insert_idx < len(shooting_snapshots):
+        candidate_indices.append(insert_idx)
+    if not candidate_indices:
+        return []
+
+    best_snapshot = None
+    best_gap = None
+    for idx in candidate_indices:
+        snapshot = shooting_snapshots[idx]
+        gap = abs(float(snapshot[0]) - target_time)
+        if gap > max_gap_seconds:
+            continue
+        if best_gap is None or gap < best_gap:
+            best_gap = gap
+            best_snapshot = snapshot
+
+    if best_snapshot is None:
+        return []
+
+    labels = best_snapshot[1] if str(alliance).strip().lower() == "blue" else best_snapshot[2]
+    return [str(label).strip() for label in (labels or []) if str(label).strip()]
+
+
 def _apply_ocr_score_correction(stats: dict, center_score_ocr: dict, blue_robots: list, red_robots: list,
-                                all_shot_events: list = None) -> dict:
+                                all_shot_events: list = None, shooting_snapshots: list = None) -> dict:
     """
     Reconcile SAM-attributed made shots with the authoritative alliance counters
     shown on the center-camera scoreboard. Misses are preserved from SAM.
+
+    When manual center tracking marks exactly one robot on an alliance as
+    shooting, OCR score deltas are awarded directly to that robot. If multiple
+    robots are marked shooting, SAM 3 shot attribution is still used to split
+    the OCR-confirmed makes between them.
     """
     if not stats or not isinstance(center_score_ocr, dict):
         return stats
@@ -1269,7 +1316,13 @@ def _apply_ocr_score_correction(stats: dict, center_score_ocr: dict, blue_robots
 
         sam_total = sum(corrected[label]["made"] for label in participating_labels)
         ocr_total = max(0, int(ocr_total))
-        if sam_total <= 0 or sam_total == ocr_total:
+        ocr_events = list(ocr_data.get("events") or [])
+        has_relevant_manual_hints = any(
+            _get_marked_shooters_for_ocr_event(shooting_snapshots, alliance, event_time)
+            for event_time, delta, _ in ocr_events
+            if max(0, int(delta or 0)) > 0
+        )
+        if not has_relevant_manual_hints and (sam_total <= 0 or sam_total == ocr_total):
             continue
 
         alliance_events = [
@@ -1279,21 +1332,71 @@ def _apply_ocr_score_correction(stats: dict, center_score_ocr: dict, blue_robots
         ]
         remaining_event_indices = set(range(len(alliance_events)))
         scaled_makes = {label: 0 for label in participating_labels}
+        scaled_period_makes = {
+            label: {period_name: 0 for period_name, _, _ in MATCH_PERIODS}
+            for label in participating_labels
+        }
 
-        for event_time, delta, _ in ocr_data.get("events") or []:
+        for event_time, delta, _ in ocr_events:
             delta = max(0, int(delta or 0))
             if delta <= 0:
                 continue
+            event_period = get_match_period(float(event_time))
+            marked_shooters = [
+                label for label in _get_marked_shooters_for_ocr_event(
+                    shooting_snapshots,
+                    alliance,
+                    event_time,
+                )
+                if label in participating_labels
+            ]
+            if len(marked_shooters) == 1:
+                single_label = marked_shooters[0]
+                scaled_makes[single_label] = scaled_makes.get(single_label, 0) + delta
+                if event_period in scaled_period_makes[single_label]:
+                    scaled_period_makes[single_label][event_period] += delta
+                single_label_indices = sorted(
+                    [
+                        idx for idx in remaining_event_indices
+                        if (
+                            alliance_events[idx][1] == single_label and
+                            abs(float(alliance_events[idx][0]) - float(event_time)) <= CENTER_SCORE_OCR_EVENT_WINDOW_SECONDS
+                        )
+                    ],
+                    key=lambda idx: abs(float(alliance_events[idx][0]) - float(event_time))
+                )
+                for idx in single_label_indices[:delta]:
+                    remaining_event_indices.discard(idx)
+                continue
+
+            allowed_labels = set(marked_shooters) if len(marked_shooters) >= 2 else None
             candidate_indices = [
                 idx for idx in remaining_event_indices
-                if abs(float(alliance_events[idx][0]) - float(event_time)) <= CENTER_SCORE_OCR_EVENT_WINDOW_SECONDS
+                if (
+                    abs(float(alliance_events[idx][0]) - float(event_time)) <= CENTER_SCORE_OCR_EVENT_WINDOW_SECONDS and
+                    (allowed_labels is None or alliance_events[idx][1] in allowed_labels)
+                )
             ]
             if not candidate_indices:
+                if allowed_labels:
+                    sam_weights = Counter({
+                        label: corrected[label]["made"]
+                        for label in allowed_labels
+                        if int(corrected.get(label, {}).get("made", 0) or 0) > 0
+                    })
+                    if sam_weights:
+                        event_scaled = _allocate_proportional_integers(sam_weights, delta)
+                        for label, amount in event_scaled.items():
+                            scaled_makes[label] = scaled_makes.get(label, 0) + int(amount)
+                            if event_period in scaled_period_makes.get(label, {}):
+                                scaled_period_makes[label][event_period] += int(amount)
                 continue
             candidate_weights = Counter(alliance_events[idx][1] for idx in candidate_indices)
             event_scaled = _allocate_proportional_integers(candidate_weights, delta)
             for label, amount in event_scaled.items():
                 scaled_makes[label] = scaled_makes.get(label, 0) + int(amount)
+                if event_period in scaled_period_makes.get(label, {}):
+                    scaled_period_makes[label][event_period] += int(amount)
             for label, amount in event_scaled.items():
                 label_candidates = sorted(
                     [idx for idx in candidate_indices if alliance_events[idx][1] == label],
@@ -1338,7 +1441,28 @@ def _apply_ocr_score_correction(stats: dict, center_score_ocr: dict, blue_robots
             }
 
             corrected_made = int(scaled_makes.get(label, 0))
-            corrected_period_made = _allocate_proportional_integers(original_period_made, corrected_made)
+            corrected_period_made = {
+                period_name: int(scaled_period_makes.get(label, {}).get(period_name, 0))
+                for period_name, _, _ in MATCH_PERIODS
+            }
+            remaining_period_made = max(0, corrected_made - sum(corrected_period_made.values()))
+            if remaining_period_made > 0:
+                period_weights = dict(original_period_made)
+                if sum(period_weights.values()) <= 0:
+                    period_weights = {
+                        period_name: int(robot_data["by_period"].get(period_name, {}).get("attempts", 0))
+                        for period_name, _, _ in MATCH_PERIODS
+                    }
+                if sum(period_weights.values()) <= 0:
+                    period_weights = {period_name: 0 for period_name, _, _ in MATCH_PERIODS}
+                    fallback_period = next(
+                        (period_name for period_name, amount in corrected_period_made.items() if amount > 0),
+                        MATCH_PERIODS[0][0],
+                    )
+                    period_weights[fallback_period] = remaining_period_made
+                extra_period_made = _allocate_proportional_integers(period_weights, remaining_period_made)
+                for period_name, amount in extra_period_made.items():
+                    corrected_period_made[period_name] = corrected_period_made.get(period_name, 0) + int(amount)
             robot_data["made"] = corrected_made
             robot_data["attempts"] = corrected_made + original_missed
 
@@ -1842,7 +1966,7 @@ class BallTracker:
         self.current_frame = 0
         
         # Store robot bounding boxes from nearest Gemini/manual detection.
-        # Format: [(y1, x1, y2, x2, label, is_shooting), ...]
+        # Format: [(y1, x1, y2, x2, label, is_shooting, has_explicit_shooting), ...]
         self.robot_bboxes = []
         
         # Shot statistics: {robot_label: {'attempts': 0, 'made': 0, 'by_period': {...}}}
@@ -1850,6 +1974,10 @@ class BallTracker:
         
         # Shot event log for cross-camera deduplication: [(elapsed_seconds, robot_label, made_bool), ...]
         self.shot_events = []
+
+        # Per-frame shooting state sampled at ball-tracking FPS.
+        # Format: [(elapsed_seconds, active_blue_labels, active_red_labels), ...]
+        self.shooting_snapshots = []
         
         # Set up goal polygons based on camera type, scaled to actual resolution
         if camera_side == "center":
@@ -1994,8 +2122,9 @@ class BallTracker:
                     x1 = float(box[1]) / 1000 * frame_width
                     y2 = float(box[2]) / 1000 * frame_height
                     x2 = float(box[3]) / 1000 * frame_width
+                    has_explicit_shooting = 'shooting' in bbox
                     is_shooting = bool(bbox.get('shooting', True))
-                    self.robot_bboxes.append((y1, x1, y2, x2, label, is_shooting))
+                    self.robot_bboxes.append((y1, x1, y2, x2, label, is_shooting, has_explicit_shooting))
         except Exception as e:
             print(f"Error parsing robot bboxes: {e}")
 
@@ -2008,13 +2137,51 @@ class BallTracker:
         matched = [bbox for bbox in self.robot_bboxes if len(bbox) >= 5 and str(bbox[4]).strip() == label]
         if not matched:
             return True
-        return any(bool(bbox[5]) if len(bbox) >= 6 else True for bbox in matched)
+        explicit_matches = [bbox for bbox in matched if len(bbox) >= 7 and bool(bbox[6])]
+        if not explicit_matches:
+            return True
+        return any(bool(bbox[5]) for bbox in explicit_matches)
 
     def any_robot_marked_shooting(self) -> bool:
         """Return True if the current frame has at least one robot allowed to shoot."""
         if not self.robot_bboxes:
             return True
-        return any(bool(bbox[5]) if len(bbox) >= 6 else True for bbox in self.robot_bboxes)
+        explicit_matches = [bbox for bbox in self.robot_bboxes if len(bbox) >= 7 and bool(bbox[6])]
+        if not explicit_matches:
+            return True
+        return any(bool(bbox[5]) for bbox in explicit_matches)
+
+    def _get_active_shooting_labels(self) -> dict:
+        """Return the currently marked shooters grouped by alliance."""
+        active = {"blue": [], "red": []}
+
+        for robot_bbox in self.robot_bboxes:
+            if len(robot_bbox) < 5:
+                continue
+            label = str(robot_bbox[4]).strip()
+            if not label:
+                continue
+            has_explicit_shooting = len(robot_bbox) >= 7 and bool(robot_bbox[6])
+            if not has_explicit_shooting or not bool(robot_bbox[5]):
+                continue
+            if label in self.blue_robots:
+                active["blue"].append(label)
+            elif label in self.red_robots:
+                active["red"].append(label)
+
+        return {
+            alliance: tuple(sorted(set(labels)))
+            for alliance, labels in active.items()
+        }
+
+    def _record_shooting_snapshot(self):
+        """Sample the current set of marked shooters for later OCR reconciliation."""
+        active = self._get_active_shooting_labels()
+        self.shooting_snapshots.append((
+            float(self._get_elapsed_seconds()),
+            active["blue"],
+            active["red"],
+        ))
     
     def _is_robot_in_camera_alliance(self, robot_label: str) -> bool:
         """
@@ -2668,6 +2835,7 @@ class BallTracker:
             List of visualization dicts for tracked and predicted balls.
         """
         self.current_frame += 1
+        self._record_shooting_snapshot()
         fuel_detections = self._dedupe_frame_detections(fuel_detections)
         
         # Match new detections to existing balls (and lost balls)
@@ -3022,6 +3190,8 @@ class BallTracker:
         self.tracked_balls = {}
         self.lost_balls = {}
         self.robot_stats = {}
+        self.shot_events = []
+        self.shooting_snapshots = []
         self.next_ball_id = 0
         self.current_frame = 0
         self.robot_bboxes = []
@@ -6168,7 +6338,9 @@ def process_single_video(video_path: str, camera_side: str = "blue", target_fps:
         highlight_ball_robot: Optional team number whose balls should remain highlighted in output.
         
     Returns:
-        Tuple of (output_video_path, robot_tracks, tracks_by_frame, width, height, robot_stats, ferry_counts, disabled_statuses, shot_events, side_visible_robots, center_score_ocr)
+        Tuple of (output_video_path, robot_tracks, tracks_by_frame, width, height, robot_stats,
+                  ferry_counts, disabled_statuses, shot_events, shooting_snapshots,
+                  side_visible_robots, center_score_ocr)
     """
     if not video_path:
         raise gr.Error("Please upload a video file.")
@@ -6786,7 +6958,20 @@ def process_single_video(video_path: str, camera_side: str = "blue", target_fps:
     disabled_statuses = disabled_tracker.get_all_disabled_statuses()
     
     center_score_ocr = center_score_ocr_tracker.summary() if center_score_ocr_tracker else None
-    return output_path, robot_tracks, tracks_by_frame, width, height, ball_tracker.robot_stats, ferry_counts, disabled_statuses, ball_tracker.shot_events, side_visible_robots_by_frame, center_score_ocr
+    return (
+        output_path,
+        robot_tracks,
+        tracks_by_frame,
+        width,
+        height,
+        ball_tracker.robot_stats,
+        ferry_counts,
+        disabled_statuses,
+        ball_tracker.shot_events,
+        ball_tracker.shooting_snapshots,
+        side_visible_robots_by_frame,
+        center_score_ocr,
+    )
 
 
 def merge_robot_tracks(blue_tracks: dict, red_tracks: dict, frame_width: int = 1068, frame_height: int = 836) -> dict:
@@ -7304,7 +7489,7 @@ def process_dual_videos(blue_video_path: str, red_video_path: str, center_video_
     if blue_video_path and enable_blue_camera:
         progress(0, desc="Starting Blue Camera processing...")
         try:
-            output_path, robot_tracks, tracks_by_frame, width, height, robot_stats, ferry_counts, disabled_statuses, shot_events, side_visible_robots, center_score_ocr = process_single_video(
+            output_path, robot_tracks, tracks_by_frame, width, height, robot_stats, ferry_counts, disabled_statuses, shot_events, shooting_snapshots, side_visible_robots, center_score_ocr = process_single_video(
                 blue_video_path,
                 "blue",
                 target_fps,
@@ -7331,6 +7516,7 @@ def process_dual_videos(blue_video_path: str, red_video_path: str, center_video_
                 'ferry_counts': ferry_counts,
                 'disabled_statuses': disabled_statuses,
                 'shot_events': shot_events,
+                'shooting_snapshots': shooting_snapshots,
                 'side_visible_robots': side_visible_robots,
                 'center_score_ocr': center_score_ocr,
             }
@@ -7343,7 +7529,7 @@ def process_dual_videos(blue_video_path: str, red_video_path: str, center_video_
     if red_video_path and enable_red_camera:
         progress(0.5, desc="Starting Red Camera processing...")
         try:
-            output_path, robot_tracks, tracks_by_frame, width, height, robot_stats, ferry_counts, disabled_statuses, shot_events, side_visible_robots, center_score_ocr = process_single_video(
+            output_path, robot_tracks, tracks_by_frame, width, height, robot_stats, ferry_counts, disabled_statuses, shot_events, shooting_snapshots, side_visible_robots, center_score_ocr = process_single_video(
                 red_video_path,
                 "red",
                 target_fps,
@@ -7370,6 +7556,7 @@ def process_dual_videos(blue_video_path: str, red_video_path: str, center_video_
                 'ferry_counts': ferry_counts,
                 'disabled_statuses': disabled_statuses,
                 'shot_events': shot_events,
+                'shooting_snapshots': shooting_snapshots,
                 'side_visible_robots': side_visible_robots,
                 'center_score_ocr': center_score_ocr,
             }
@@ -7383,7 +7570,7 @@ def process_dual_videos(blue_video_path: str, red_video_path: str, center_video_
     if center_video_path and enable_center_camera:
         progress(0.4, desc="Starting Center Camera processing...")
         try:
-            output_path, robot_tracks, tracks_by_frame, width, height, robot_stats, ferry_counts, disabled_statuses, shot_events, _, center_score_ocr = process_single_video(
+            output_path, robot_tracks, tracks_by_frame, width, height, robot_stats, ferry_counts, disabled_statuses, shot_events, shooting_snapshots, _, center_score_ocr = process_single_video(
                 center_video_path,
                 "center",
                 target_fps,
@@ -7415,6 +7602,7 @@ def process_dual_videos(blue_video_path: str, red_video_path: str, center_video_
                 'ferry_counts': ferry_counts,
                 'disabled_statuses': disabled_statuses,
                 'shot_events': shot_events,
+                'shooting_snapshots': shooting_snapshots,
                 'center_score_ocr': center_score_ocr,
             }
         except Exception as e:
@@ -7567,7 +7755,15 @@ def process_dual_videos(blue_video_path: str, red_video_path: str, center_video_
             print(f"[DEDUP] Robot {robot_label}: {original_count} events -> {deduped_count} after dedup ({original_count - deduped_count} duplicates removed)")
 
     center_score_ocr = results.get('center', {}).get('center_score_ocr')
-    merged_stats = _apply_ocr_score_correction(merged_stats, center_score_ocr, blue_robots, red_robots, all_shot_events=all_shot_events)
+    center_shooting_snapshots = results.get('center', {}).get('shooting_snapshots')
+    merged_stats = _apply_ocr_score_correction(
+        merged_stats,
+        center_score_ocr,
+        blue_robots,
+        red_robots,
+        all_shot_events=all_shot_events,
+        shooting_snapshots=center_shooting_snapshots,
+    )
     
     # Get ferry counts from all cameras (ferry cycles complete per camera)
     blue_ferry = results.get('blue', {}).get('ferry_counts', {})
@@ -7696,7 +7892,7 @@ def process_manual_center_video(center_video_path: str = None, composite_video_p
     manual_robot_tracks = _parse_manual_robot_tracks_json(manual_tracks_json, blue_robots, red_robots)
 
     progress(0.05, desc="Processing center camera with manual robot tracks...")
-    center_output, robot_tracks, tracks_by_frame, width, height, _, ferry_counts, disabled_statuses, shot_events, _, center_score_ocr = process_single_video(
+    center_output, robot_tracks, tracks_by_frame, width, height, _, ferry_counts, disabled_statuses, shot_events, shooting_snapshots, _, center_score_ocr = process_single_video(
         center_video_path,
         "center",
         target_fps,
@@ -7763,7 +7959,14 @@ def process_manual_center_video(center_video_path: str = None, composite_video_p
     progress(1.0, desc="Manual center-camera processing complete!")
 
     merged_stats = _build_stats_from_shot_events(shot_events)
-    merged_stats = _apply_ocr_score_correction(merged_stats, center_score_ocr, blue_robots, red_robots, all_shot_events=shot_events)
+    merged_stats = _apply_ocr_score_correction(
+        merged_stats,
+        center_score_ocr,
+        blue_robots,
+        red_robots,
+        all_shot_events=shot_events,
+        shooting_snapshots=shooting_snapshots,
+    )
     robot_stats_markdowns = []
     for label in all_robot_labels:
         if label and label.strip():
@@ -8115,32 +8318,27 @@ MANUAL_TRACKER_HEAD = r"""
       const cornerMarginX = Math.max(42, canvasRect.width * 0.08);
       const cornerMarginY = Math.max(42, canvasRect.height * 0.08);
       const suspiciousCornerJump = Math.max(90, Math.min(canvasRect.width, canvasRect.height) * 0.12);
-      const candidates = [];
+      const lastClientPoint = state.dragLastClientPoint;
+      const candidates = [event];
       if (event && typeof event.getCoalescedEvents === "function") {
         const coalesced = event.getCoalescedEvents();
         for (let i = coalesced.length - 1; i >= 0; i -= 1) {
           candidates.push(coalesced[i]);
         }
       }
-      candidates.push(event);
 
-      const lastClientPoint = state.dragLastClientPoint;
-      let bestCandidate = null;
-      let bestDistanceSq = Infinity;
-
-      for (let i = 0; i < candidates.length; i += 1) {
-        const sample = candidates[i];
-        if (!sample) continue;
+      function isUsableSample(sample) {
+        if (!sample) return false;
         const clientX = Number(sample.clientX);
         const clientY = Number(sample.clientY);
         const sampleButtons = Number(sample.buttons) || 0;
         const samplePressure = Number(sample.pressure);
-        if (!Number.isFinite(clientX) || !Number.isFinite(clientY)) continue;
+        if (!Number.isFinite(clientX) || !Number.isFinite(clientY)) return false;
         const withinExtendedBounds = clientX >= (canvasRect.left - maxOverflowX)
           && clientX <= (canvasRect.right + maxOverflowX)
           && clientY >= (canvasRect.top - maxOverflowY)
           && clientY <= (canvasRect.bottom + maxOverflowY);
-        if (!withinExtendedBounds) continue;
+        if (!withinExtendedBounds) return false;
         if (
           sample.pointerType === "pen"
           && lastClientPoint
@@ -8148,33 +8346,27 @@ MANUAL_TRACKER_HEAD = r"""
           && Number.isFinite(samplePressure)
           && samplePressure <= 0
         ) {
-          continue;
+          return false;
         }
-        let distanceSq = 0;
         if (lastClientPoint) {
           const dx = clientX - lastClientPoint.x;
           const dy = clientY - lastClientPoint.y;
-          distanceSq = (dx * dx) + (dy * dy);
+          const distanceSq = (dx * dx) + (dy * dy);
           const nearLeft = clientX <= (canvasRect.left + cornerMarginX);
           const nearRight = clientX >= (canvasRect.right - cornerMarginX);
           const nearTop = clientY <= (canvasRect.top + cornerMarginY);
           const nearBottom = clientY >= (canvasRect.bottom - cornerMarginY);
           const nearCorner = (nearLeft || nearRight) && (nearTop || nearBottom);
           if (nearCorner && distanceSq > (suspiciousCornerJump * suspiciousCornerJump)) {
-            continue;
+            return false;
           }
         }
-        if (!lastClientPoint) {
-          return { x: clientX, y: clientY };
-        }
-        if (distanceSq < bestDistanceSq) {
-          bestDistanceSq = distanceSq;
-          bestCandidate = { x: clientX, y: clientY };
-        }
+        return { x: clientX, y: clientY };
       }
 
-      if (bestCandidate) {
-        return bestCandidate;
+      for (let i = 0; i < candidates.length; i += 1) {
+        const usable = isUsableSample(candidates[i]);
+        if (usable) return usable;
       }
 
       return state.dragLastClientPoint
