@@ -6,10 +6,12 @@ Based on Google Gemini's Spatial Understanding capabilities.
 
 import os
 import json
+import re
 import shutil
 import subprocess
 import tempfile
-from bisect import bisect_left
+from bisect import bisect_left, bisect_right
+from collections import Counter
 import cv2
 import numpy as np
 import gradio as gr
@@ -46,7 +48,7 @@ except Exception as e:
 
 # SAM 3 predictor for ball detection (text-prompted semantic segmentation)
 SAM3_PREDICTOR = None
-SAM3_MODEL_PATH = Path(__file__).parent / "sam3.pt"
+SAM3_MODEL_PATH = Path(__file__).parent / "sam3.1_multiplex.pt"
 try:
     from ultralytics.models.sam import SAM3SemanticPredictor
     sam3_overrides = dict(
@@ -70,6 +72,15 @@ LMSTUDIO_ENABLED = True  # Set to False to disable LMStudio queries
 
 import requests
 import base64
+try:
+    import pytesseract
+    from pytesseract import TesseractNotFoundError
+    _tesseract_cmd = os.getenv("TESSERACT_CMD", "").strip()
+    if _tesseract_cmd:
+        pytesseract.pytesseract.tesseract_cmd = _tesseract_cmd
+except Exception:
+    pytesseract = None
+    TesseractNotFoundError = RuntimeError
 
 
 class RobotLabelTracker:
@@ -990,6 +1001,17 @@ RED_ALLIANCE_COLORS = [
 
 # Default color for unknown robots
 DEFAULT_COLOR = (0, 0, 0)  # Black
+BALL_HIGHLIGHT_ALL_OPTION = "All Robots"
+CENTER_SCORE_COUNTER_REF_SIZE = (1918, 709)
+CENTER_SCORE_COUNTER_RECTS = {
+    "blue": (81, 67, 228, 114),
+    "red": (1738, 70, 1885, 112),
+}
+CENTER_SCORE_OCR_SAMPLE_FPS = 5.0
+CENTER_SCORE_OCR_MIN_CONFIRMATIONS = 2
+CENTER_SCORE_OCR_EVENT_WINDOW_SECONDS = 2.0
+_CENTER_SCORE_OCR_DISABLED = pytesseract is None
+_CENTER_SCORE_OCR_DISABLED_REASON_PRINTED = pytesseract is None
 
 
 def get_robot_color(robot_label: str, blue_robots: list = None, red_robots: list = None) -> tuple:
@@ -1027,6 +1049,338 @@ def get_robot_color(robot_label: str, blue_robots: list = None, red_robots: list
 def _normalize_robot_numbers(robots: list) -> list:
     """Return cleaned team-number strings, preserving input order."""
     return [str(robot).strip() for robot in (robots or []) if str(robot).strip()]
+
+
+def _scale_ref_rect(rect: tuple, frame_width: int, frame_height: int, ref_size: tuple = CENTER_SCORE_COUNTER_REF_SIZE) -> tuple:
+    """Scale a rectangle from the reference center-camera resolution to the current frame."""
+    ref_w, ref_h = ref_size
+    if frame_width <= 0 or frame_height <= 0 or ref_w <= 0 or ref_h <= 0:
+        return rect
+    x1, y1, x2, y2 = rect
+    sx = frame_width / ref_w
+    sy = frame_height / ref_h
+    return (
+        int(round(x1 * sx)),
+        int(round(y1 * sy)),
+        int(round(x2 * sx)),
+        int(round(y2 * sy)),
+    )
+
+
+def _parse_center_score_counter_text(text: str):
+    """Parse a scoreboard snippet like '12 / 40' and return the left-hand number."""
+    cleaned = re.sub(r"[^0-9/]", "", str(text or ""))
+    if not cleaned:
+        return None
+    if "/" in cleaned:
+        cleaned = cleaned.split("/", 1)[0]
+    match = re.search(r"\d+", cleaned)
+    if not match:
+        return None
+    try:
+        return int(match.group(0))
+    except ValueError:
+        return None
+
+
+def _ocr_center_score_counter(frame_bgr: np.ndarray, alliance: str):
+    """Run lightweight OCR on the center-camera alliance score counter."""
+    global _CENTER_SCORE_OCR_DISABLED, _CENTER_SCORE_OCR_DISABLED_REASON_PRINTED
+
+    if _CENTER_SCORE_OCR_DISABLED or pytesseract is None or frame_bgr is None:
+        return None
+
+    rect = CENTER_SCORE_COUNTER_RECTS.get(str(alliance).strip().lower())
+    if rect is None:
+        return None
+
+    frame_height, frame_width = frame_bgr.shape[:2]
+    x1, y1, x2, y2 = _scale_ref_rect(rect, frame_width, frame_height)
+    x1 = max(0, min(frame_width - 1, x1))
+    x2 = max(x1 + 1, min(frame_width, x2))
+    y1 = max(0, min(frame_height - 1, y1))
+    y2 = max(y1 + 1, min(frame_height, y2))
+    roi = frame_bgr[y1:y2, x1:x2]
+    if roi.size == 0:
+        return None
+
+    gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
+    gray = cv2.resize(gray, None, fx=4.0, fy=4.0, interpolation=cv2.INTER_CUBIC)
+    gray = cv2.GaussianBlur(gray, (3, 3), 0)
+    _, thresh = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    _, thresh_inv = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
+    variants = [gray, thresh, thresh_inv]
+    parsed_counts = []
+
+    for variant in variants:
+        try:
+            text = pytesseract.image_to_string(
+                Image.fromarray(variant),
+                config="--psm 7 -c tessedit_char_whitelist=0123456789/"
+            )
+        except TesseractNotFoundError as e:
+            _CENTER_SCORE_OCR_DISABLED = True
+            if not _CENTER_SCORE_OCR_DISABLED_REASON_PRINTED:
+                print(f"Center score OCR disabled: {e}")
+                _CENTER_SCORE_OCR_DISABLED_REASON_PRINTED = True
+            return None
+        except Exception:
+            continue
+
+        parsed = _parse_center_score_counter_text(text)
+        if parsed is not None:
+            parsed_counts.append(parsed)
+
+    if not parsed_counts:
+        return None
+
+    return Counter(parsed_counts).most_common(1)[0][0]
+
+
+class CenterScoreOCRTracker:
+    """Track the scoreboard counters shown on the cropped center camera feed."""
+
+    def __init__(self, min_confirmations: int = CENTER_SCORE_OCR_MIN_CONFIRMATIONS):
+        self.min_confirmations = max(1, int(min_confirmations))
+        self.confirmed_counts = {"blue": None, "red": None}
+        self.start_counts = {"blue": None, "red": None}
+        self.pending_counts = {"blue": None, "red": None}
+        self.pending_hits = {"blue": 0, "red": 0}
+        self.events = {"blue": [], "red": []}
+        self.observation_counts = {"blue": 0, "red": 0}
+
+    def _accept_count(self, alliance: str, count: int, elapsed_seconds: float):
+        previous = self.confirmed_counts[alliance]
+        if previous is None:
+            self.start_counts[alliance] = count
+        elif count > previous:
+            self.events[alliance].append((float(elapsed_seconds), int(count - previous), int(count)))
+        self.confirmed_counts[alliance] = int(count)
+        self.pending_counts[alliance] = None
+        self.pending_hits[alliance] = 0
+
+    def update(self, frame_bgr: np.ndarray, elapsed_seconds: float):
+        for alliance in ("blue", "red"):
+            count = _ocr_center_score_counter(frame_bgr, alliance)
+            if count is None:
+                continue
+
+            self.observation_counts[alliance] += 1
+            confirmed = self.confirmed_counts[alliance]
+
+            if confirmed is not None and count < confirmed:
+                continue
+
+            if confirmed is not None and count == confirmed:
+                self.pending_counts[alliance] = None
+                self.pending_hits[alliance] = 0
+                continue
+
+            if self.pending_counts[alliance] == count:
+                self.pending_hits[alliance] += 1
+            else:
+                self.pending_counts[alliance] = count
+                self.pending_hits[alliance] = 1
+
+            if self.pending_hits[alliance] >= self.min_confirmations:
+                self._accept_count(alliance, count, elapsed_seconds)
+
+    def summary(self) -> dict:
+        summary = {}
+        for alliance in ("blue", "red"):
+            start = self.start_counts[alliance]
+            end = self.confirmed_counts[alliance]
+            scored = None if start is None or end is None else max(0, int(end) - int(start))
+            summary[alliance] = {
+                "start": start,
+                "end": end,
+                "scored": scored,
+                "events": list(self.events[alliance]),
+                "observations": int(self.observation_counts[alliance]),
+            }
+        return summary
+
+
+def _allocate_proportional_integers(raw_values: dict, target_total: int) -> dict:
+    """Allocate an integer total proportionally using largest remainders."""
+    target_total = max(0, int(round(target_total or 0)))
+    keys = list(raw_values.keys())
+    if not keys:
+        return {}
+
+    sanitized = {key: max(0.0, float(raw_values.get(key, 0) or 0)) for key in keys}
+    current_total = sum(sanitized.values())
+    if current_total <= 0:
+        return {key: 0 for key in keys}
+
+    scaled = {key: (sanitized[key] * target_total) / current_total for key in keys}
+    allocation = {key: int(np.floor(value)) for key, value in scaled.items()}
+    remaining = target_total - sum(allocation.values())
+    if remaining > 0:
+        order = sorted(
+            keys,
+            key=lambda key: (scaled[key] - allocation[key], sanitized[key], str(key)),
+            reverse=True,
+        )
+        for key in order[:remaining]:
+            allocation[key] += 1
+    return allocation
+
+
+def _apply_ocr_score_correction(stats: dict, center_score_ocr: dict, blue_robots: list, red_robots: list,
+                                all_shot_events: list = None) -> dict:
+    """
+    Reconcile SAM-attributed made shots with the authoritative alliance counters
+    shown on the center-camera scoreboard. Misses are preserved from SAM.
+    """
+    if not stats or not isinstance(center_score_ocr, dict):
+        return stats
+
+    corrected = {}
+    for robot_label, robot_data in (stats or {}).items():
+        by_period = {}
+        original_periods = robot_data.get("by_period") or {}
+        for period_name, _, _ in MATCH_PERIODS:
+            period_data = original_periods.get(period_name, {}) if isinstance(original_periods, dict) else {}
+            by_period[period_name] = {
+                "attempts": int(period_data.get("attempts", 0) or 0),
+                "made": int(period_data.get("made", 0) or 0),
+            }
+        corrected[robot_label] = {
+            "attempts": int(robot_data.get("attempts", 0) or 0),
+            "made": int(robot_data.get("made", 0) or 0),
+            "by_period": by_period,
+        }
+
+    deduped_shot_events = _dedupe_shot_events(all_shot_events or [])
+
+    for alliance, robot_labels in (
+        ("blue", _normalize_robot_numbers(blue_robots)),
+        ("red", _normalize_robot_numbers(red_robots)),
+    ):
+        ocr_data = center_score_ocr.get(alliance, {}) if isinstance(center_score_ocr.get(alliance, {}), dict) else {}
+        ocr_total = ocr_data.get("scored")
+        if ocr_total is None:
+            continue
+
+        participating_labels = [label for label in robot_labels if label in corrected]
+        if not participating_labels:
+            continue
+
+        sam_total = sum(corrected[label]["made"] for label in participating_labels)
+        ocr_total = max(0, int(ocr_total))
+        if sam_total <= 0 or sam_total == ocr_total:
+            continue
+
+        alliance_events = [
+            (elapsed, robot_label)
+            for elapsed, robot_label, made in deduped_shot_events
+            if made and robot_label in participating_labels
+        ]
+        remaining_event_indices = set(range(len(alliance_events)))
+        scaled_makes = {label: 0 for label in participating_labels}
+
+        for event_time, delta, _ in ocr_data.get("events") or []:
+            delta = max(0, int(delta or 0))
+            if delta <= 0:
+                continue
+            candidate_indices = [
+                idx for idx in remaining_event_indices
+                if abs(float(alliance_events[idx][0]) - float(event_time)) <= CENTER_SCORE_OCR_EVENT_WINDOW_SECONDS
+            ]
+            if not candidate_indices:
+                continue
+            candidate_weights = Counter(alliance_events[idx][1] for idx in candidate_indices)
+            event_scaled = _allocate_proportional_integers(candidate_weights, delta)
+            for label, amount in event_scaled.items():
+                scaled_makes[label] = scaled_makes.get(label, 0) + int(amount)
+            for label, amount in event_scaled.items():
+                label_candidates = sorted(
+                    [idx for idx in candidate_indices if alliance_events[idx][1] == label],
+                    key=lambda idx: abs(float(alliance_events[idx][0]) - float(event_time))
+                )
+                for idx in label_candidates[:max(0, int(amount))]:
+                    remaining_event_indices.discard(idx)
+
+        allocated_total = sum(scaled_makes.values())
+        remaining_total = max(0, ocr_total - allocated_total)
+        if remaining_total > 0:
+            if remaining_event_indices:
+                fallback_weights = Counter(alliance_events[idx][1] for idx in remaining_event_indices)
+            else:
+                fallback_weights = Counter({label: corrected[label]["made"] for label in participating_labels})
+            fallback_scaled = _allocate_proportional_integers(fallback_weights, remaining_total)
+            for label, amount in fallback_scaled.items():
+                scaled_makes[label] = scaled_makes.get(label, 0) + int(amount)
+
+        print(
+            f"[Center Score OCR] {alliance.title()} alliance correction: "
+            f"SAM made={sam_total}, OCR made={ocr_total}, scaled={scaled_makes}"
+        )
+
+        for label in participating_labels:
+            robot_data = corrected[label]
+            original_made = int(robot_data["made"])
+            original_attempts = int(robot_data["attempts"])
+            original_missed = max(0, original_attempts - original_made)
+
+            original_period_made = {
+                period_name: int(robot_data["by_period"].get(period_name, {}).get("made", 0))
+                for period_name, _, _ in MATCH_PERIODS
+            }
+            original_period_missed = {
+                period_name: max(
+                    0,
+                    int(robot_data["by_period"].get(period_name, {}).get("attempts", 0))
+                    - int(robot_data["by_period"].get(period_name, {}).get("made", 0))
+                )
+                for period_name, _, _ in MATCH_PERIODS
+            }
+
+            corrected_made = int(scaled_makes.get(label, 0))
+            corrected_period_made = _allocate_proportional_integers(original_period_made, corrected_made)
+            robot_data["made"] = corrected_made
+            robot_data["attempts"] = corrected_made + original_missed
+
+            for period_name, _, _ in MATCH_PERIODS:
+                period_made = int(corrected_period_made.get(period_name, 0))
+                robot_data["by_period"][period_name] = {
+                    "attempts": period_made + original_period_missed[period_name],
+                    "made": period_made,
+                }
+
+    return corrected
+
+
+def _normalize_highlight_ball_robot(highlight_ball_robot: str = None) -> str:
+    """Return the selected robot label for ball highlighting, or empty for no filter."""
+    label = str(highlight_ball_robot or "").strip()
+    if not label or label == BALL_HIGHLIGHT_ALL_OPTION:
+        return ""
+    return label
+
+
+def _build_ball_highlight_choices(blue_robots: list = None, red_robots: list = None) -> list:
+    """Build dropdown choices for the ball-highlight export filter."""
+    choices = [BALL_HIGHLIGHT_ALL_OPTION]
+    seen = {BALL_HIGHLIGHT_ALL_OPTION}
+    for label in _normalize_robot_numbers((blue_robots or []) + (red_robots or [])):
+        if label not in seen:
+            choices.append(label)
+            seen.add(label)
+    return choices
+
+
+def _update_ball_highlight_dropdown(blue_robot_1: str = "", blue_robot_2: str = "", blue_robot_3: str = "",
+                                    red_robot_1: str = "", red_robot_2: str = "", red_robot_3: str = "",
+                                    current_value: str = None):
+    """Keep the ball-highlight dropdown synced with the configured robot numbers."""
+    blue_robots = [blue_robot_1, blue_robot_2, blue_robot_3]
+    red_robots = [red_robot_1, red_robot_2, red_robot_3]
+    choices = _build_ball_highlight_choices(blue_robots, red_robots)
+    selected = _normalize_highlight_ball_robot(current_value)
+    value = selected if selected in choices else BALL_HIGHLIGHT_ALL_OPTION
+    return gr.update(choices=choices, value=value)
 
 
 def _get_center_robot_scan_alliance(bbox: tuple, frame_width: int) -> str:
@@ -1474,6 +1828,9 @@ class BallTracker:
         self.prediction_horizon_frames = max(18, int(round(self.fps * 2.0)))
         self.prediction_substeps = 3
         self.prediction_bounds_padding = 40.0
+        self.min_shot_progress_pixels = max(12.0, float(self.min_upward_pixels) * 2.0)
+        self.min_predicted_make_stable_frames = 3
+        self.min_predicted_make_progress_pixels = max(24.0, self.min_shot_progress_pixels * 1.5)
         
         # Track balls: {ball_id: {'pos': (x, y, r), 'prev_pos': (x, y, r), 'shot_by': robot_label, ...}}
         self.tracked_balls = {}
@@ -1484,8 +1841,8 @@ class BallTracker:
         self.next_ball_id = 0
         self.current_frame = 0
         
-        # Store robot bounding boxes from nearest Gemini detection
-        # Format: [(y1, x1, y2, x2, label), ...]
+        # Store robot bounding boxes from nearest Gemini/manual detection.
+        # Format: [(y1, x1, y2, x2, label, is_shooting), ...]
         self.robot_bboxes = []
         
         # Shot statistics: {robot_label: {'attempts': 0, 'made': 0, 'by_period': {...}}}
@@ -1572,6 +1929,15 @@ class BallTracker:
         sx = actual_w / ref_w
         sy = actual_h / ref_h
         return [(x * sx, y * sy) for x, y in polygon]
+
+    @staticmethod
+    def _polygon_center(polygon) -> tuple:
+        """Return the centroid-like average of polygon vertices."""
+        if not polygon:
+            return None
+        xs = [pt[0] for pt in polygon]
+        ys = [pt[1] for pt in polygon]
+        return sum(xs) / len(xs), sum(ys) / len(ys)
     
     def _get_unshifted_point(self, x, y):
         """Un-shift a point from video coords back to base reference coords if tracking center camera."""
@@ -1628,9 +1994,27 @@ class BallTracker:
                     x1 = float(box[1]) / 1000 * frame_width
                     y2 = float(box[2]) / 1000 * frame_height
                     x2 = float(box[3]) / 1000 * frame_width
-                    self.robot_bboxes.append((y1, x1, y2, x2, label))
+                    is_shooting = bool(bbox.get('shooting', True))
+                    self.robot_bboxes.append((y1, x1, y2, x2, label, is_shooting))
         except Exception as e:
             print(f"Error parsing robot bboxes: {e}")
+
+    def _is_robot_marked_shooting(self, robot_label: str) -> bool:
+        """
+        Manual center tracking can explicitly mark which robots are shooting.
+        If that metadata is absent, fall back to the legacy permissive behavior.
+        """
+        label = str(robot_label).strip()
+        matched = [bbox for bbox in self.robot_bboxes if len(bbox) >= 5 and str(bbox[4]).strip() == label]
+        if not matched:
+            return True
+        return any(bool(bbox[5]) if len(bbox) >= 6 else True for bbox in matched)
+
+    def any_robot_marked_shooting(self) -> bool:
+        """Return True if the current frame has at least one robot allowed to shoot."""
+        if not self.robot_bboxes:
+            return True
+        return any(bool(bbox[5]) if len(bbox) >= 6 else True for bbox in self.robot_bboxes)
     
     def _is_robot_in_camera_alliance(self, robot_label: str) -> bool:
         """
@@ -1671,6 +2055,8 @@ class BallTracker:
         right half is red.
         """
         label = str(robot_label).strip()
+        if not self._is_robot_marked_shooting(label):
+            return False
         if self.camera_side == "center":
             ball_alliance = self._get_center_ball_alliance(ball_x)
             if ball_alliance == "blue":
@@ -1693,7 +2079,8 @@ class BallTracker:
         """
         edge_margin = self.frame_width * 0.05 if self.frame_width > 0 else 0
         
-        for (y1, x1, y2, x2, label) in self.robot_bboxes:
+        for robot_bbox in self.robot_bboxes:
+            y1, x1, y2, x2, label = robot_bbox[:5]
             # Only consider robots eligible for the current ball position.
             if not self._is_robot_eligible_for_ball(label, ball_x):
                 continue
@@ -1742,6 +2129,13 @@ class BallTracker:
         zone_y2 = y2
         return anchor_x, anchor_y, zone_x1, zone_y1, zone_x2, zone_y2
 
+    def _is_probable_side_source(self, ball_x: int) -> bool:
+        """Heuristic guard for balls originating from the human-player side edges."""
+        if self.camera_side != "center" or self.frame_width <= 0:
+            return False
+        edge_margin = self.frame_width * 0.08
+        return ball_x <= edge_margin or ball_x >= (self.frame_width - edge_margin)
+
     def _find_nearest_alliance_robot(self, ball_x: int, ball_y: int, max_dist: float = None) -> str:
         """
         Find the nearest alliance robot using a launch anchor above each robot bbox.
@@ -1761,7 +2155,8 @@ class BallTracker:
         best_label = None
         best_dist = max_dist
         
-        for (y1, x1, y2, x2, label) in self.robot_bboxes:
+        for robot_bbox in self.robot_bboxes:
+            y1, x1, y2, x2, label = robot_bbox[:5]
             if not self._is_robot_eligible_for_ball(label, ball_x):
                 continue
             anchor_x, anchor_y, zone_x1, zone_y1, zone_x2, zone_y2 = self._get_robot_launch_geometry(y1, x1, y2, x2)
@@ -1791,7 +2186,9 @@ class BallTracker:
                     self._is_robot_eligible_for_ball(last_overlap_robot, ball_x)):
                 return last_overlap_robot
 
-        if last_near_robot and self._is_robot_eligible_for_ball(last_near_robot, ball_x):
+        if (last_near_robot
+                and self._is_robot_eligible_for_ball(last_near_robot, ball_x)
+                and not self._is_probable_side_source(ball_x)):
             return last_near_robot
 
         return None
@@ -1910,6 +2307,55 @@ class BallTracker:
 
         return weighted_vx / total_weight, weighted_vy / total_weight
 
+    def _get_goal_center_for_origin(self, shot_origin_pos) -> tuple:
+        """Pick the goal center this shot is most plausibly traveling toward."""
+        if shot_origin_pos is None or not self.goal_polygons:
+            return None
+
+        goal_centers = []
+        for polygon in self.goal_polygons:
+            center = self._polygon_center(polygon)
+            if center is None:
+                continue
+            cx, cy = center
+            if self.camera_side == "center" and self.frame_width > 0 and self.frame_height > 0:
+                cx, cy = _calibration_transform_point(cx, cy, self.frame_width, self.frame_height, inverse=False)
+            goal_centers.append((cx, cy))
+
+        if not goal_centers:
+            return None
+
+        ox, oy = float(shot_origin_pos[0]), float(shot_origin_pos[1])
+        return min(goal_centers, key=lambda center: ((center[0] - ox) ** 2 + (center[1] - oy) ** 2))
+
+    def _shot_progress_from_origin(self, current_pos, shot_origin_pos) -> float:
+        """Measure forward travel specifically along the path toward the goal zone."""
+        if current_pos is None or shot_origin_pos is None:
+            return 0.0
+        goal_center = self._get_goal_center_for_origin(shot_origin_pos)
+        dx = float(current_pos[0]) - float(shot_origin_pos[0])
+        dy = float(current_pos[1]) - float(shot_origin_pos[1])
+        if goal_center is None:
+            return (dx * dx + dy * dy) ** 0.5
+
+        goal_dx = float(goal_center[0]) - float(shot_origin_pos[0])
+        goal_dy = float(goal_center[1]) - float(shot_origin_pos[1])
+        goal_len = (goal_dx * goal_dx + goal_dy * goal_dy) ** 0.5
+        if goal_len <= 1e-6:
+            return (dx * dx + dy * dy) ** 0.5
+
+        projected_progress = ((dx * goal_dx) + (dy * goal_dy)) / goal_len
+        return max(0.0, projected_progress)
+
+    def _shot_has_launch_progress(self, current_pos, shot_origin_pos) -> bool:
+        """Only arm trajectory prediction after the ball has visibly displaced."""
+        return self._shot_progress_from_origin(current_pos, shot_origin_pos) >= self.min_shot_progress_pixels
+
+    @staticmethod
+    def _goal_spawn_lock_active(spawned_in_goal_zone: bool, exited_spawn_goal_zone: bool) -> bool:
+        """Prevent brand-new goal-zone detections from immediately becoming shots."""
+        return bool(spawned_in_goal_zone and not exited_spawn_goal_zone)
+
     def _is_prediction_in_bounds(self, x: float, y: float) -> bool:
         """Stop trajectory simulation once the ball is well outside the frame."""
         pad = self.prediction_bounds_padding
@@ -1998,27 +2444,54 @@ class BallTracker:
             'updated_at_frame': self.current_frame,
         }
 
-    @staticmethod
-    def _prediction_will_score(prediction: dict) -> bool:
-        """Return True when the latest shot prediction intersects the goal."""
-        return bool(prediction and prediction.get('will_score'))
+    def _prediction_will_score(self, prediction: dict, launch_progress: float = 0.0) -> bool:
+        """Return True only when the predicted make is strong enough to trust."""
+        if not prediction or not prediction.get('will_score'):
+            return False
+        if int(prediction.get('stable_frames', 0)) < self.min_predicted_make_stable_frames:
+            return False
+        return launch_progress >= self.min_predicted_make_progress_pixels
 
     def _resolve_shot_result(self, robot_label: str, x: float, y: float,
                              was_ever_in_goal: bool = False, prediction: dict = None,
+                             shot_origin_pos: tuple = None, trace_visible: bool = False,
                              context: str = "") -> bool:
         """
         Finalize a shot using observed goal entry if available, otherwise the
         latest trajectory prediction.
         """
-        observed_make = bool(was_ever_in_goal or self._is_in_goal(x, y))
-        predicted_make = self._prediction_will_score(prediction)
+        raw_observed_make = bool(was_ever_in_goal or self._is_in_goal(x, y))
+        observed_make = raw_observed_make and trace_visible
+        launch_progress = self._shot_progress_from_origin((x, y), shot_origin_pos)
+        raw_predicted_make = bool(prediction and prediction.get('will_score'))
+        predicted_make = (
+            self._prediction_will_score(prediction, launch_progress=launch_progress)
+            if trace_visible else False
+        )
+        if not observed_make and not predicted_make and launch_progress < self.min_shot_progress_pixels:
+            suffix = f" ({context})" if context else ""
+            print(
+                f"[SHOT DROPPED] Robot {robot_label}{suffix}: "
+                f"only moved {launch_progress:.1f}px from launch point"
+            )
+            return False
         made = observed_make or predicted_make
         self._record_shot(robot_label, made=made)
 
         period = get_match_period(self._get_elapsed_seconds())
-        reason = "observed goal entry" if observed_make else (
-            "predicted path intersects goal" if predicted_make else "predicted path misses goal"
-        )
+        if raw_observed_make and not trace_visible:
+            reason = "goal entry ignored because no shot trace was ever armed"
+        elif raw_predicted_make and not trace_visible:
+            reason = "predicted make ignored because no shot trace was ever armed"
+        elif observed_make:
+            reason = "observed goal entry"
+        elif predicted_make:
+            reason = "predicted path intersects goal"
+        else:
+            reason = (
+                "predicted make was too weak to trust" if raw_predicted_make
+                else "predicted path misses goal"
+            )
         outcome = "SHOT MADE" if made else "SHOT MISSED"
         suffix = f" ({context})" if context else ""
         print(f"[{outcome}] Robot {robot_label} @ {period}{suffix}: {reason}")
@@ -2256,15 +2729,20 @@ class BallTracker:
             shot_by = ball_data.get('shot_by')
             shot_evaluated = ball_data.get('shot_evaluated', False)
             candidate_shot = ball_data.get('candidate_shot')
-            if shot_by and not shot_evaluated:
+            shot_origin_pos = ball_data.get('shot_origin_pos')
+            trace_visible_once = bool(ball_data.get('trace_visible_once', False))
+            if shot_by and not shot_evaluated and trace_visible_once:
                 predicted_ball = (pred_x, pred_y, ball_data['pos'][2])
-                ball_data['candidate_shot'] = self._build_shot_prediction(
-                    predicted_ball,
-                    prev_pos=curr_pos,
-                    recent_positions=ball_data.get('recent_positions'),
-                    velocity_hint=lost_data.get('velocity'),
-                    previous_prediction=candidate_shot,
-                )
+                if self._shot_has_launch_progress(predicted_ball, shot_origin_pos):
+                    ball_data['candidate_shot'] = self._build_shot_prediction(
+                        predicted_ball,
+                        prev_pos=curr_pos,
+                        recent_positions=ball_data.get('recent_positions'),
+                        velocity_hint=lost_data.get('velocity'),
+                        previous_prediction=candidate_shot,
+                    )
+                else:
+                    ball_data['candidate_shot'] = None
             
             # Check if ball has been lost too long
             if lost_data['frames_lost'] <= self.max_frames_lost:
@@ -2282,6 +2760,8 @@ class BallTracker:
                         y,
                         was_ever_in_goal=lost_data['data'].get('last_seen_in_goal', False),
                         prediction=lost_data['data'].get('candidate_shot'),
+                        shot_origin_pos=lost_data['data'].get('shot_origin_pos'),
+                        trace_visible=bool(lost_data['data'].get('trace_visible_once', False)),
                         context="lost timeout",
                     )
         
@@ -2309,15 +2789,24 @@ class BallTracker:
                 shot_time = old_data.get('shot_time')
                 shot_evaluated = old_data.get('shot_evaluated', False)
                 candidate_shot = old_data.get('candidate_shot')
+                shot_origin_pos = old_data.get('shot_origin_pos')
                 overlapping_robot = old_data.get('overlapping_robot')
                 last_near_robot = old_data.get('last_near_robot')
                 last_overlap_robot = old_data.get('last_overlap_robot')
                 last_overlap_frame = old_data.get('last_overlap_frame')
                 was_ever_in_goal = old_data.get('last_seen_in_goal', False)
+                spawned_in_goal_zone = bool(old_data.get('spawned_in_goal_zone', False))
+                exited_spawn_goal_zone = bool(old_data.get('exited_spawn_goal_zone', not spawned_in_goal_zone))
+                trace_visible_once = bool(old_data.get('trace_visible_once', False))
                 recent_positions = list(old_data.get('recent_positions') or ([prev_pos] if prev_pos else []))
                 
             elif ball_id is None:
                 # New ball
+                cur_in_goal = self._is_in_goal(x, y)
+                if cur_in_goal:
+                    print(f"[BALL IGNORED] New detection inside goal zone at ({x:.0f},{y:.0f})")
+                    continue
+
                 ball_id = self.next_ball_id
                 self.next_ball_id += 1
                 cur_overlap = self._ball_overlaps_robot(x, y, r)
@@ -2333,7 +2822,11 @@ class BallTracker:
                     'last_overlap_robot': cur_overlap,
                     'last_overlap_frame': self.current_frame if cur_overlap else None,
                     'candidate_shot': None,
-                    'last_seen_in_goal': False,
+                    'shot_origin_pos': None,
+                    'last_seen_in_goal': cur_in_goal,
+                    'spawned_in_goal_zone': cur_in_goal,
+                    'exited_spawn_goal_zone': not cur_in_goal,
+                    'trace_visible_once': False,
                     'recent_positions': [(x, y, r)]
                 }
                 results.append({
@@ -2354,11 +2847,15 @@ class BallTracker:
                 shot_time = old_data.get('shot_time')
                 shot_evaluated = old_data.get('shot_evaluated', False)
                 candidate_shot = old_data.get('candidate_shot')
+                shot_origin_pos = old_data.get('shot_origin_pos')
                 overlapping_robot = old_data.get('overlapping_robot')
                 last_near_robot = old_data.get('last_near_robot')
                 last_overlap_robot = old_data.get('last_overlap_robot')
                 last_overlap_frame = old_data.get('last_overlap_frame')
                 was_ever_in_goal = old_data.get('last_seen_in_goal', False)
+                spawned_in_goal_zone = bool(old_data.get('spawned_in_goal_zone', False))
+                exited_spawn_goal_zone = bool(old_data.get('exited_spawn_goal_zone', not spawned_in_goal_zone))
+                trace_visible_once = bool(old_data.get('trace_visible_once', False))
                 recent_positions = list(old_data.get('recent_positions') or ([prev_pos] if prev_pos else []))
             
             recent_positions = recent_positions[-(self.motion_history_size - 1):]
@@ -2369,13 +2866,17 @@ class BallTracker:
             instant_rise, window_gain, rising_steps = self._get_shot_launch_metrics(prev_pos, recent_positions, y)
 
             # As soon as the ball is clearly lifting, credit the nearest launch anchor.
-            if not shot_by:
+            shot_detection_locked = self._goal_spawn_lock_active(
+                spawned_in_goal_zone,
+                exited_spawn_goal_zone,
+            )
+            if not shot_by and not shot_detection_locked:
                 nearby_robot = self._get_shot_origin_robot(
                     x,
                     cur_overlap or overlapping_robot,
                     last_overlap_robot,
                     last_overlap_frame,
-                    cur_nearest
+                    cur_nearest,
                 )
                 launch_detected = (
                     instant_rise >= self.min_launch_rise_pixels or
@@ -2387,6 +2888,7 @@ class BallTracker:
                     shot_time = self.current_frame
                     shot_evaluated = False
                     candidate_shot = None
+                    shot_origin_pos = (x, y, r)
                     print(
                         f"[SHOT DETECTED] Ball {ball_id} shot by {shot_by} at "
                         f"pos=({x:.0f},{y:.0f}), rise={instant_rise:.0f}px, "
@@ -2394,13 +2896,18 @@ class BallTracker:
                     )
 
             updated_recent_positions = recent_positions + [(x, y, r)]
-            if shot_by:
+            launch_progress = self._shot_progress_from_origin((x, y, r), shot_origin_pos)
+            shot_trace_ready = bool(shot_by) and launch_progress >= self.min_shot_progress_pixels
+            trace_visible_once = trace_visible_once or shot_trace_ready
+            if shot_by and shot_trace_ready:
                 candidate_shot = self._build_shot_prediction(
                     (x, y, r),
                     prev_pos=prev_pos,
                     recent_positions=recent_positions,
                     previous_prediction=candidate_shot,
                 )
+            else:
+                candidate_shot = None
             
             # Check if 2 seconds have passed since shot - time to evaluate!
             # Only count MADE shots (ball in goal)
@@ -2415,6 +2922,8 @@ class BallTracker:
                         y,
                         was_ever_in_goal=was_ever_in_goal,
                         prediction=candidate_shot,
+                        shot_origin_pos=shot_origin_pos,
+                        trace_visible=trace_visible_once,
                         context="2sec eval",
                     )
                     shot_evaluated = True
@@ -2428,6 +2937,7 @@ class BallTracker:
                     shot_time = None
             
             is_in_goal = self._is_in_goal(x, y)
+            exited_spawn_goal_zone = exited_spawn_goal_zone or not is_in_goal
             
             # Sticky flags: once True, stays True
             ever_in_goal = was_ever_in_goal or is_in_goal
@@ -2452,45 +2962,55 @@ class BallTracker:
                 'last_overlap_robot': updated_last_overlap_robot,
                 'last_overlap_frame': updated_last_overlap_frame,
                 'candidate_shot': candidate_shot,
+                'shot_origin_pos': shot_origin_pos,
                 'last_seen_in_goal': ever_in_goal,
+                'spawned_in_goal_zone': spawned_in_goal_zone,
+                'exited_spawn_goal_zone': exited_spawn_goal_zone,
+                'trace_visible_once': trace_visible_once,
                 'recent_positions': updated_recent_positions
             }
             
             # Add to results
-            robot_label = new_tracked[ball_id].get('shot_by')
+            robot_label = new_tracked[ball_id].get('shot_by') if candidate_shot is not None else None
+            predicted_make_state = None
+            if candidate_shot is not None:
+                if self._prediction_will_score(candidate_shot, launch_progress=launch_progress):
+                    predicted_make_state = True
+                elif not candidate_shot.get('will_score'):
+                    predicted_make_state = False
             results.append({
                 'x': x,
                 'y': y,
                 'radius': r,
                 'robot_label': robot_label,
                 'predicted_path': list((candidate_shot or {}).get('path') or []),
-                'predicted_make': (
-                    (candidate_shot or {}).get('will_score')
-                    if candidate_shot is not None else None
-                ),
+                'predicted_make': predicted_make_state,
                 'predicted_only': False,
             })
 
         for lost_data in self.lost_balls.values():
             ball_data = lost_data.get('data', {})
             prediction = ball_data.get('candidate_shot')
-            robot_label = ball_data.get('shot_by')
-            if not robot_label and not prediction:
+            if not prediction:
                 continue
 
+            robot_label = ball_data.get('shot_by')
             pred_x, pred_y = lost_data.get('predicted_pos', (0, 0))
             pos = ball_data.get('pos', (pred_x, pred_y, 0))
             radius = pos[2] if len(pos) >= 3 else 0
+            launch_progress = self._shot_progress_from_origin((pred_x, pred_y, radius), ball_data.get('shot_origin_pos'))
+            predicted_make_state = None
+            if self._prediction_will_score(prediction, launch_progress=launch_progress):
+                predicted_make_state = True
+            elif not prediction.get('will_score'):
+                predicted_make_state = False
             results.append({
                 'x': int(round(pred_x)),
                 'y': int(round(pred_y)),
                 'radius': radius,
                 'robot_label': robot_label,
                 'predicted_path': list((prediction or {}).get('path') or []),
-                'predicted_make': (
-                    (prediction or {}).get('will_score')
-                    if prediction is not None else None
-                ),
+                'predicted_make': predicted_make_state,
                 'predicted_only': True,
             })
         
@@ -2524,6 +3044,8 @@ class BallTracker:
                     y,
                     was_ever_in_goal=ball_data.get('last_seen_in_goal', False),
                     prediction=ball_data.get('candidate_shot'),
+                    shot_origin_pos=ball_data.get('shot_origin_pos'),
+                    trace_visible=bool(ball_data.get('trace_visible_once', False)),
                     context="finalize tracked",
                 )
         
@@ -2540,6 +3062,8 @@ class BallTracker:
                     y,
                     was_ever_in_goal=lost_data['data'].get('last_seen_in_goal', False),
                     prediction=lost_data['data'].get('candidate_shot'),
+                    shot_origin_pos=lost_data['data'].get('shot_origin_pos'),
+                    trace_visible=bool(lost_data['data'].get('trace_visible_once', False)),
                     context="finalize lost",
                 )
         
@@ -4023,6 +4547,46 @@ def _run_sam3_on_region(frame_bgr: np.ndarray, predictor,
     return detections
 
 
+def _apply_sam3_exclusion_polygons(frame_bgr: np.ndarray, exclusion_polygons: list = None,
+                                   x_offset: int = 0, y_offset: int = 0) -> np.ndarray:
+    """Black out excluded polygons before passing an image region to SAM3."""
+    if frame_bgr is None or frame_bgr.size == 0 or not exclusion_polygons:
+        return frame_bgr
+
+    masked = frame_bgr.copy()
+    region_h, region_w = masked.shape[:2]
+    local_polygons = []
+
+    for polygon in exclusion_polygons:
+        if not polygon or len(polygon) < 3:
+            continue
+
+        points = []
+        for px, py in polygon:
+            lx = int(round(px - x_offset))
+            ly = int(round(py - y_offset))
+            points.append((lx, ly))
+
+        polygon_np = np.array(points, dtype=np.int32)
+        if polygon_np.size == 0:
+            continue
+
+        min_x = int(np.min(polygon_np[:, 0]))
+        max_x = int(np.max(polygon_np[:, 0]))
+        min_y = int(np.min(polygon_np[:, 1]))
+        max_y = int(np.max(polygon_np[:, 1]))
+
+        if max_x < 0 or max_y < 0 or min_x >= region_w or min_y >= region_h:
+            continue
+
+        local_polygons.append(polygon_np)
+
+    if local_polygons:
+        cv2.fillPoly(masked, local_polygons, (0, 0, 0))
+
+    return masked
+
+
 # Center camera ROI regions (1918x709 frame)
 # Only the bottom-left and bottom-right corners contain scoring areas
 _CENTER_CAM_ROIS = [
@@ -4033,7 +4597,8 @@ _CENTER_CAM_ROIS = [
 
 def detect_fuel_sam3(frame_bgr: np.ndarray, predictor,
                      min_radius: int = 3, max_radius: int = 30,
-                     camera_side: str = "blue") -> list:
+                     camera_side: str = "blue",
+                     exclusion_polygons: list = None) -> list:
     """
     Detect yellow fuel balls using SAM 3 semantic segmentation.
     
@@ -4067,6 +4632,12 @@ def detect_fuel_sam3(frame_bgr: np.ndarray, predictor,
 
             if x2 > x1 and y2 > y1:
                 roi = frame_bgr[y1:y2, x1:x2]
+                roi = _apply_sam3_exclusion_polygons(
+                    roi,
+                    exclusion_polygons=exclusion_polygons,
+                    x_offset=x1,
+                    y_offset=y1,
+                )
                 detections = _run_sam3_on_region(
                     roi,
                     predictor,
@@ -4145,7 +4716,8 @@ def _draw_fuel_detections_legacy(frame: Image.Image, fuel_detections: list, blue
     return frame
 
 
-def draw_fuel_detections(frame: Image.Image, fuel_detections: list, blue_robots: list = None, red_robots: list = None) -> Image.Image:
+def draw_fuel_detections(frame: Image.Image, fuel_detections: list, blue_robots: list = None,
+                         red_robots: list = None, highlight_robot_label: str = None) -> Image.Image:
     """
     Draw fuel detections plus optional predicted trajectories.
 
@@ -4154,6 +4726,7 @@ def draw_fuel_detections(frame: Image.Image, fuel_detections: list, blue_robots:
         fuel_detections: List of tuples or dict payloads from BallTracker.update()
         blue_robots: List of blue alliance team numbers for color coding
         red_robots: List of red alliance team numbers for color coding
+        highlight_robot_label: Only this robot's attributed balls stay fully highlighted
 
     Returns:
         PIL Image with fuel detections drawn
@@ -4167,6 +4740,7 @@ def draw_fuel_detections(frame: Image.Image, fuel_detections: list, blue_robots:
 
     blue_robots = blue_robots or []
     red_robots = red_robots or []
+    highlight_robot_label = _normalize_highlight_ball_robot(highlight_robot_label)
 
     def _normalize_detection(detection):
         if isinstance(detection, dict):
@@ -4208,21 +4782,30 @@ def draw_fuel_detections(frame: Image.Image, fuel_detections: list, blue_robots:
         ]
         predicted_make = payload['predicted_make']
         predicted_only = payload['predicted_only']
+        is_selected_robot = (
+            not highlight_robot_label
+            or (robot_label is not None and str(robot_label).strip() == highlight_robot_label)
+        )
 
-        if robot_label:
+        if robot_label and is_selected_robot:
             color_rgb = get_robot_color(robot_label, blue_robots, red_robots)
             outline_width = 3
+        elif highlight_robot_label:
+            color_rgb = (205, 205, 205) if robot_label else (185, 185, 165)
+            outline_width = 1 if predicted_only else 2
         else:
             color_rgb = (255, 215, 0)
             outline_width = 2
 
-        circle_rgba = (*color_rgb, 220 if not predicted_only else 150)
-        if predicted_make is True:
-            path_rgba = (90, 255, 120, 210 if not predicted_only else 150)
-        elif predicted_make is False:
-            path_rgba = (255, 140, 60, 210 if not predicted_only else 150)
+        if highlight_robot_label and not is_selected_robot:
+            circle_rgba = (*color_rgb, 110 if not predicted_only else 80)
+            path_rgba = (*color_rgb, 90 if not predicted_only else 60)
         else:
-            path_rgba = (*color_rgb, 170 if not predicted_only else 110)
+            circle_rgba = (*color_rgb, 220 if not predicted_only else 150)
+            if predicted_make is True:
+                path_rgba = (90, 255, 120, 210 if not predicted_only else 150)
+            else:
+                path_rgba = (*color_rgb, 170 if not predicted_only else 110)
 
         if len(predicted_path) >= 2:
             draw.line(predicted_path, fill=path_rgba, width=3)
@@ -4241,17 +4824,15 @@ def draw_fuel_detections(frame: Image.Image, fuel_detections: list, blue_robots:
             width=outline_width
         )
 
-        if robot_label:
+        if robot_label and is_selected_robot:
             if predicted_make is True:
                 suffix = " IN"
-            elif predicted_make is False:
-                suffix = " OUT"
             else:
                 suffix = ""
             prefix = "PRED " if predicted_only else ""
             label_text = f"{prefix}{robot_label}{suffix}"
             draw.text((x - 24, y - radius - 18), label_text, fill=circle_rgba, font=label_font)
-        else:
+        elif not highlight_robot_label:
             draw.text((x - 10, y - radius - 15), "fuel", fill=circle_rgba, font=font)
 
     return Image.alpha_composite(frame, overlay).convert("RGB")
@@ -4373,9 +4954,8 @@ def plot_bounding_boxes(img: Image.Image, bounding_boxes_json: str, blue_robots:
         label_text = str(team_number)
         if team_number in stats:
             made = stats[team_number]['made']
-            atm = stats[team_number]['attempts']
-            if atm > 0:
-                label_text += f" - {made}/{atm}"
+            if made > 0:
+                label_text += f" - {made} made"
         
         # Convert normalized coordinates to absolute coordinates
         # Format: [y1, x1, y2, x2] normalized to 1000
@@ -5389,14 +5969,18 @@ def _iter_manual_track_slots(blue_robots: list, red_robots: list):
 def _dedupe_manual_track_samples(samples: list) -> list:
     samples = sorted(samples, key=lambda item: item[0])
     deduped = []
-    for t, x, y in samples:
-        if deduped and abs(t - deduped[-1][0]) <= 0.03:
-            deduped[-1] = (t, x, y)
+    for t, x, y, shooting in samples:
+        if deduped and abs(t - deduped[-1][0]) <= 0.03 and bool(shooting) == bool(deduped[-1][3]):
+            deduped[-1] = (t, x, y, shooting)
             continue
-        if deduped and abs(t - deduped[-1][0]) <= 0.20 and abs(x - deduped[-1][1]) <= 0.5 and abs(y - deduped[-1][2]) <= 0.5:
-            deduped[-1] = (t, x, y)
+        if (deduped
+                and abs(t - deduped[-1][0]) <= 0.20
+                and abs(x - deduped[-1][1]) <= 0.5
+                and abs(y - deduped[-1][2]) <= 0.5
+                and bool(shooting) == bool(deduped[-1][3])):
+            deduped[-1] = (t, x, y, shooting)
             continue
-        deduped.append((t, x, y))
+        deduped.append((t, x, y, shooting))
     return deduped
 
 
@@ -5405,7 +5989,7 @@ def _parse_manual_robot_tracks_json(manual_tracks_json: str, blue_robots: list, 
     Parse the browser-recorded manual robot tracks.
 
     Returns:
-        Dict mapping robot label -> {'samples': [(t, x, y), ...], 'times': [t, ...], ...}
+        Dict mapping robot label -> {'samples': [(t, x, y, shooting), ...], 'times': [t, ...], ...}
     """
     if not manual_tracks_json or not str(manual_tracks_json).strip():
         raise gr.Error("Manual tracking mode is enabled, but no robot tracks were recorded.")
@@ -5445,7 +6029,7 @@ def _parse_manual_robot_tracks_json(manual_tracks_json: str, blue_robots: list, 
                 continue
             if t < 0:
                 continue
-            cleaned_samples.append((t, x, y))
+            cleaned_samples.append((t, x, y, bool(sample.get("shooting", True))))
 
         deduped = _dedupe_manual_track_samples(cleaned_samples)
         if not deduped:
@@ -5476,29 +6060,31 @@ def _interpolate_manual_robot_position(robot_track: dict, target_time: float):
         return None
 
     if target_time <= times[0]:
-        _, x, y = samples[0]
-        return x, y
+        _, x, y, shooting = samples[0]
+        return x, y, bool(shooting)
     if target_time >= times[-1]:
-        _, x, y = samples[-1]
-        return x, y
+        _, x, y, shooting = samples[-1]
+        return x, y, bool(shooting)
 
     idx = bisect_left(times, target_time)
     if idx <= 0:
-        _, x, y = samples[0]
-        return x, y
+        _, x, y, shooting = samples[0]
+        return x, y, bool(shooting)
     if idx >= len(samples):
-        _, x, y = samples[-1]
-        return x, y
+        _, x, y, shooting = samples[-1]
+        return x, y, bool(shooting)
 
-    t0, x0, y0 = samples[idx - 1]
-    t1, x1, y1 = samples[idx]
+    t0, x0, y0, _ = samples[idx - 1]
+    t1, x1, y1, _ = samples[idx]
     if t1 <= t0:
-        return x1, y1
+        shooting_idx = max(0, bisect_right(times, target_time) - 1)
+        return x1, y1, bool(samples[shooting_idx][3])
 
     alpha = (target_time - t0) / (t1 - t0)
     x = x0 + ((x1 - x0) * alpha)
     y = y0 + ((y1 - y0) * alpha)
-    return x, y
+    shooting_idx = max(0, bisect_right(times, target_time) - 1)
+    return x, y, bool(samples[shooting_idx][3])
 
 
 def _estimate_manual_robot_bbox(center_x: float, center_y: float, frame_width: int, frame_height: int) -> tuple:
@@ -5537,12 +6123,12 @@ def build_manual_robot_bboxes_json(manual_robot_tracks: dict, target_time: float
         if interp is None:
             continue
 
-        center_x, center_y = interp
+        center_x, center_y, is_shooting = interp
         x1, y1, x2, y2 = _estimate_manual_robot_bbox(center_x, center_y, frame_width, frame_height)
         bbox_area = (x2 - x1) * (y2 - y1)
         track_y = min(float(frame_height - 1), center_y + ((y2 - y1) / 6.0))
 
-        detections.append({
+        detection = {
             "box_2d": [
                 int((y1 / max(1, frame_height)) * 1000),
                 int((x1 / max(1, frame_width)) * 1000),
@@ -5550,13 +6136,15 @@ def build_manual_robot_bboxes_json(manual_robot_tracks: dict, target_time: float
                 int((x2 / max(1, frame_width)) * 1000),
             ],
             "label": label,
-        })
-        frame_tracks[label] = (float(center_x), float(track_y), camera_side, float(bbox_area))
+            "shooting": bool(is_shooting),
+        }
+        detections.append(detection)
+        frame_tracks[label] = (float(center_x), float(track_y), camera_side, float(bbox_area), bool(is_shooting))
 
     return json.dumps(detections), frame_tracks
 
 
-def process_single_video(video_path: str, camera_side: str = "blue", target_fps: int = 3, start_seconds: float = 0, end_seconds: float = 0, blue_robots: list = None, red_robots: list = None, enable_robot_detection: bool = True, enable_fuel_detection: bool = True, progress=gr.Progress(), camera_name: str = "Camera", enable_person_detection: bool = True, calibration_points: list = None, calibration_image_size: tuple = None, side_box_points: list = None, side_box_image_size: tuple = None, side_camera_visible_robots: dict = None, show_unlabeled_robots: bool = True, manual_robot_tracks: dict = None) -> tuple:
+def process_single_video(video_path: str, camera_side: str = "blue", target_fps: int = 3, start_seconds: float = 0, end_seconds: float = 0, blue_robots: list = None, red_robots: list = None, enable_robot_detection: bool = True, enable_fuel_detection: bool = True, progress=gr.Progress(), camera_name: str = "Camera", enable_person_detection: bool = True, calibration_points: list = None, calibration_image_size: tuple = None, side_box_points: list = None, side_box_image_size: tuple = None, side_camera_visible_robots: dict = None, show_unlabeled_robots: bool = True, manual_robot_tracks: dict = None, highlight_ball_robot: str = "") -> tuple:
     """
     Process a single video, tracking objects at specified FPS.
     Uses bumper color detection for robot identification.
@@ -5576,9 +6164,10 @@ def process_single_video(video_path: str, camera_side: str = "blue", target_fps:
         side_camera_visible_robots: Dict of side camera visibility data (for center camera hidden robot injection)
             Format: {'blue': {frame_num: [robot_labels]}, 'red': {frame_num: [robot_labels]}}
         manual_robot_tracks: Optional dict of human-provided center-camera robot tracks.
+        highlight_ball_robot: Optional team number whose balls should remain highlighted in output.
         
     Returns:
-        Tuple of (output_video_path, robot_tracks, tracks_by_frame, width, height, robot_stats, ferry_counts, disabled_statuses, shot_events, side_visible_robots)
+        Tuple of (output_video_path, robot_tracks, tracks_by_frame, width, height, robot_stats, ferry_counts, disabled_statuses, shot_events, side_visible_robots, center_score_ocr)
     """
     if not video_path:
         raise gr.Error("Please upload a video file.")
@@ -5650,6 +6239,7 @@ def process_single_video(video_path: str, camera_side: str = "blue", target_fps:
     # Ball detection at 30fps (or video fps if lower)
     ball_fps = min(30.0, original_fps)
     ball_frame_interval = max(1, round(original_fps / ball_fps))
+    score_ocr_frame_interval = max(1, round(original_fps / CENTER_SCORE_OCR_SAMPLE_FPS))
     # Person detection at 6fps (independent of robot FPS)
     person_frame_interval = max(1, int(original_fps / 6))
     
@@ -5662,6 +6252,12 @@ def process_single_video(video_path: str, camera_side: str = "blue", target_fps:
     # Robot tracking for map visualization
     robot_tracks = {}  # label -> list of (center_x, center_y, camera_side)
     tracks_by_frame = []  # List of dicts {label: (cx, cy, side)} for each frame
+    center_score_ocr_tracker = CenterScoreOCRTracker() if camera_side == "center" else None
+    score_ocr_delay_frames = int(round((original_fps or 30.0) * 2.0))
+    reader_end_frame = max(
+        end_frame,
+        min(total_frames, end_frame + score_ocr_delay_frames) if center_score_ocr_tracker else end_frame
+    )
     
     # Ferry tracker for counting fuel ferries (cross out, cross back, shoot)
     ferry_tracker = FerryTracker(blue_robots=blue_robots, red_robots=red_robots)
@@ -5773,13 +6369,19 @@ def process_single_video(video_path: str, camera_side: str = "blue", target_fps:
         progress(0, desc=f"Processing {camera_name} - Frame 0/{total_ball_frames}")
 
     # Use threaded reader/writer to overlap I/O with processing
-    reader = ThreadedVideoReader(cap, frame_count, end_frame)
+    reader = ThreadedVideoReader(cap, frame_count, reader_end_frame)
     writer = ThreadedVideoWriter(out)
     
     while True:
         ret, frame, frame_count = reader.read()
         if not ret:
             break
+
+        if center_score_ocr_tracker and frame_count % score_ocr_frame_interval == 0:
+            center_score_ocr_tracker.update(frame, frame_count / max(1.0, original_fps))
+
+        if frame_count >= end_frame:
+            continue
         
         # Person detection at 6fps (center camera only)
         if (frame_count % person_frame_interval == 0 and enable_person_detection
@@ -6061,19 +6663,33 @@ def process_single_video(video_path: str, camera_side: str = "blue", target_fps:
             
             # Detect and draw fuel using color-based detection if enabled
             if enable_fuel_detection:
-                if SAM3_PREDICTOR is not None:
-                    fuel_detections = detect_fuel_sam3(frame, SAM3_PREDICTOR,
-                                                       min_radius=3, max_radius=30,
-                                                       camera_side=camera_side)
+                should_scan_for_balls = True
+                if using_manual_robot_tracks and camera_side == "center":
+                    should_scan_for_balls = ball_tracker.any_robot_marked_shooting()
+
+                if should_scan_for_balls:
+                    if SAM3_PREDICTOR is not None:
+                        fuel_detections = detect_fuel_sam3(frame, SAM3_PREDICTOR,
+                                                           min_radius=3, max_radius=30,
+                                                           camera_side=camera_side,
+                                                           exclusion_polygons=robot_exclusion_polygons if camera_side == "center" else None)
+                    else:
+                        fuel_detections = detect_fuel(frame, min_radius=3, max_radius=30,
+                                                      tracked_positions=ball_tracker.get_predicted_positions())
                 else:
-                    fuel_detections = detect_fuel(frame, min_radius=3, max_radius=30,
-                                                  tracked_positions=ball_tracker.get_predicted_positions())
+                    fuel_detections = []
                 
                 # Track balls and detect shots
                 tracked_balls = ball_tracker.update(fuel_detections)
                 
                 # Draw with shot attribution
-                annotated_frame = draw_fuel_detections(annotated_frame, tracked_balls, blue_robots, red_robots)
+                annotated_frame = draw_fuel_detections(
+                    annotated_frame,
+                    tracked_balls,
+                    blue_robots,
+                    red_robots,
+                    highlight_robot_label=highlight_ball_robot,
+                )
             
             # Draw Gemini Calibration Visualization (Center Camera only)
             if calib_viz_data is not None:
@@ -6168,7 +6784,8 @@ def process_single_video(video_path: str, camera_side: str = "blue", target_fps:
     # Get disabled statuses from the disabled tracker
     disabled_statuses = disabled_tracker.get_all_disabled_statuses()
     
-    return output_path, robot_tracks, tracks_by_frame, width, height, ball_tracker.robot_stats, ferry_counts, disabled_statuses, ball_tracker.shot_events, side_visible_robots_by_frame
+    center_score_ocr = center_score_ocr_tracker.summary() if center_score_ocr_tracker else None
+    return output_path, robot_tracks, tracks_by_frame, width, height, ball_tracker.robot_stats, ferry_counts, disabled_statuses, ball_tracker.shot_events, side_visible_robots_by_frame, center_score_ocr
 
 
 def merge_robot_tracks(blue_tracks: dict, red_tracks: dict, frame_width: int = 1068, frame_height: int = 836) -> dict:
@@ -6546,16 +7163,13 @@ def extract_center_video_from_composite(composite_path: str, progress=None) -> s
     return output_path
 
 
-def _build_stats_from_shot_events(all_shot_events: list) -> dict:
-    """
-    Deduplicate shot events within a short time window and rebuild per-robot stats.
-    """
-    dedup_window_seconds = 3.0
+def _dedupe_shot_events(all_shot_events: list, dedup_window_seconds: float = 3.0) -> list:
+    """Deduplicate shot events within a short time window and keep the best made flag."""
     events_by_robot = {}
     for elapsed, robot_label, made in all_shot_events:
         events_by_robot.setdefault(robot_label, []).append((elapsed, made))
 
-    merged_stats = {}
+    deduped_output = []
     for robot_label, events in events_by_robot.items():
         events.sort(key=lambda e: e[0])
         deduped_events = []
@@ -6569,12 +7183,27 @@ def _build_stats_from_shot_events(all_shot_events: list) -> dict:
                     break
             if not is_duplicate:
                 deduped_events.append((elapsed, made))
+        deduped_output.extend((elapsed, robot_label, made) for elapsed, made in deduped_events)
 
+    deduped_output.sort(key=lambda event: (event[0], str(event[1])))
+    return deduped_output
+
+
+def _build_stats_from_shot_events(all_shot_events: list) -> dict:
+    """
+    Deduplicate shot events within a short time window and rebuild per-robot stats.
+    """
+    events_by_robot = {}
+    for elapsed, robot_label, made in _dedupe_shot_events(all_shot_events):
+        events_by_robot.setdefault(robot_label, []).append((elapsed, made))
+
+    merged_stats = {}
+    for robot_label, events in events_by_robot.items():
         by_period = {name: {'attempts': 0, 'made': 0} for name, _, _ in MATCH_PERIODS}
         total_attempts = 0
         total_made = 0
 
-        for elapsed, made in deduped_events:
+        for elapsed, made in events:
             period = get_match_period(elapsed)
             total_attempts += 1
             if made:
@@ -6612,16 +7241,15 @@ def format_robot_stats_md(stats: dict, robot_label: str, ferry_counts: dict, dis
         return result
 
     robot_data = stats[robot_label]
-    total = f"**{robot_data['made']}/{robot_data['attempts']} shots made**"
+    total = f"**{robot_data['made']} shots made**"
     if ferry_count > 0:
         total += f" | **Ferried: {ferry_count}x**"
 
-    rows = ["| Period | Made | Missed |", "|--------|------|--------|"]
+    rows = ["| Period | Made |", "|--------|------|"]
     for period_name, _, _ in MATCH_PERIODS:
         period_data = robot_data['by_period'].get(period_name, {'attempts': 0, 'made': 0})
-        missed = period_data['attempts'] - period_data['made']
         if period_data['attempts'] > 0:
-            rows.append(f"| {period_name} | {period_data['made']} | {missed} |")
+            rows.append(f"| {period_name} | {period_data['made']} |")
 
     if len(rows) == 2:
         result = disabled_line + "\n\n"
@@ -6633,7 +7261,7 @@ def format_robot_stats_md(stats: dict, robot_label: str, ferry_counts: dict, dis
     return f"{disabled_line}\n\n{total}\n\n" + "\n".join(rows)
 
 
-def process_dual_videos(blue_video_path: str, red_video_path: str, center_video_path: str = None, composite_video_path: str = None, target_fps: int = 3, start_seconds: float = 0, end_seconds: float = 0, blue_robot_1: str = "", blue_robot_2: str = "", blue_robot_3: str = "", red_robot_1: str = "", red_robot_2: str = "", red_robot_3: str = "", enable_robot_detection: bool = True, enable_fuel_detection: bool = True, side_ref_image: Image.Image = None, center_ref_image: Image.Image = None, enable_blue_camera: bool = True, enable_center_camera: bool = True, enable_red_camera: bool = True, enable_person_detection: bool = True, calibration_points: list = None, calibration_image_size: tuple = None, blue_side_box_points: list = None, blue_side_box_image_size: tuple = None, red_side_box_points: list = None, red_side_box_image_size: tuple = None, show_unlabeled_robots: bool = True, progress=gr.Progress()) -> tuple:
+def process_dual_videos(blue_video_path: str, red_video_path: str, center_video_path: str = None, composite_video_path: str = None, target_fps: int = 3, start_seconds: float = 0, end_seconds: float = 0, blue_robot_1: str = "", blue_robot_2: str = "", blue_robot_3: str = "", red_robot_1: str = "", red_robot_2: str = "", red_robot_3: str = "", enable_robot_detection: bool = True, enable_fuel_detection: bool = True, side_ref_image: Image.Image = None, center_ref_image: Image.Image = None, enable_blue_camera: bool = True, enable_center_camera: bool = True, enable_red_camera: bool = True, enable_person_detection: bool = True, calibration_points: list = None, calibration_image_size: tuple = None, blue_side_box_points: list = None, blue_side_box_image_size: tuple = None, red_side_box_points: list = None, red_side_box_image_size: tuple = None, show_unlabeled_robots: bool = True, highlight_ball_robot: str = "", progress=gr.Progress()) -> tuple:
     """
     Process blue, red, and center camera videos using bumper detection.
     
@@ -6648,6 +7276,7 @@ def process_dual_videos(blue_video_path: str, red_video_path: str, center_video_
         red_robot_1, red_robot_2, red_robot_3: Red alliance team numbers
         enable_robot_detection: Whether to detect robots
         enable_fuel_detection: Whether to detect yellow fuel balls
+        highlight_ball_robot: Optional team number whose balls should remain highlighted in output
         progress: Gradio progress tracker
         
     Returns:
@@ -6674,7 +7303,7 @@ def process_dual_videos(blue_video_path: str, red_video_path: str, center_video_
     if blue_video_path and enable_blue_camera:
         progress(0, desc="Starting Blue Camera processing...")
         try:
-            output_path, robot_tracks, tracks_by_frame, width, height, robot_stats, ferry_counts, disabled_statuses, shot_events, side_visible_robots = process_single_video(
+            output_path, robot_tracks, tracks_by_frame, width, height, robot_stats, ferry_counts, disabled_statuses, shot_events, side_visible_robots, center_score_ocr = process_single_video(
                 blue_video_path,
                 "blue",
                 target_fps,
@@ -6688,7 +7317,8 @@ def process_dual_videos(blue_video_path: str, red_video_path: str, center_video_
                 "Blue Camera",
                 enable_person_detection=enable_person_detection,
                 side_box_points=blue_side_box_points,
-                side_box_image_size=blue_side_box_image_size
+                side_box_image_size=blue_side_box_image_size,
+                highlight_ball_robot=highlight_ball_robot,
             )
             results['blue'] = {
                 'output_path': output_path,
@@ -6700,7 +7330,8 @@ def process_dual_videos(blue_video_path: str, red_video_path: str, center_video_
                 'ferry_counts': ferry_counts,
                 'disabled_statuses': disabled_statuses,
                 'shot_events': shot_events,
-                'side_visible_robots': side_visible_robots
+                'side_visible_robots': side_visible_robots,
+                'center_score_ocr': center_score_ocr,
             }
         except Exception as e:
             import traceback
@@ -6711,7 +7342,7 @@ def process_dual_videos(blue_video_path: str, red_video_path: str, center_video_
     if red_video_path and enable_red_camera:
         progress(0.5, desc="Starting Red Camera processing...")
         try:
-            output_path, robot_tracks, tracks_by_frame, width, height, robot_stats, ferry_counts, disabled_statuses, shot_events, side_visible_robots = process_single_video(
+            output_path, robot_tracks, tracks_by_frame, width, height, robot_stats, ferry_counts, disabled_statuses, shot_events, side_visible_robots, center_score_ocr = process_single_video(
                 red_video_path,
                 "red",
                 target_fps,
@@ -6725,7 +7356,8 @@ def process_dual_videos(blue_video_path: str, red_video_path: str, center_video_
                 "Red Camera",
                 enable_person_detection=enable_person_detection,
                 side_box_points=red_side_box_points,
-                side_box_image_size=red_side_box_image_size
+                side_box_image_size=red_side_box_image_size,
+                highlight_ball_robot=highlight_ball_robot,
             )
             results['red'] = {
                 'output_path': output_path,
@@ -6737,7 +7369,8 @@ def process_dual_videos(blue_video_path: str, red_video_path: str, center_video_
                 'ferry_counts': ferry_counts,
                 'disabled_statuses': disabled_statuses,
                 'shot_events': shot_events,
-                'side_visible_robots': side_visible_robots
+                'side_visible_robots': side_visible_robots,
+                'center_score_ocr': center_score_ocr,
             }
         except Exception as e:
             import traceback
@@ -6749,7 +7382,7 @@ def process_dual_videos(blue_video_path: str, red_video_path: str, center_video_
     if center_video_path and enable_center_camera:
         progress(0.4, desc="Starting Center Camera processing...")
         try:
-            output_path, robot_tracks, tracks_by_frame, width, height, robot_stats, ferry_counts, disabled_statuses, shot_events, _ = process_single_video(
+            output_path, robot_tracks, tracks_by_frame, width, height, robot_stats, ferry_counts, disabled_statuses, shot_events, _, center_score_ocr = process_single_video(
                 center_video_path,
                 "center",
                 target_fps,
@@ -6768,7 +7401,8 @@ def process_dual_videos(blue_video_path: str, red_video_path: str, center_video_
                     'blue': results.get('blue', {}).get('side_visible_robots', {}),
                     'red': results.get('red', {}).get('side_visible_robots', {}),
                 },
-                show_unlabeled_robots=show_unlabeled_robots
+                show_unlabeled_robots=show_unlabeled_robots,
+                highlight_ball_robot=highlight_ball_robot,
             )
             results['center'] = {
                 'output_path': output_path,
@@ -6779,7 +7413,8 @@ def process_dual_videos(blue_video_path: str, red_video_path: str, center_video_
                 'robot_stats': robot_stats,
                 'ferry_counts': ferry_counts,
                 'disabled_statuses': disabled_statuses,
-                'shot_events': shot_events
+                'shot_events': shot_events,
+                'center_score_ocr': center_score_ocr,
             }
         except Exception as e:
             import traceback
@@ -6929,6 +7564,9 @@ def process_dual_videos(blue_video_path: str, red_video_path: str, center_video_
         deduped_count = len(deduped_events)
         if original_count != deduped_count:
             print(f"[DEDUP] Robot {robot_label}: {original_count} events -> {deduped_count} after dedup ({original_count - deduped_count} duplicates removed)")
+
+    center_score_ocr = results.get('center', {}).get('center_score_ocr')
+    merged_stats = _apply_ocr_score_correction(merged_stats, center_score_ocr, blue_robots, red_robots, all_shot_events=all_shot_events)
     
     # Get ferry counts from all cameras (ferry cycles complete per camera)
     blue_ferry = results.get('blue', {}).get('ferry_counts', {})
@@ -6980,19 +7618,18 @@ def process_dual_videos(blue_video_path: str, red_video_path: str, center_video_
             return result
         
         robot_data = stats[robot_label]
-        total = f"**{robot_data['made']}/{robot_data['attempts']} shots made**"
+        total = f"**{robot_data['made']} shots made**"
         
         # Add ferry count if any
         if ferry_count > 0:
             total += f" | **Ferried: {ferry_count}x**"
         
         # Build period table
-        rows = ["| Period | Made | Missed |", "|--------|------|--------|"]
+        rows = ["| Period | Made |", "|--------|------|"]
         for period_name, _, _ in MATCH_PERIODS:
             p = robot_data['by_period'].get(period_name, {'attempts': 0, 'made': 0})
-            missed = p['attempts'] - p['made']
             if p['attempts'] > 0:
-                rows.append(f"| {period_name} | {p['made']} | {missed} |")
+                rows.append(f"| {period_name} | {p['made']} |")
         
         if len(rows) == 2:  # Only header rows
             result = disabled_line + "\n\n"
@@ -7042,7 +7679,7 @@ def process_dual_videos(blue_video_path: str, red_video_path: str, center_video_
     )
 
 
-def process_manual_center_video(center_video_path: str = None, composite_video_path: str = None, target_fps: int = 3, start_seconds: float = 0, end_seconds: float = 0, blue_robot_1: str = "", blue_robot_2: str = "", blue_robot_3: str = "", red_robot_1: str = "", red_robot_2: str = "", red_robot_3: str = "", enable_fuel_detection: bool = True, calibration_points: list = None, calibration_image_size: tuple = None, manual_tracks_json: str = "", progress=gr.Progress()) -> tuple:
+def process_manual_center_video(center_video_path: str = None, composite_video_path: str = None, target_fps: int = 3, start_seconds: float = 0, end_seconds: float = 0, blue_robot_1: str = "", blue_robot_2: str = "", blue_robot_3: str = "", red_robot_1: str = "", red_robot_2: str = "", red_robot_3: str = "", enable_fuel_detection: bool = True, calibration_points: list = None, calibration_image_size: tuple = None, manual_tracks_json: str = "", highlight_ball_robot: str = "", progress=gr.Progress()) -> tuple:
     """
     Process only the center camera using human-provided robot tracks and SAM 3 ball detection.
     """
@@ -7058,7 +7695,7 @@ def process_manual_center_video(center_video_path: str = None, composite_video_p
     manual_robot_tracks = _parse_manual_robot_tracks_json(manual_tracks_json, blue_robots, red_robots)
 
     progress(0.05, desc="Processing center camera with manual robot tracks...")
-    center_output, robot_tracks, tracks_by_frame, width, height, _, ferry_counts, disabled_statuses, shot_events, _ = process_single_video(
+    center_output, robot_tracks, tracks_by_frame, width, height, _, ferry_counts, disabled_statuses, shot_events, _, center_score_ocr = process_single_video(
         center_video_path,
         "center",
         target_fps,
@@ -7076,6 +7713,7 @@ def process_manual_center_video(center_video_path: str = None, composite_video_p
         side_camera_visible_robots=None,
         show_unlabeled_robots=True,
         manual_robot_tracks=manual_robot_tracks,
+        highlight_ball_robot=highlight_ball_robot,
     )
 
     all_robot_labels = blue_robots + red_robots
@@ -7124,6 +7762,7 @@ def process_manual_center_video(center_video_path: str = None, composite_video_p
     progress(1.0, desc="Manual center-camera processing complete!")
 
     merged_stats = _build_stats_from_shot_events(shot_events)
+    merged_stats = _apply_ocr_score_correction(merged_stats, center_score_ocr, blue_robots, red_robots, all_shot_events=shot_events)
     robot_stats_markdowns = []
     for label in all_robot_labels:
         if label and label.strip():
@@ -7334,6 +7973,7 @@ MANUAL_TRACKER_HEAD = r"""
 <script>
 (() => {
   const MANUAL_TRACK_REACTION_SECONDS = 0.025;
+  const MANUAL_TRACK_SHOOTING_REACTION_REAL_SECONDS = 1.0;
   const MANUAL_TRACK_AUTO_SAMPLE_SECONDS = 0.04;
   const MANUAL_TRACK_PLAYING_POLL_MS = 40;
   const MANUAL_TRACK_SAMPLE_REPLACE_SECONDS = 0.02;
@@ -7382,12 +8022,17 @@ MANUAL_TRACKER_HEAD = r"""
       sourceSrc: null,
       activeSlotId: SLOT_ORDER[0].id,
       dragging: null,
+      dragPointerId: null,
+      dragInitialButtons: 0,
+      dragInitialButton: 0,
+      dragAlternateMode: false,
+      dragLastPoint: null,
       lastSnapshotTime: -1,
       playbackRate: 2.0,
       slots: {},
     };
     SLOT_ORDER.forEach((slot) => {
-      state.slots[slot.id] = { x: null, y: null, skipped: false, samples: [] };
+      state.slots[slot.id] = { x: null, y: null, shooting: false, skipped: false, samples: [] };
     });
 
     function getSlotLabel(slot) {
@@ -7413,42 +8058,64 @@ MANUAL_TRACKER_HEAD = r"""
       return Math.max(0, numericTime - leadSeconds);
     }
 
-    function getInterpolatedSlotPosition(slotId, rawTime) {
+    function getShootingActivationTime(rawTime) {
+      const numericTime = Number(rawTime) || 0;
+      const reverseSeconds = MANUAL_TRACK_SHOOTING_REACTION_REAL_SECONDS * state.playbackRate;
+      return Math.max(0, numericTime - reverseSeconds);
+    }
+
+    function getInterpolatedSlotState(slotId, rawTime) {
       const slotState = state.slots[slotId];
       if (!slotState || slotState.skipped || !slotState.samples.length) return null;
       const targetTime = getCompensatedTrackTime(rawTime);
       const samples = slotState.samples;
 
       if (targetTime <= samples[0].t) {
-        return { x: samples[0].x, y: samples[0].y };
+        return { x: samples[0].x, y: samples[0].y, shooting: !!samples[0].shooting };
       }
       if (targetTime >= samples[samples.length - 1].t) {
         const last = samples[samples.length - 1];
-        return { x: last.x, y: last.y };
+        return { x: last.x, y: last.y, shooting: !!last.shooting };
       }
 
+      let shootingSample = samples[0];
       for (let i = 1; i < samples.length; i += 1) {
         const prev = samples[i - 1];
         const next = samples[i];
-        if (targetTime <= next.t) {
+        if (targetTime < next.t) {
           const span = Math.max(next.t - prev.t, 1e-6);
           const alpha = (targetTime - prev.t) / span;
           return {
             x: prev.x + ((next.x - prev.x) * alpha),
             y: prev.y + ((next.y - prev.y) * alpha),
+            shooting: !!shootingSample.shooting,
           };
         }
+        shootingSample = next;
       }
 
       return null;
     }
 
     function syncSlotCursorToTime(slotId, rawTime) {
-      const interp = getInterpolatedSlotPosition(slotId, rawTime);
+      const interp = getInterpolatedSlotState(slotId, rawTime);
       if (!interp) return;
       const slotState = state.slots[slotId];
       slotState.x = interp.x;
       slotState.y = interp.y;
+      slotState.shooting = !!interp.shooting;
+    }
+
+    function isAlternatePointerMode(event) {
+      if ((Number(state.dragInitialButton) || 0) === 2 || (Number(event.button) || 0) === 2) {
+        return true;
+      }
+      const initialButtons = Number(state.dragInitialButtons) || 0;
+      const currentButtons = Number(event.buttons) || 0;
+      if (!initialButtons || !currentButtons) {
+        return !!state.dragAlternateMode;
+      }
+      return currentButtons !== initialButtons;
     }
 
     function toPayload() {
@@ -7462,6 +8129,7 @@ MANUAL_TRACKER_HEAD = r"""
             t: Number(sample.t.toFixed(3)),
             x: Number(sample.x.toFixed(1)),
             y: Number(sample.y.toFixed(1)),
+            shooting: !!sample.shooting,
           })),
         };
       });
@@ -7490,10 +8158,16 @@ MANUAL_TRACKER_HEAD = r"""
     function updateStatus() {
       const tracked = SLOT_ORDER.filter((slot) => !state.slots[slot.id].skipped && state.slots[slot.id].samples.length > 0).length;
       const skipped = SLOT_ORDER.filter((slot) => state.slots[slot.id].skipped).length;
+      const shootingNow = SLOT_ORDER.filter((slot) => {
+        if (state.slots[slot.id].skipped) return false;
+        const slotNow = getInterpolatedSlotState(slot.id, video.currentTime || 0);
+        return !!(slotNow && slotNow.shooting);
+      }).length;
       const total = SLOT_ORDER.length;
       const durationText = Number.isFinite(video.duration) ? `${video.duration.toFixed(1)}s` : "0.0s";
       const reactionLead = (MANUAL_TRACK_REACTION_SECONDS * state.playbackRate).toFixed(2).replace(/0+$/, "").replace(/\.$/, "");
-      status.textContent = `Track all 6 robots unless skipped. Active: ${tracked}/${total} tracked, ${skipped} skipped. Video duration: ${durationText}. Reaction lead: ${reactionLead}s.`;
+      const dragMode = state.dragging ? (state.dragAlternateMode ? "shooting" : "tracking") : "idle";
+      status.textContent = `Track all 6 robots unless skipped. Active: ${tracked}/${total} tracked, ${skipped} skipped, ${shootingNow} shooting now. Video duration: ${durationText}. Reaction lead: ${reactionLead}s. Drag mode: ${dragMode}.`;
     }
 
     function resizeCanvas() {
@@ -7550,7 +8224,7 @@ MANUAL_TRACKER_HEAD = r"""
 
         const point = sourceToCanvas(slotState.x, slotState.y);
         const radius = 7;
-        ctx.fillStyle = slot.color;
+        ctx.fillStyle = slotState.shooting ? "#f59e0b" : slot.color;
         ctx.beginPath();
         ctx.arc(point.x, point.y, radius, 0, Math.PI * 2);
         ctx.fill();
@@ -7588,7 +8262,10 @@ MANUAL_TRACKER_HEAD = r"""
           labelNode.textContent = slot.short;
         }
         if (countNode) {
-          countNode.textContent = slotState.skipped ? "Skipped" : `${slotState.samples.length} samples`;
+          const slotNow = getInterpolatedSlotState(slot.id, video.currentTime || 0);
+          countNode.textContent = slotState.skipped
+            ? "Skipped"
+            : `${slotState.samples.length} samples${slotNow && slotNow.shooting ? " | shooting now" : ""}`;
         }
         if (skipInput) {
           skipInput.checked = !!slotState.skipped;
@@ -7602,16 +8279,19 @@ MANUAL_TRACKER_HEAD = r"""
       time,
       x,
       y,
+      shooting = false,
+      compensatedTime = null,
       replaceWindow = MANUAL_TRACK_SAMPLE_REPLACE_SECONDS,
       rewriteForwardWindow = MANUAL_TRACK_FORWARD_REWRITE_SECONDS
     ) {
       const slotState = state.slots[slotId];
       if (!slotState || slotState.skipped) return;
-      const adjustedTime = getCompensatedTrackTime(time);
+      const adjustedTime = compensatedTime === null ? getCompensatedTrackTime(time) : Math.max(0, Number(compensatedTime) || 0);
       const entry = {
         t: Number(adjustedTime.toFixed(3)),
         x: Number(x.toFixed(1)),
         y: Number(y.toFixed(1)),
+        shooting: !!shooting,
       };
       if (rewriteForwardWindow > 0) {
         slotState.samples = slotState.samples.filter((sample) => {
@@ -7624,6 +8304,10 @@ MANUAL_TRACKER_HEAD = r"""
       for (let i = 0; i < slotState.samples.length; i += 1) {
         const sample = slotState.samples[i];
         if (Math.abs(sample.t - entry.t) <= replaceWindow) {
+          if (!!sample.shooting !== !!entry.shooting) {
+            entry.t = Number((Math.max(entry.t, sample.t) + 0.001).toFixed(3));
+            continue;
+          }
           slotState.samples[i] = entry;
           inserted = true;
           break;
@@ -7646,7 +8330,7 @@ MANUAL_TRACKER_HEAD = r"""
       state.lastSnapshotTime = time;
       const slotState = state.slots[state.activeSlotId];
       if (slotState && !slotState.skipped && slotState.x !== null && slotState.y !== null) {
-        recordSlotSample(state.activeSlotId, time, slotState.x, slotState.y);
+        recordSlotSample(state.activeSlotId, time, slotState.x, slotState.y, slotState.shooting);
       }
       syncHiddenField();
       refreshSlotCards();
@@ -7658,8 +8342,15 @@ MANUAL_TRACKER_HEAD = r"""
         const slotState = state.slots[slot.id];
         slotState.x = null;
         slotState.y = null;
+        slotState.shooting = false;
         slotState.samples = [];
       });
+      state.dragging = null;
+      state.dragPointerId = null;
+      state.dragInitialButtons = 0;
+      state.dragInitialButton = 0;
+      state.dragAlternateMode = false;
+      state.dragLastPoint = null;
       state.lastSnapshotTime = -1;
       syncHiddenField(true);
       refreshSlotCards();
@@ -7716,6 +8407,7 @@ MANUAL_TRACKER_HEAD = r"""
         const slotState = state.slots[slotId];
         slotState.x = null;
         slotState.y = null;
+        slotState.shooting = false;
         slotState.samples = [];
         syncHiddenField(true);
         refreshSlotCards();
@@ -7732,6 +8424,7 @@ MANUAL_TRACKER_HEAD = r"""
       if (slotState.skipped) {
         slotState.x = null;
         slotState.y = null;
+        slotState.shooting = false;
         slotState.samples = [];
       }
       syncHiddenField(true);
@@ -7776,7 +8469,12 @@ MANUAL_TRACKER_HEAD = r"""
       setPlaybackRate(state.playbackRate + 0.25);
     });
 
+    canvas.addEventListener("contextmenu", (event) => {
+      event.preventDefault();
+    });
+
     canvas.addEventListener("pointerdown", (event) => {
+      event.preventDefault();
       resizeCanvas();
       const rect = canvas.getBoundingClientRect();
       let hitSlotId = null;
@@ -7790,37 +8488,101 @@ MANUAL_TRACKER_HEAD = r"""
         }
       }
 
-      if (hitSlotId) {
-        state.activeSlotId = hitSlotId;
-        state.dragging = hitSlotId;
-        canvas.setPointerCapture(event.pointerId);
-      } else {
-        const point = pointerToSource(event);
-        const slotState = state.slots[state.activeSlotId];
-        slotState.skipped = false;
-        slotState.x = point.x;
-        slotState.y = point.y;
-        recordSlotSample(state.activeSlotId, video.currentTime || 0, point.x, point.y, MANUAL_TRACK_DRAG_REPLACE_SECONDS);
-        syncHiddenField(true);
-      }
+      if (hitSlotId) state.activeSlotId = hitSlotId;
+      const point = hitSlotId ? { x: activeSlotState.x, y: activeSlotState.y } : pointerToSource(event);
+      const slotState = state.slots[state.activeSlotId];
+      slotState.skipped = false;
+      slotState.x = point.x;
+      slotState.y = point.y;
+      state.dragging = state.activeSlotId;
+      state.dragPointerId = event.pointerId;
+      state.dragInitialButtons = Number(event.buttons) || 0;
+      state.dragInitialButton = Number(event.button) || 0;
+      state.dragAlternateMode = isAlternatePointerMode(event);
+      state.dragLastPoint = point;
+      slotState.shooting = state.dragAlternateMode;
+      const dragTime = video.currentTime || 0;
+      const activationTime = slotState.shooting ? getShootingActivationTime(dragTime) : null;
+      recordSlotSample(
+        state.activeSlotId,
+        dragTime,
+        point.x,
+        point.y,
+        slotState.shooting,
+        activationTime,
+        MANUAL_TRACK_DRAG_REPLACE_SECONDS
+      );
+      canvas.setPointerCapture(event.pointerId);
+      syncHiddenField(true);
 
       refreshSlotCards();
       drawOverlay();
     });
 
     canvas.addEventListener("pointermove", (event) => {
-      if (!state.dragging) return;
+      if (!state.dragging || event.pointerId !== state.dragPointerId) return;
+      event.preventDefault();
       const point = pointerToSource(event);
       const slotState = state.slots[state.dragging];
+      const wasShooting = !!slotState.shooting;
+      state.dragAlternateMode = isAlternatePointerMode(event);
+      state.dragLastPoint = point;
       slotState.x = point.x;
       slotState.y = point.y;
-      recordSlotSample(state.dragging, video.currentTime || 0, point.x, point.y, MANUAL_TRACK_DRAG_REPLACE_SECONDS);
+      slotState.shooting = state.dragAlternateMode;
+      const dragTime = video.currentTime || 0;
+      const activationTime = (!wasShooting && slotState.shooting) ? getShootingActivationTime(dragTime) : null;
+      recordSlotSample(
+        state.dragging,
+        dragTime,
+        point.x,
+        point.y,
+        slotState.shooting,
+        activationTime,
+        MANUAL_TRACK_DRAG_REPLACE_SECONDS
+      );
       syncHiddenField();
+      refreshSlotCards();
       drawOverlay();
     });
 
-    function stopDrag() {
+    function stopDrag(event) {
+      if (!state.dragging) return;
+      if (event && state.dragPointerId !== null && event.pointerId !== state.dragPointerId) return;
+      const slotId = state.dragging;
+      const slotState = state.slots[slotId];
+      const point = event ? pointerToSource(event) : state.dragLastPoint;
+      if (point) {
+        slotState.x = point.x;
+        slotState.y = point.y;
+      }
+      if (slotState) {
+        if (state.dragAlternateMode && point) {
+          recordSlotSample(
+            slotId,
+            (video.currentTime || 0) + 0.001,
+            point.x,
+            point.y,
+            false,
+            null,
+            0,
+            0
+          );
+        }
+        slotState.shooting = false;
+      }
+      if (event && canvas.hasPointerCapture && canvas.hasPointerCapture(event.pointerId)) {
+        canvas.releasePointerCapture(event.pointerId);
+      }
       state.dragging = null;
+      state.dragPointerId = null;
+      state.dragInitialButtons = 0;
+      state.dragInitialButton = 0;
+      state.dragAlternateMode = false;
+      state.dragLastPoint = null;
+      syncHiddenField(true);
+      refreshSlotCards();
+      drawOverlay();
     }
     canvas.addEventListener("pointerup", stopDrag);
     canvas.addEventListener("pointercancel", stopDrag);
@@ -7869,7 +8631,7 @@ MANUAL_TRACKER_HEAD = r"""
 
 MANUAL_TRACKER_HTML = """
 <div id="manual-center-tracker">
-  <p><strong>Manual Center Tracking</strong> — Keep the marker on the middle of each robot while the center video plays at 2x. Track all six robots unless you intentionally mark one as skipped.</p>
+  <p><strong>Manual Center Tracking</strong> — Keep the marker on the middle of each robot while the center video plays at 2x. Track all six robots unless you intentionally mark one as skipped. Hold the pen side button, switch pointer buttons mid-drag, or use right-click while dragging to mark that robot as shooting.</p>
   <div class="manual-tracker-toolbar">
     <button type="button" id="manual-tracker-play">Play / Pause</button>
     <button type="button" id="manual-tracker-restart">Restart</button>
@@ -7977,6 +8739,13 @@ def create_manual_demo():
                         label="End Time (seconds)",
                         info="Stop processing at this time (0 = process to end)"
                     )
+
+                highlight_ball_robot_dropdown = gr.Dropdown(
+                    choices=_build_ball_highlight_choices(["1768", "4909", "5962"], ["2342", "6328", "2877"]),
+                    value=BALL_HIGHLIGHT_ALL_OPTION,
+                    label="Ball Overlay Highlight",
+                    info="Only this robot's attributed balls stay fully colored in the annotated export."
+                )
 
                 manual_tracks_json = gr.Textbox(
                     label="Manual Track Cache",
@@ -8088,6 +8857,22 @@ def create_manual_demo():
             outputs=[calibration_points_state, calibration_status]
         )
 
+        manual_ball_highlight_inputs = [
+            blue_robot_1,
+            blue_robot_2,
+            blue_robot_3,
+            red_robot_1,
+            red_robot_2,
+            red_robot_3,
+            highlight_ball_robot_dropdown,
+        ]
+        for robot_input in manual_ball_highlight_inputs[:-1]:
+            robot_input.change(
+                fn=_update_ball_highlight_dropdown,
+                inputs=manual_ball_highlight_inputs,
+                outputs=[highlight_ball_robot_dropdown]
+            )
+
         process_btn.click(
             fn=process_manual_center_video,
             inputs=[
@@ -8106,6 +8891,7 @@ def create_manual_demo():
                 calibration_points_state,
                 calibration_image_size_state,
                 manual_tracks_json,
+                highlight_ball_robot_dropdown,
             ],
             outputs=[
                 center_video_output,
@@ -8120,12 +8906,12 @@ def create_manual_demo():
             js="""
             (centerVideoPath, compositeVideoPath, fps, startSeconds, endSeconds,
              blue1, blue2, blue3, red1, red2, red3, detectFuel,
-             calibrationPoints, calibrationImageSize, manualTracksJson) => {
+             calibrationPoints, calibrationImageSize, manualTracksJson, highlightBallRobot) => {
                 const synced = window.manualTrackerSync ? window.manualTrackerSync() : manualTracksJson;
                 return [
                     centerVideoPath, compositeVideoPath, fps, startSeconds, endSeconds,
                     blue1, blue2, blue3, red1, red2, red3, detectFuel,
-                    calibrationPoints, calibrationImageSize, synced
+                    calibrationPoints, calibrationImageSize, synced, highlightBallRobot
                 ];
             }
             """
@@ -8325,7 +9111,14 @@ def create_demo():
                         value=True,
                         info="Show bounding boxes for robots that couldn't be identified by team number"
                     )
-                
+
+                highlight_ball_robot_dropdown = gr.Dropdown(
+                    choices=_build_ball_highlight_choices(["1768", "4909", "5962"], ["2342", "6328", "2877"]),
+                    value=BALL_HIGHLIGHT_ALL_OPTION,
+                    label="Ball Overlay Highlight",
+                    info="Only this robot's attributed balls stay fully colored in the annotated export."
+                )
+
                 # Hidden placeholders to keep inputs list consistent
                 side_ref_image_input = gr.State(None)
                 center_ref_image_input = gr.State(None)
@@ -8514,11 +9307,27 @@ def create_demo():
             inputs=[],
             outputs=[calibration_points_state, calibration_status]
         )
-        
+
+        ball_highlight_inputs = [
+            blue_robot_1,
+            blue_robot_2,
+            blue_robot_3,
+            red_robot_1,
+            red_robot_2,
+            red_robot_3,
+            highlight_ball_robot_dropdown,
+        ]
+        for robot_input in ball_highlight_inputs[:-1]:
+            robot_input.change(
+                fn=_update_ball_highlight_dropdown,
+                inputs=ball_highlight_inputs,
+                outputs=[highlight_ball_robot_dropdown]
+            )
+
         # Connect the processing function
         process_btn.click(
             fn=process_dual_videos,
-            inputs=[blue_video_input, red_video_input, center_video_input, composite_video_input, fps_slider, start_seconds_input, end_seconds_input, blue_robot_1, blue_robot_2, blue_robot_3, red_robot_1, red_robot_2, red_robot_3, detect_robots_checkbox, detect_fuel_checkbox, side_ref_image_input, center_ref_image_input, enable_blue_cam, enable_center_cam, enable_red_cam, detect_people_checkbox, calibration_points_state, calibration_image_size_state, blue_side_box_points_state, blue_side_box_image_size_state, red_side_box_points_state, red_side_box_image_size_state, show_unlabeled_checkbox],
+            inputs=[blue_video_input, red_video_input, center_video_input, composite_video_input, fps_slider, start_seconds_input, end_seconds_input, blue_robot_1, blue_robot_2, blue_robot_3, red_robot_1, red_robot_2, red_robot_3, detect_robots_checkbox, detect_fuel_checkbox, side_ref_image_input, center_ref_image_input, enable_blue_cam, enable_center_cam, enable_red_cam, detect_people_checkbox, calibration_points_state, calibration_image_size_state, blue_side_box_points_state, blue_side_box_image_size_state, red_side_box_points_state, red_side_box_image_size_state, show_unlabeled_checkbox, highlight_ball_robot_dropdown],
             outputs=[
                 blue_video_output, red_video_output, center_video_output, map_video_output,
                 blue1_map, blue1_stats,

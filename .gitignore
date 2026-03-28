@@ -14,7 +14,7 @@ datasets/
 runs/
 
 # Ignore model weights
-sam3.pt
+sam3.1_multiplex.pt
 
 
 # Ignore images and videos (optional)
