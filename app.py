@@ -8029,6 +8029,7 @@ MANUAL_TRACKER_HEAD = r"""
       dragAlternateMode: false,
       dragLastPoint: null,
       dragLastClientPoint: null,
+      dragLastClientTime: null,
       lastSnapshotTime: -1,
       playbackRate: 2.0,
       slots: {},
@@ -8121,19 +8122,48 @@ MANUAL_TRACKER_HEAD = r"""
       }
       candidates.push(event);
 
+      const lastClientPoint = state.dragLastClientPoint;
+      const currentTime = Number(event && event.timeStamp);
+      const lastTime = Number(state.dragLastClientTime);
+      const deltaMs = Number.isFinite(currentTime) && Number.isFinite(lastTime)
+        ? Math.max(1, currentTime - lastTime)
+        : 16;
+      const maxJump = Math.max(
+        120,
+        Math.min(canvasRect.width, canvasRect.height) * 0.18,
+        deltaMs * 6
+      );
+
       for (let i = 0; i < candidates.length; i += 1) {
         const sample = candidates[i];
         if (!sample) continue;
         const clientX = Number(sample.clientX);
         const clientY = Number(sample.clientY);
+        const sampleButtons = Number(sample.buttons) || 0;
+        const samplePressure = Number(sample.pressure);
         if (!Number.isFinite(clientX) || !Number.isFinite(clientY)) continue;
         const withinExtendedBounds = clientX >= (canvasRect.left - maxOverflowX)
           && clientX <= (canvasRect.right + maxOverflowX)
           && clientY >= (canvasRect.top - maxOverflowY)
           && clientY <= (canvasRect.bottom + maxOverflowY);
-        if (withinExtendedBounds) {
-          return { x: clientX, y: clientY };
+        if (!withinExtendedBounds) continue;
+        if (
+          sample.pointerType === "pen"
+          && lastClientPoint
+          && sampleButtons === 0
+          && Number.isFinite(samplePressure)
+          && samplePressure <= 0
+        ) {
+          continue;
         }
+        if (lastClientPoint) {
+          const dx = clientX - lastClientPoint.x;
+          const dy = clientY - lastClientPoint.y;
+          if (((dx * dx) + (dy * dy)) > (maxJump * maxJump)) {
+            continue;
+          }
+        }
+        return { x: clientX, y: clientY };
       }
 
       return state.dragLastClientPoint
@@ -8259,6 +8289,7 @@ MANUAL_TRACKER_HEAD = r"""
           : { x: 0, y: 0 };
       }
       state.dragLastClientPoint = { x: clientPoint.x, y: clientPoint.y };
+      state.dragLastClientTime = Number(event && event.timeStamp) || state.dragLastClientTime;
       const canvasX = clientPoint.x - canvasRect.left;
       const canvasY = clientPoint.y - canvasRect.top;
       const localX = Math.min(displayed.width, Math.max(0, canvasX - displayed.offsetX));
@@ -8407,6 +8438,7 @@ MANUAL_TRACKER_HEAD = r"""
       state.dragAlternateMode = false;
       state.dragLastPoint = null;
       state.dragLastClientPoint = null;
+      state.dragLastClientTime = null;
       state.lastSnapshotTime = -1;
       syncHiddenField(true);
       refreshSlotCards();
@@ -8637,6 +8669,7 @@ MANUAL_TRACKER_HEAD = r"""
       state.dragAlternateMode = false;
       state.dragLastPoint = null;
       state.dragLastClientPoint = null;
+      state.dragLastClientTime = null;
       syncHiddenField(true);
       refreshSlotCards();
       drawOverlay();
