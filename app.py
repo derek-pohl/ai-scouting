@@ -8029,7 +8029,6 @@ MANUAL_TRACKER_HEAD = r"""
       dragAlternateMode: false,
       dragLastPoint: null,
       dragLastClientPoint: null,
-      dragLastClientTime: null,
       lastSnapshotTime: -1,
       playbackRate: 2.0,
       slots: {},
@@ -8113,6 +8112,9 @@ MANUAL_TRACKER_HEAD = r"""
       const canvasRect = canvas.getBoundingClientRect();
       const maxOverflowX = Math.max(48, canvasRect.width * 0.25);
       const maxOverflowY = Math.max(48, canvasRect.height * 0.25);
+      const cornerMarginX = Math.max(42, canvasRect.width * 0.08);
+      const cornerMarginY = Math.max(42, canvasRect.height * 0.08);
+      const suspiciousCornerJump = Math.max(90, Math.min(canvasRect.width, canvasRect.height) * 0.12);
       const candidates = [];
       if (event && typeof event.getCoalescedEvents === "function") {
         const coalesced = event.getCoalescedEvents();
@@ -8123,16 +8125,8 @@ MANUAL_TRACKER_HEAD = r"""
       candidates.push(event);
 
       const lastClientPoint = state.dragLastClientPoint;
-      const currentTime = Number(event && event.timeStamp);
-      const lastTime = Number(state.dragLastClientTime);
-      const deltaMs = Number.isFinite(currentTime) && Number.isFinite(lastTime)
-        ? Math.max(1, currentTime - lastTime)
-        : 16;
-      const maxJump = Math.max(
-        120,
-        Math.min(canvasRect.width, canvasRect.height) * 0.18,
-        deltaMs * 6
-      );
+      let bestCandidate = null;
+      let bestDistanceSq = Infinity;
 
       for (let i = 0; i < candidates.length; i += 1) {
         const sample = candidates[i];
@@ -8156,14 +8150,31 @@ MANUAL_TRACKER_HEAD = r"""
         ) {
           continue;
         }
+        let distanceSq = 0;
         if (lastClientPoint) {
           const dx = clientX - lastClientPoint.x;
           const dy = clientY - lastClientPoint.y;
-          if (((dx * dx) + (dy * dy)) > (maxJump * maxJump)) {
+          distanceSq = (dx * dx) + (dy * dy);
+          const nearLeft = clientX <= (canvasRect.left + cornerMarginX);
+          const nearRight = clientX >= (canvasRect.right - cornerMarginX);
+          const nearTop = clientY <= (canvasRect.top + cornerMarginY);
+          const nearBottom = clientY >= (canvasRect.bottom - cornerMarginY);
+          const nearCorner = (nearLeft || nearRight) && (nearTop || nearBottom);
+          if (nearCorner && distanceSq > (suspiciousCornerJump * suspiciousCornerJump)) {
             continue;
           }
         }
-        return { x: clientX, y: clientY };
+        if (!lastClientPoint) {
+          return { x: clientX, y: clientY };
+        }
+        if (distanceSq < bestDistanceSq) {
+          bestDistanceSq = distanceSq;
+          bestCandidate = { x: clientX, y: clientY };
+        }
+      }
+
+      if (bestCandidate) {
+        return bestCandidate;
       }
 
       return state.dragLastClientPoint
@@ -8289,7 +8300,6 @@ MANUAL_TRACKER_HEAD = r"""
           : { x: 0, y: 0 };
       }
       state.dragLastClientPoint = { x: clientPoint.x, y: clientPoint.y };
-      state.dragLastClientTime = Number(event && event.timeStamp) || state.dragLastClientTime;
       const canvasX = clientPoint.x - canvasRect.left;
       const canvasY = clientPoint.y - canvasRect.top;
       const localX = Math.min(displayed.width, Math.max(0, canvasX - displayed.offsetX));
@@ -8438,7 +8448,6 @@ MANUAL_TRACKER_HEAD = r"""
       state.dragAlternateMode = false;
       state.dragLastPoint = null;
       state.dragLastClientPoint = null;
-      state.dragLastClientTime = null;
       state.lastSnapshotTime = -1;
       syncHiddenField(true);
       refreshSlotCards();
@@ -8669,7 +8678,6 @@ MANUAL_TRACKER_HEAD = r"""
       state.dragAlternateMode = false;
       state.dragLastPoint = null;
       state.dragLastClientPoint = null;
-      state.dragLastClientTime = null;
       syncHiddenField(true);
       refreshSlotCards();
       drawOverlay();
