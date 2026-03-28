@@ -3942,9 +3942,10 @@ def draw_robot_paths(map_image_path: str, robot_tracks: dict, frame_width: int, 
         # Convert all positions to map coordinates
         map_positions = []
         for pos in positions:
-            # Handle 2-tuple (cx, cy), 3-tuple (cx, cy, side), and 4-tuple (cx, cy, side, bbox_area)
+            # Handle 2-tuple (cx, cy), 3-tuple (cx, cy, side), and longer tuples
+            # such as (cx, cy, side, bbox_area[, shooting]).
             if len(pos) >= 4:
-                cx, cy, side, _ = pos  # Ignore bbox_area for drawing
+                cx, cy, side = pos[:3]
             elif len(pos) == 3:
                 cx, cy, side = pos
             else:
@@ -4172,9 +4173,9 @@ def generate_map_video(map_image_path: str, robot_tracks_by_frame: list, frame_w
                 # Get alliance-based color for this robot
                 base_color = get_robot_color(robot_label, blue_robots, red_robots)
                 
-                # Handle 2-tuple, 3-tuple, and 4-tuple formats
+                # Handle 2-tuple, 3-tuple, and longer tuple formats.
                 if len(pos) >= 4:
-                    cx, cy, side, _ = pos  # Ignore bbox_area
+                    cx, cy, side = pos[:3]
                 elif len(pos) == 3:
                     cx, cy, side = pos
                 else:
@@ -4208,9 +4209,9 @@ def generate_map_video(map_image_path: str, robot_tracks_by_frame: list, frame_w
                     continue
                 if robot_label in robot_tracks_by_frame[trail_idx]:
                     pos = robot_tracks_by_frame[trail_idx][robot_label]
-                    # Handle 2-tuple, 3-tuple, and 4-tuple formats
+                    # Handle 2-tuple, 3-tuple, and longer tuple formats.
                     if len(pos) >= 4:
-                        cx, cy, side, _ = pos  # Ignore bbox_area
+                        cx, cy, side = pos[:3]
                     elif len(pos) == 3:
                         cx, cy, side = pos
                     else:
@@ -8027,6 +8028,7 @@ MANUAL_TRACKER_HEAD = r"""
       dragInitialButton: 0,
       dragAlternateMode: false,
       dragLastPoint: null,
+      dragLastClientPoint: null,
       lastSnapshotTime: -1,
       playbackRate: 2.0,
       slots: {},
@@ -8106,16 +8108,62 @@ MANUAL_TRACKER_HEAD = r"""
       slotState.shooting = !!interp.shooting;
     }
 
+    function getReliableClientPoint(event) {
+      const canvasRect = canvas.getBoundingClientRect();
+      const maxOverflowX = Math.max(48, canvasRect.width * 0.25);
+      const maxOverflowY = Math.max(48, canvasRect.height * 0.25);
+      const candidates = [];
+      if (event && typeof event.getCoalescedEvents === "function") {
+        const coalesced = event.getCoalescedEvents();
+        for (let i = coalesced.length - 1; i >= 0; i -= 1) {
+          candidates.push(coalesced[i]);
+        }
+      }
+      candidates.push(event);
+
+      for (let i = 0; i < candidates.length; i += 1) {
+        const sample = candidates[i];
+        if (!sample) continue;
+        const clientX = Number(sample.clientX);
+        const clientY = Number(sample.clientY);
+        if (!Number.isFinite(clientX) || !Number.isFinite(clientY)) continue;
+        const withinExtendedBounds = clientX >= (canvasRect.left - maxOverflowX)
+          && clientX <= (canvasRect.right + maxOverflowX)
+          && clientY >= (canvasRect.top - maxOverflowY)
+          && clientY <= (canvasRect.bottom + maxOverflowY);
+        if (withinExtendedBounds) {
+          return { x: clientX, y: clientY };
+        }
+      }
+
+      return state.dragLastClientPoint
+        ? { x: state.dragLastClientPoint.x, y: state.dragLastClientPoint.y }
+        : null;
+    }
+
+    function hasPenAlternateButtons(event) {
+      if (!event || event.pointerType !== "pen") return false;
+      const currentButtons = Number(event.buttons) || 0;
+      if ((currentButtons & ~1) !== 0) {
+        return true;
+      }
+      const currentButton = Number(event.button);
+      return Number.isFinite(currentButton) && currentButton > 0;
+    }
+
     function isAlternatePointerMode(event) {
       if ((Number(state.dragInitialButton) || 0) === 2 || (Number(event.button) || 0) === 2) {
         return true;
       }
+      if (hasPenAlternateButtons(event)) {
+        return true;
+      }
       const initialButtons = Number(state.dragInitialButtons) || 0;
       const currentButtons = Number(event.buttons) || 0;
-      if (!initialButtons || !currentButtons) {
-        return !!state.dragAlternateMode;
+      if (initialButtons && currentButtons && currentButtons !== initialButtons) {
+        return true;
       }
-      return currentButtons !== initialButtons;
+      return !!state.dragAlternateMode;
     }
 
     function toPayload() {
@@ -8204,8 +8252,15 @@ MANUAL_TRACKER_HEAD = r"""
     function pointerToSource(event) {
       const canvasRect = canvas.getBoundingClientRect();
       const displayed = getDisplayedVideoRect();
-      const canvasX = event.clientX - canvasRect.left;
-      const canvasY = event.clientY - canvasRect.top;
+      const clientPoint = getReliableClientPoint(event);
+      if (!clientPoint) {
+        return state.dragLastPoint
+          ? { x: state.dragLastPoint.x, y: state.dragLastPoint.y }
+          : { x: 0, y: 0 };
+      }
+      state.dragLastClientPoint = { x: clientPoint.x, y: clientPoint.y };
+      const canvasX = clientPoint.x - canvasRect.left;
+      const canvasY = clientPoint.y - canvasRect.top;
       const localX = Math.min(displayed.width, Math.max(0, canvasX - displayed.offsetX));
       const localY = Math.min(displayed.height, Math.max(0, canvasY - displayed.offsetY));
       return {
@@ -8351,6 +8406,7 @@ MANUAL_TRACKER_HEAD = r"""
       state.dragInitialButton = 0;
       state.dragAlternateMode = false;
       state.dragLastPoint = null;
+      state.dragLastClientPoint = null;
       state.lastSnapshotTime = -1;
       syncHiddenField(true);
       refreshSlotCards();
@@ -8580,6 +8636,7 @@ MANUAL_TRACKER_HEAD = r"""
       state.dragInitialButton = 0;
       state.dragAlternateMode = false;
       state.dragLastPoint = null;
+      state.dragLastClientPoint = null;
       syncHiddenField(true);
       refreshSlotCards();
       drawOverlay();
