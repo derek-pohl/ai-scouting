@@ -1317,10 +1317,25 @@ def _apply_ocr_score_correction(stats: dict, center_score_ocr: dict, blue_robots
         sam_total = sum(corrected[label]["made"] for label in participating_labels)
         ocr_total = max(0, int(ocr_total))
         ocr_events = list(ocr_data.get("events") or [])
+        positive_ocr_events = [
+            (float(event_time), max(0, int(delta or 0)), raw_total)
+            for event_time, delta, raw_total in ocr_events
+            if max(0, int(delta or 0)) > 0
+        ]
+        unique_marked_shooters = {
+            label
+            for event_time, _, _ in positive_ocr_events
+            for label in _get_marked_shooters_for_ocr_event(
+                shooting_snapshots,
+                alliance,
+                event_time,
+            )
+            if label in participating_labels
+        }
+        lone_marked_shooter = next(iter(unique_marked_shooters)) if len(unique_marked_shooters) == 1 else None
         has_relevant_manual_hints = any(
             _get_marked_shooters_for_ocr_event(shooting_snapshots, alliance, event_time)
-            for event_time, delta, _ in ocr_events
-            if max(0, int(delta or 0)) > 0
+            for event_time, _, _ in positive_ocr_events
         )
         if not has_relevant_manual_hints and (sam_total <= 0 or sam_total == ocr_total):
             continue
@@ -1337,10 +1352,7 @@ def _apply_ocr_score_correction(stats: dict, center_score_ocr: dict, blue_robots
             for label in participating_labels
         }
 
-        for event_time, delta, _ in ocr_events:
-            delta = max(0, int(delta or 0))
-            if delta <= 0:
-                continue
+        for event_time, delta, _ in positive_ocr_events:
             event_period = get_match_period(float(event_time))
             marked_shooters = [
                 label for label in _get_marked_shooters_for_ocr_event(
@@ -1378,6 +1390,11 @@ def _apply_ocr_score_correction(stats: dict, center_score_ocr: dict, blue_robots
                 )
             ]
             if not candidate_indices:
+                if lone_marked_shooter:
+                    scaled_makes[lone_marked_shooter] = scaled_makes.get(lone_marked_shooter, 0) + delta
+                    if event_period in scaled_period_makes.get(lone_marked_shooter, {}):
+                        scaled_period_makes[lone_marked_shooter][event_period] += delta
+                    continue
                 if allowed_labels:
                     sam_weights = Counter({
                         label: corrected[label]["made"]
@@ -1408,13 +1425,18 @@ def _apply_ocr_score_correction(stats: dict, center_score_ocr: dict, blue_robots
         allocated_total = sum(scaled_makes.values())
         remaining_total = max(0, ocr_total - allocated_total)
         if remaining_total > 0:
-            if remaining_event_indices:
+            if lone_marked_shooter:
+                scaled_makes[lone_marked_shooter] = scaled_makes.get(lone_marked_shooter, 0) + remaining_total
+            elif remaining_event_indices:
                 fallback_weights = Counter(alliance_events[idx][1] for idx in remaining_event_indices)
+                fallback_scaled = _allocate_proportional_integers(fallback_weights, remaining_total)
+                for label, amount in fallback_scaled.items():
+                    scaled_makes[label] = scaled_makes.get(label, 0) + int(amount)
             else:
                 fallback_weights = Counter({label: corrected[label]["made"] for label in participating_labels})
-            fallback_scaled = _allocate_proportional_integers(fallback_weights, remaining_total)
-            for label, amount in fallback_scaled.items():
-                scaled_makes[label] = scaled_makes.get(label, 0) + int(amount)
+                fallback_scaled = _allocate_proportional_integers(fallback_weights, remaining_total)
+                for label, amount in fallback_scaled.items():
+                    scaled_makes[label] = scaled_makes.get(label, 0) + int(amount)
 
         print(
             f"[Center Score OCR] {alliance.title()} alliance correction: "
@@ -6818,7 +6840,7 @@ def process_single_video(video_path: str, camera_side: str = "blue", target_fps:
                     overlay[current_person_mask > 0] = (128, 128, 128)  # Grey
                     blended = cv2.addWeighted(frame_np, 0.6, overlay, 0.4, 0)
                     annotated_frame = Image.fromarray(blended)
-                
+
                 annotated_frame = plot_bounding_boxes(
                     annotated_frame, 
                     render_bboxes_json, 
@@ -8385,18 +8407,19 @@ MANUAL_TRACKER_HEAD = r"""
     }
 
     function isAlternatePointerMode(event) {
-      if ((Number(state.dragInitialButton) || 0) === 2 || (Number(event.button) || 0) === 2) {
+      const currentButton = Number(event.button) || 0;
+      const currentButtons = Number(event.buttons) || 0;
+      if (currentButton === 2 || (currentButtons & 2) !== 0) {
         return true;
       }
       if (hasPenAlternateButtons(event)) {
         return true;
       }
       const initialButtons = Number(state.dragInitialButtons) || 0;
-      const currentButtons = Number(event.buttons) || 0;
       if (initialButtons && currentButtons && currentButtons !== initialButtons) {
         return true;
       }
-      return !!state.dragAlternateMode;
+      return false;
     }
 
     function toPayload() {
@@ -8844,6 +8867,30 @@ MANUAL_TRACKER_HEAD = r"""
       if (point) {
         slotState.x = point.x;
         slotState.y = point.y;
+        state.dragLastPoint = point;
+      }
+      if (event && event.type === "pointerup" && (Number(event.buttons) || 0) > 0) {
+        const wasShooting = !!slotState.shooting;
+        state.dragAlternateMode = isAlternatePointerMode(event);
+        slotState.shooting = state.dragAlternateMode;
+        if (point && wasShooting !== slotState.shooting) {
+          const dragTime = video.currentTime || 0;
+          const activationTime = slotState.shooting ? getShootingActivationTime(dragTime) : null;
+          recordSlotSample(
+            slotId,
+            dragTime,
+            point.x,
+            point.y,
+            slotState.shooting,
+            activationTime,
+            0,
+            0
+          );
+        }
+        syncHiddenField(true);
+        refreshSlotCards();
+        drawOverlay();
+        return;
       }
       if (slotState) {
         if (state.dragAlternateMode && point) {
@@ -8991,15 +9038,15 @@ def create_manual_demo():
 
                 gr.Markdown("### Blue Alliance")
                 with gr.Row():
-                    blue_robot_1 = gr.Textbox(label="Robot 1", value="1768", max_lines=1, elem_id="blue-robot-1-input")
-                    blue_robot_2 = gr.Textbox(label="Robot 2", value="4909", max_lines=1, elem_id="blue-robot-2-input")
-                    blue_robot_3 = gr.Textbox(label="Robot 3", value="5962", max_lines=1, elem_id="blue-robot-3-input")
+                    blue_robot_1 = gr.Textbox(label="Robot 1", value="1796", max_lines=1, elem_id="blue-robot-1-input")
+                    blue_robot_2 = gr.Textbox(label="Robot 2", value="250", max_lines=1, elem_id="blue-robot-2-input")
+                    blue_robot_3 = gr.Textbox(label="Robot 3", value="11331", max_lines=1, elem_id="blue-robot-3-input")
 
                 gr.Markdown("### Red Alliance")
                 with gr.Row():
-                    red_robot_1 = gr.Textbox(label="Robot 1", value="2342", max_lines=1, elem_id="red-robot-1-input")
-                    red_robot_2 = gr.Textbox(label="Robot 2", value="6328", max_lines=1, elem_id="red-robot-2-input")
-                    red_robot_3 = gr.Textbox(label="Robot 3", value="2877", max_lines=1, elem_id="red-robot-3-input")
+                    red_robot_1 = gr.Textbox(label="Robot 1", value="7759", max_lines=1, elem_id="red-robot-1-input")
+                    red_robot_2 = gr.Textbox(label="Robot 2", value="6621", max_lines=1, elem_id="red-robot-2-input")
+                    red_robot_3 = gr.Textbox(label="Robot 3", value="333", max_lines=1, elem_id="red-robot-3-input")
 
                 with gr.Row():
                     fps_slider = gr.Slider(
@@ -9298,19 +9345,19 @@ def create_demo():
                 with gr.Row():
                     blue_robot_1 = gr.Textbox(
                         label="Robot 1",
-                        value="1768",
+                        value="1796",
                         placeholder="e.g., 1919",
                         max_lines=1
                     )
                     blue_robot_2 = gr.Textbox(
                         label="Robot 2",
-                        value="4909",
+                        value="250",
                         placeholder="e.g., 334",
                         max_lines=1
                     )
                     blue_robot_3 = gr.Textbox(
                         label="Robot 3",
-                        value="5962",
+                        value="11331",
                         placeholder="e.g., 254",
                         max_lines=1
                     )
@@ -9319,19 +9366,19 @@ def create_demo():
                 with gr.Row():
                     red_robot_1 = gr.Textbox(
                         label="Robot 1",
-                        value="2342",
+                        value="7759",
                         placeholder="e.g., 118",
                         max_lines=1
                     )
                     red_robot_2 = gr.Textbox(
                         label="Robot 2",
-                        value="6328",
+                        value="6621",
                         placeholder="e.g., 973",
                         max_lines=1
                     )
                     red_robot_3 = gr.Textbox(
                         label="Robot 3",
-                        value="2877",
+                        value="333",
                         placeholder="e.g., 2056",
                         max_lines=1
                     )
