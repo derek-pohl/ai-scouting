@@ -343,25 +343,30 @@ def _download_youtube_video(youtube_url: str, progress=None) -> tuple:
     ffmpeg_exe = _ensure_ffmpeg_executable()
     download_dir = Path(tempfile.mkdtemp(prefix=YOUTUBE_DOWNLOAD_DIR_PREFIX))
 
-    ydl_opts = {
+    base_ydl_opts = {
         "noplaylist": True,
         "quiet": True,
         "no_warnings": True,
-        "outtmpl": str(download_dir / "%(title).180B [%(id)s].%(ext)s"),
-        "format": "bestvideo*[ext=mp4]+bestaudio[ext=m4a]/bestvideo*+bestaudio/best[ext=mp4]/best",
-        "merge_output_format": "mp4",
     }
     cookiefile = _get_ytdlp_cookiefile_path()
     if cookiefile:
-        ydl_opts["cookiefile"] = cookiefile
+        base_ydl_opts["cookiefile"] = cookiefile
         print(f"[YouTube Download] Using yt-dlp cookies from {cookiefile}")
     if ffmpeg_exe:
-        ydl_opts["ffmpeg_location"] = ffmpeg_exe
+        base_ydl_opts["ffmpeg_location"] = ffmpeg_exe
+
+    metadata_ydl_opts = dict(base_ydl_opts)
+    download_ydl_opts = dict(base_ydl_opts)
+    download_ydl_opts.update({
+        "outtmpl": str(download_dir / "%(title).180B [%(id)s].%(ext)s"),
+        "format": "bestvideo*[ext=mp4]+bestaudio[ext=m4a]/bestvideo*+bestaudio/best[ext=mp4]/best",
+        "merge_output_format": "mp4",
+    })
 
     if progress is not None:
         progress(0.05, desc="Fetching YouTube match metadata...")
 
-    with YoutubeDL(ydl_opts) as ydl:
+    with YoutubeDL(metadata_ydl_opts) as ydl:
         try:
             info = ydl.extract_info(url, download=False)
             metadata = _parse_youtube_match_metadata(
@@ -370,12 +375,12 @@ def _download_youtube_video(youtube_url: str, progress=None) -> tuple:
             )
             if progress is not None:
                 progress(0.12, desc=f"Starting download for {metadata.get('match_title') or 'YouTube match'}...")
-            ydl_opts["progress_hooks"] = [_build_youtube_progress_hook(progress, metadata.get("match_label") or metadata.get("match_title") or "YouTube match")]
+            download_ydl_opts["progress_hooks"] = [_build_youtube_progress_hook(progress, metadata.get("match_label") or metadata.get("match_title") or "YouTube match")]
         except Exception:
             _cleanup_managed_youtube_dir(download_dir)
             raise
 
-    with YoutubeDL(ydl_opts) as ydl:
+    with YoutubeDL(download_ydl_opts) as ydl:
         try:
             info = ydl.extract_info(url, download=True)
             video_path = _resolve_downloaded_video_path(info, download_dir, ydl=ydl)
