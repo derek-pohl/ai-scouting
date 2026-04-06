@@ -82,6 +82,401 @@ except Exception:
     pytesseract = None
     TesseractNotFoundError = RuntimeError
 
+YOUTUBE_URL_PATTERN = re.compile(r"(?i)^(https?://)?(www\.)?(youtube\.com|youtu\.be)/")
+VIDEO_SOURCE_EMPTY_STATUS = "*Upload a file or paste a YouTube link to begin.*"
+FIELD_CALIBRATION_CACHE_PATH = Path(__file__).parent / "field_calibration_cache.json"
+VIDEO_FILE_EXTENSIONS = {".mp4", ".mov", ".mkv", ".webm", ".avi", ".m4v"}
+
+
+def _clean_text(value: str) -> str:
+    """Collapse whitespace and trim user-facing text."""
+    return re.sub(r"\s+", " ", str(value or "").strip())
+
+
+def _normalize_regional_name(regional_name: str) -> str:
+    """Build a stable cache key for regional / event names."""
+    cleaned = _clean_text(regional_name).lower()
+    return re.sub(r"[^a-z0-9]+", " ", cleaned).strip()
+
+
+def _ensure_ffmpeg_executable() -> str:
+    """Return an FFmpeg executable path when available."""
+    ffmpeg_exe = shutil.which("ffmpeg")
+    if ffmpeg_exe is None:
+        try:
+            import static_ffmpeg
+            static_ffmpeg.add_paths()
+            ffmpeg_exe = shutil.which("ffmpeg")
+        except ImportError:
+            ffmpeg_exe = None
+    return ffmpeg_exe
+
+
+def _parse_match_title_and_regional(title: str) -> tuple:
+    """Split a match title into full title and trailing regional / event name."""
+    match_title = _clean_text(title)
+    if " - " in match_title:
+        _, regional_name = match_title.split(" - ", 1)
+        regional_name = _clean_text(regional_name)
+    else:
+        regional_name = ""
+    return match_title, regional_name
+
+
+def _parse_alliance_teams_from_description(description: str) -> dict:
+    """Extract blue / red alliance team numbers from a video description."""
+    teams_by_alliance = {"blue": ["", "", ""], "red": ["", "", ""]}
+    pattern = re.compile(
+        r"(?im)^\s*(red|blue)\s*\(teams?\s*([^)]+)\)\s*-\s*(\d+)\s*$"
+    )
+    for match in pattern.finditer(str(description or "")):
+        alliance = str(match.group(1)).strip().lower()
+        team_blob = str(match.group(2)).strip()
+        team_numbers = re.findall(r"\d+", team_blob)
+        if team_numbers:
+            padded = (team_numbers[:3] + ["", "", ""])[:3]
+            teams_by_alliance[alliance] = padded
+    return teams_by_alliance
+
+
+def _parse_youtube_match_metadata(title: str, description: str) -> dict:
+    """Parse the useful scouting metadata from a YouTube title / description."""
+    match_title, regional_name = _parse_match_title_and_regional(title)
+    alliance_teams = _parse_alliance_teams_from_description(description)
+    return {
+        "match_title": match_title,
+        "regional_name": regional_name,
+        "blue_robots": alliance_teams.get("blue", ["", "", ""]),
+        "red_robots": alliance_teams.get("red", ["", "", ""]),
+    }
+
+
+def _resolve_downloaded_video_path(info: dict, download_dir: Path, ydl=None) -> str:
+    """Locate the final downloaded video file from a yt-dlp run."""
+    candidates = []
+    if isinstance(info, dict):
+        for item in info.get("requested_downloads") or []:
+            if isinstance(item, dict):
+                candidates.append(item.get("filepath"))
+        candidates.append(info.get("_filename"))
+        if ydl is not None:
+            try:
+                candidates.append(ydl.prepare_filename(info))
+            except Exception:
+                pass
+
+    for candidate in candidates:
+        if candidate:
+            path = Path(candidate)
+            if path.exists() and path.suffix.lower() in VIDEO_FILE_EXTENSIONS:
+                return str(path)
+
+    for path in sorted(download_dir.glob("*"), key=lambda p: p.stat().st_mtime, reverse=True):
+        if path.is_file() and path.suffix.lower() in VIDEO_FILE_EXTENSIONS:
+            return str(path)
+
+    return ""
+
+
+def _download_youtube_video(youtube_url: str, progress=None) -> tuple:
+    """Download a YouTube match video and return its local path plus parsed metadata."""
+    url = str(youtube_url or "").strip()
+    if not url:
+        raise gr.Error("Please enter a YouTube URL.")
+    if not YOUTUBE_URL_PATTERN.search(url):
+        raise gr.Error("Please enter a valid YouTube URL.")
+
+    try:
+        from yt_dlp import YoutubeDL
+    except ImportError as exc:
+        raise gr.Error("yt-dlp is not installed. Please reinstall dependencies.") from exc
+
+    ffmpeg_exe = _ensure_ffmpeg_executable()
+    download_dir = Path(tempfile.mkdtemp(prefix="youtube_match_"))
+
+    ydl_opts = {
+        "noplaylist": True,
+        "quiet": True,
+        "no_warnings": True,
+        "outtmpl": str(download_dir / "%(title).180B [%(id)s].%(ext)s"),
+        "format": "bv*[ext=mp4]+ba[ext=m4a]/b[ext=mp4]/bv*+ba/b",
+        "merge_output_format": "mp4",
+    }
+    if ffmpeg_exe:
+        ydl_opts["ffmpeg_location"] = ffmpeg_exe
+
+    if progress is not None:
+        progress(0.05, desc="Fetching YouTube match metadata...")
+
+    with YoutubeDL(ydl_opts) as ydl:
+        info = ydl.extract_info(url, download=False)
+        metadata = _parse_youtube_match_metadata(
+            info.get("title", ""),
+            info.get("description", ""),
+        )
+        if progress is not None:
+            progress(0.35, desc=f"Downloading {metadata.get('match_title') or 'YouTube match'}...")
+        info = ydl.extract_info(url, download=True)
+        video_path = _resolve_downloaded_video_path(info, download_dir, ydl=ydl)
+
+    if not video_path:
+        raise gr.Error("The YouTube download completed, but the video file could not be found.")
+
+    metadata.update({
+        "match_title": _clean_text(info.get("title", metadata.get("match_title", ""))),
+        "regional_name": _clean_text(
+            _parse_match_title_and_regional(info.get("title", ""))[1] or metadata.get("regional_name", "")
+        ),
+    })
+    return video_path, metadata
+
+
+def _serialize_calibration_points(points: list, image_size: tuple) -> list:
+    """Persist calibration points as normalized coordinates."""
+    if not points or not image_size:
+        return []
+    img_w, img_h = image_size
+    if not img_w or not img_h:
+        return []
+
+    serialized = []
+    for point in points:
+        if not isinstance(point, (list, tuple)) or len(point) < 2:
+            continue
+        x = max(0.0, min(float(point[0]), float(img_w))) / float(img_w)
+        y = max(0.0, min(float(point[1]), float(img_h))) / float(img_h)
+        serialized.append([round(x, 6), round(y, 6)])
+    return serialized
+
+
+def _restore_calibration_points(points: list, image_size: tuple) -> list:
+    """Restore normalized calibration points into the current image size."""
+    if not points or not image_size:
+        return []
+    img_w, img_h = image_size
+    if not img_w or not img_h:
+        return []
+
+    restored = []
+    max_x = max(int(img_w) - 1, 0)
+    max_y = max(int(img_h) - 1, 0)
+    for point in points:
+        if not isinstance(point, (list, tuple)) or len(point) < 2:
+            continue
+        try:
+            x = min(max(int(round(float(point[0]) * float(img_w))), 0), max_x)
+            y = min(max(int(round(float(point[1]) * float(img_h))), 0), max_y)
+        except Exception:
+            continue
+        restored.append((x, y))
+    return restored
+
+
+def _load_field_calibration_cache() -> dict:
+    """Load cached field calibration data from disk."""
+    if not FIELD_CALIBRATION_CACHE_PATH.exists():
+        return {}
+    try:
+        return json.loads(FIELD_CALIBRATION_CACHE_PATH.read_text(encoding="utf-8"))
+    except Exception as exc:
+        print(f"[Calibration Cache] Failed to load cache: {exc}")
+        return {}
+
+
+def _save_field_calibration_cache(cache: dict) -> None:
+    """Atomically save cached field calibration data to disk."""
+    temp_path = FIELD_CALIBRATION_CACHE_PATH.with_suffix(".tmp")
+    temp_path.write_text(json.dumps(cache, indent=2, sort_keys=True), encoding="utf-8")
+    temp_path.replace(FIELD_CALIBRATION_CACHE_PATH)
+
+
+def _get_saved_regional_calibration(regional_name: str) -> dict:
+    """Return a cached calibration entry for the given regional / event name."""
+    cache_key = _normalize_regional_name(regional_name)
+    if not cache_key:
+        return {}
+    cache = _load_field_calibration_cache()
+    entry = cache.get(cache_key)
+    return entry if isinstance(entry, dict) else {}
+
+
+def _persist_regional_calibration(
+    regional_name: str,
+    calibration_points: list = None,
+    calibration_image_size: tuple = None,
+    blue_side_box_points: list = None,
+    blue_side_box_image_size: tuple = None,
+    red_side_box_points: list = None,
+    red_side_box_image_size: tuple = None,
+) -> bool:
+    """Save completed calibration details for a regional so future matches prefill."""
+    cache_key = _normalize_regional_name(regional_name)
+    display_name = _clean_text(regional_name)
+    if not cache_key or not display_name:
+        return False
+
+    cache = _load_field_calibration_cache()
+    entry = cache.get(cache_key, {})
+    if not isinstance(entry, dict):
+        entry = {}
+    entry["regional_name"] = display_name
+
+    updated = False
+    if calibration_points and calibration_image_size and len(calibration_points) >= CALIBRATION_REQUIRED_POINTS:
+        entry["center_points"] = _serialize_calibration_points(calibration_points, calibration_image_size)
+        updated = True
+    if blue_side_box_points and blue_side_box_image_size and len(blue_side_box_points) >= SIDE_CAMERA_BOX_POINT_COUNT:
+        entry["blue_side_points"] = _serialize_calibration_points(blue_side_box_points, blue_side_box_image_size)
+        updated = True
+    if red_side_box_points and red_side_box_image_size and len(red_side_box_points) >= SIDE_CAMERA_BOX_POINT_COUNT:
+        entry["red_side_points"] = _serialize_calibration_points(red_side_box_points, red_side_box_image_size)
+        updated = True
+
+    if not updated:
+        return False
+
+    cache[cache_key] = entry
+    _save_field_calibration_cache(cache)
+    print(f"[Calibration Cache] Saved calibration for {display_name}")
+    return True
+
+
+def _get_saved_calibration_points(regional_name: str, center_frame=None, blue_frame=None, red_frame=None) -> tuple:
+    """Restore any saved calibration points for the current extracted frames."""
+    entry = _get_saved_regional_calibration(regional_name)
+    if not entry:
+        return [], [], [], False
+
+    center_points = _restore_calibration_points(
+        entry.get("center_points", []),
+        center_frame.size if center_frame is not None else None,
+    )
+    blue_points = _restore_calibration_points(
+        entry.get("blue_side_points", []),
+        blue_frame.size if blue_frame is not None else None,
+    )
+    red_points = _restore_calibration_points(
+        entry.get("red_side_points", []),
+        red_frame.size if red_frame is not None else None,
+    )
+    return center_points, blue_points, red_points, bool(center_points or blue_points or red_points)
+
+
+def _prepare_composite_video_calibration_state(video_path: str, start_seconds: float = 0, regional_name: str = "") -> tuple:
+    """Extract preview frames and apply any saved calibration for the regional."""
+    if video_path is None:
+        return (
+            None, None, [], None, "*Upload a video to begin calibration*",
+            None, None, [], None, "*Upload a video to calibrate blue side boxes*",
+            None, None, [], None, "*Upload a video to calibrate red side boxes*",
+            False,
+        )
+
+    center_frame, blue_frame, red_frame = _extract_composite_calibration_frames(video_path, start_seconds or 0)
+    if center_frame is None:
+        return (
+            None, None, [], None, "Failed to extract frame from video",
+            None, None, [], None, "Failed to extract blue side frame",
+            None, None, [], None, "Failed to extract red side frame",
+            False,
+        )
+
+    center_points, blue_points, red_points, loaded_saved = _get_saved_calibration_points(
+        regional_name,
+        center_frame=center_frame,
+        blue_frame=blue_frame,
+        red_frame=red_frame,
+    )
+
+    center_image = _redraw_calibration_image(center_frame, center_points) if center_points else center_frame
+    blue_image = (
+        _redraw_side_calibration_image(blue_frame, blue_points, "blue")
+        if blue_frame is not None and blue_points else blue_frame
+    )
+    red_image = (
+        _redraw_side_calibration_image(red_frame, red_points, "red")
+        if red_frame is not None and red_points else red_frame
+    )
+    blue_status = _get_side_box_calibration_status_text("blue", len(blue_points)) if blue_frame is not None else "Failed to extract blue side frame"
+    red_status = _get_side_box_calibration_status_text("red", len(red_points)) if red_frame is not None else "Failed to extract red side frame"
+
+    return (
+        center_image, center_frame, center_points, center_frame.size, _get_calibration_status_text(len(center_points)),
+        blue_image, blue_frame, blue_points, (blue_frame.size if blue_frame is not None else None), blue_status,
+        red_image, red_frame, red_points, (red_frame.size if red_frame is not None else None), red_status,
+        loaded_saved,
+    )
+
+
+def _prepare_manual_video_calibration_state(video_path: str, start_seconds: float = 0, regional_name: str = "") -> tuple:
+    """Extract manual-mode calibration data and apply any saved regional calibration."""
+    if video_path is None:
+        return None, None, None, None, [], None, "*Upload a video to begin calibration*", "{}", False
+
+    center_frame, _, _ = _extract_composite_calibration_frames(video_path, start_seconds or 0)
+    if center_frame is None:
+        return None, None, None, None, [], None, "Failed to extract center calibration frame", "{}", False
+
+    center_video_path = extract_center_video_from_composite(video_path)
+    center_points, _, _, loaded_saved = _get_saved_calibration_points(
+        regional_name,
+        center_frame=center_frame,
+        blue_frame=None,
+        red_frame=None,
+    )
+    center_image = _redraw_calibration_image(center_frame, center_points) if center_points else center_frame
+    return (
+        center_video_path,
+        center_video_path,
+        center_image,
+        center_frame,
+        center_points,
+        center_frame.size,
+        _get_calibration_status_text(len(center_points)),
+        "{}",
+        loaded_saved,
+    )
+
+
+def _merge_prefilled_robot_numbers(prefilled: list, current_values: list) -> list:
+    """Overwrite robot numbers only when parsed metadata provides a value."""
+    merged = list(current_values or [])
+    while len(merged) < 3:
+        merged.append("")
+    for idx, value in enumerate((prefilled or [])[:3]):
+        cleaned = _clean_text(value)
+        if cleaned:
+            merged[idx] = cleaned
+    return merged[:3]
+
+
+def _format_video_source_status(source_label: str, regional_name: str = "", match_title: str = "",
+                                blue_robots: list = None, red_robots: list = None,
+                                calibration_loaded: bool = False) -> str:
+    """Build a short markdown summary for the current video source / metadata."""
+    lines = [f"**{source_label}**"]
+    regional_name = _clean_text(regional_name)
+    match_title = _clean_text(match_title)
+    blue_labels = _normalize_robot_numbers(blue_robots or [])
+    red_labels = _normalize_robot_numbers(red_robots or [])
+
+    if match_title:
+        lines.append(f"Match: {match_title}")
+    if regional_name:
+        lines.append(f"Regional: {regional_name}")
+    if blue_labels:
+        lines.append(f"Blue teams: {', '.join(blue_labels)}")
+    if red_labels:
+        lines.append(f"Red teams: {', '.join(red_labels)}")
+    if calibration_loaded and regional_name:
+        lines.append(f"Loaded saved calibration for {regional_name}.")
+    elif regional_name:
+        lines.append(f"No saved calibration found yet for {regional_name}.")
+    else:
+        lines.append("Enter a regional name to reuse saved calibration for uploaded files.")
+
+    return "  \n".join(lines)
+
 
 class RobotLabelTracker:
     """
@@ -7918,7 +8313,7 @@ def format_robot_stats_md(stats: dict, robot_label: str, ferry_counts: dict, dis
     return f"{disabled_line}\n\n{total}\n\n" + "\n".join(rows)
 
 
-def process_dual_videos(blue_video_path: str, red_video_path: str, center_video_path: str = None, composite_video_path: str = None, target_fps: int = 3, start_seconds: float = 0, end_seconds: float = 0, blue_robot_1: str = "", blue_robot_2: str = "", blue_robot_3: str = "", red_robot_1: str = "", red_robot_2: str = "", red_robot_3: str = "", enable_robot_detection: bool = True, enable_fuel_detection: bool = True, side_ref_image: Image.Image = None, center_ref_image: Image.Image = None, enable_blue_camera: bool = True, enable_center_camera: bool = True, enable_red_camera: bool = True, enable_person_detection: bool = True, calibration_points: list = None, calibration_image_size: tuple = None, blue_side_box_points: list = None, blue_side_box_image_size: tuple = None, red_side_box_points: list = None, red_side_box_image_size: tuple = None, show_unlabeled_robots: bool = True, highlight_ball_robot: str = "", progress=gr.Progress()) -> tuple:
+def process_dual_videos(blue_video_path: str, red_video_path: str, center_video_path: str = None, composite_video_path: str = None, target_fps: int = 3, start_seconds: float = 0, end_seconds: float = 0, blue_robot_1: str = "", blue_robot_2: str = "", blue_robot_3: str = "", red_robot_1: str = "", red_robot_2: str = "", red_robot_3: str = "", enable_robot_detection: bool = True, enable_fuel_detection: bool = True, side_ref_image: Image.Image = None, center_ref_image: Image.Image = None, enable_blue_camera: bool = True, enable_center_camera: bool = True, enable_red_camera: bool = True, enable_person_detection: bool = True, calibration_points: list = None, calibration_image_size: tuple = None, blue_side_box_points: list = None, blue_side_box_image_size: tuple = None, red_side_box_points: list = None, red_side_box_image_size: tuple = None, show_unlabeled_robots: bool = True, highlight_ball_robot: str = "", regional_name: str = "", progress=gr.Progress()) -> tuple:
     """
     Process blue, red, and center camera videos using bumper detection.
     
@@ -7953,6 +8348,16 @@ def process_dual_videos(blue_video_path: str, red_video_path: str, center_video_
     # Create separate lists for blue and red robots
     blue_robots = [blue_robot_1, blue_robot_2, blue_robot_3]
     red_robots = [red_robot_1, red_robot_2, red_robot_3]
+
+    _persist_regional_calibration(
+        regional_name,
+        calibration_points=calibration_points,
+        calibration_image_size=calibration_image_size,
+        blue_side_box_points=blue_side_box_points,
+        blue_side_box_image_size=blue_side_box_image_size,
+        red_side_box_points=red_side_box_points,
+        red_side_box_image_size=red_side_box_image_size,
+    )
     
     results = {}
     
@@ -8354,7 +8759,7 @@ def process_dual_videos(blue_video_path: str, red_video_path: str, center_video_
     )
 
 
-def process_manual_center_video(center_video_path: str = None, composite_video_path: str = None, target_fps: int = 3, start_seconds: float = 0, end_seconds: float = 0, blue_robot_1: str = "", blue_robot_2: str = "", blue_robot_3: str = "", red_robot_1: str = "", red_robot_2: str = "", red_robot_3: str = "", enable_fuel_detection: bool = True, calibration_points: list = None, calibration_image_size: tuple = None, manual_tracks_json: str = "", highlight_ball_robot: str = "", progress=gr.Progress()) -> tuple:
+def process_manual_center_video(center_video_path: str = None, composite_video_path: str = None, target_fps: int = 3, start_seconds: float = 0, end_seconds: float = 0, blue_robot_1: str = "", blue_robot_2: str = "", blue_robot_3: str = "", red_robot_1: str = "", red_robot_2: str = "", red_robot_3: str = "", enable_fuel_detection: bool = True, calibration_points: list = None, calibration_image_size: tuple = None, manual_tracks_json: str = "", highlight_ball_robot: str = "", regional_name: str = "", progress=gr.Progress()) -> tuple:
     """
     Process only the center camera using human-provided robot tracks and SAM 3 ball detection.
     """
@@ -8368,6 +8773,12 @@ def process_manual_center_video(center_video_path: str = None, composite_video_p
     blue_robots = [blue_robot_1, blue_robot_2, blue_robot_3]
     red_robots = [red_robot_1, red_robot_2, red_robot_3]
     manual_robot_tracks = _parse_manual_robot_tracks_json(manual_tracks_json, blue_robots, red_robots)
+
+    _persist_regional_calibration(
+        regional_name,
+        calibration_points=calibration_points,
+        calibration_image_size=calibration_image_size,
+    )
 
     progress(0.05, desc="Processing center camera with manual robot tracks...")
     center_output, robot_tracks, tracks_by_frame, width, height, _, ferry_counts, disabled_statuses, shot_events, shooting_snapshots, _, center_score_ocr = process_single_video(
@@ -9478,6 +9889,19 @@ def create_manual_demo():
                     sources=["upload"],
                 )
                 center_video_input = gr.State(None)
+                youtube_url_input = gr.Textbox(
+                    label="YouTube Match URL",
+                    placeholder="https://www.youtube.com/watch?v=...",
+                    max_lines=1,
+                )
+                with gr.Row():
+                    youtube_download_btn = gr.Button("Download YouTube Video")
+                    regional_input = gr.Textbox(
+                        label="Regional / Event",
+                        placeholder="Auto-filled from YouTube, or type it for uploads",
+                        max_lines=1,
+                    )
+                video_source_status = gr.Markdown(VIDEO_SOURCE_EMPTY_STATUS)
 
                 preview_source_video = gr.Video(
                     label="Center Preview Source",
@@ -9596,29 +10020,59 @@ def create_manual_demo():
                 red3_map = gr.Image(label="Red Robot 3 - Movement")
                 red3_stats = gr.Markdown("*Waiting for processing...*")
 
-        def handle_manual_video_upload(video_path, start_seconds):
-            if video_path is None:
-                return None, None, None, None, [], None, "*Upload a video to begin calibration*", "{}"
+        def handle_manual_video_upload(video_path, start_seconds, regional_name):
+            manual_state = _prepare_manual_video_calibration_state(video_path, start_seconds, regional_name)
+            loaded_saved = manual_state[-1]
+            status = VIDEO_SOURCE_EMPTY_STATUS if video_path is None else _format_video_source_status(
+                "Uploaded video ready.",
+                regional_name=regional_name,
+                calibration_loaded=loaded_saved,
+            )
+            return (*manual_state[:-1], status)
 
-            center_frame, _, _ = _extract_composite_calibration_frames(video_path, start_seconds or 0)
-            if center_frame is None:
-                return None, None, None, None, [], None, "Failed to extract center calibration frame", "{}"
-
-            center_video_path = extract_center_video_from_composite(video_path)
+        def handle_manual_youtube_download(youtube_url, start_seconds,
+                                           current_blue_1, current_blue_2, current_blue_3,
+                                           current_red_1, current_red_2, current_red_3,
+                                           current_highlight, current_regional,
+                                           progress=gr.Progress()):
+            video_path, metadata = _download_youtube_video(youtube_url, progress=progress)
+            merged_blue = _merge_prefilled_robot_numbers(
+                metadata.get("blue_robots", []),
+                [current_blue_1, current_blue_2, current_blue_3],
+            )
+            merged_red = _merge_prefilled_robot_numbers(
+                metadata.get("red_robots", []),
+                [current_red_1, current_red_2, current_red_3],
+            )
+            resolved_regional = _clean_text(metadata.get("regional_name") or current_regional)
+            manual_state = _prepare_manual_video_calibration_state(video_path, start_seconds, resolved_regional)
+            loaded_saved = manual_state[-1]
+            highlight_update = _update_ball_highlight_dropdown(
+                merged_blue[0], merged_blue[1], merged_blue[2],
+                merged_red[0], merged_red[1], merged_red[2],
+                current_highlight,
+            )
+            status = _format_video_source_status(
+                "YouTube video ready.",
+                regional_name=resolved_regional,
+                match_title=metadata.get("match_title", ""),
+                blue_robots=merged_blue,
+                red_robots=merged_red,
+                calibration_loaded=loaded_saved,
+            )
             return (
-                center_video_path,
-                center_video_path,
-                center_frame,
-                center_frame,
-                [],
-                center_frame.size,
-                _get_calibration_status_text(0),
-                "{}",
+                video_path,
+                *manual_state[:-1],
+                merged_blue[0], merged_blue[1], merged_blue[2],
+                merged_red[0], merged_red[1], merged_red[2],
+                resolved_regional,
+                highlight_update,
+                status,
             )
 
         composite_video_input.change(
             fn=handle_manual_video_upload,
-            inputs=[composite_video_input, start_seconds_input],
+            inputs=[composite_video_input, start_seconds_input, regional_input],
             outputs=[
                 preview_source_video,
                 center_video_input,
@@ -9628,20 +10082,114 @@ def create_manual_demo():
                 calibration_image_size_state,
                 calibration_status,
                 manual_tracks_json,
+                video_source_status,
             ]
         )
 
-        def handle_image_click(base_image, clicked_points, evt: gr.SelectData):
+        regional_input.change(
+            fn=handle_manual_video_upload,
+            inputs=[composite_video_input, start_seconds_input, regional_input],
+            outputs=[
+                preview_source_video,
+                center_video_input,
+                calibration_image,
+                calibration_base_image,
+                calibration_points_state,
+                calibration_image_size_state,
+                calibration_status,
+                manual_tracks_json,
+                video_source_status,
+            ]
+        )
+
+        youtube_download_btn.click(
+            fn=handle_manual_youtube_download,
+            inputs=[
+                youtube_url_input,
+                start_seconds_input,
+                blue_robot_1,
+                blue_robot_2,
+                blue_robot_3,
+                red_robot_1,
+                red_robot_2,
+                red_robot_3,
+                highlight_ball_robot_dropdown,
+                regional_input,
+            ],
+            outputs=[
+                composite_video_input,
+                preview_source_video,
+                center_video_input,
+                calibration_image,
+                calibration_base_image,
+                calibration_points_state,
+                calibration_image_size_state,
+                calibration_status,
+                manual_tracks_json,
+                blue_robot_1,
+                blue_robot_2,
+                blue_robot_3,
+                red_robot_1,
+                red_robot_2,
+                red_robot_3,
+                regional_input,
+                highlight_ball_robot_dropdown,
+                video_source_status,
+            ]
+        )
+
+        youtube_url_input.submit(
+            fn=handle_manual_youtube_download,
+            inputs=[
+                youtube_url_input,
+                start_seconds_input,
+                blue_robot_1,
+                blue_robot_2,
+                blue_robot_3,
+                red_robot_1,
+                red_robot_2,
+                red_robot_3,
+                highlight_ball_robot_dropdown,
+                regional_input,
+            ],
+            outputs=[
+                composite_video_input,
+                preview_source_video,
+                center_video_input,
+                calibration_image,
+                calibration_base_image,
+                calibration_points_state,
+                calibration_image_size_state,
+                calibration_status,
+                manual_tracks_json,
+                blue_robot_1,
+                blue_robot_2,
+                blue_robot_3,
+                red_robot_1,
+                red_robot_2,
+                red_robot_3,
+                regional_input,
+                highlight_ball_robot_dropdown,
+                video_source_status,
+            ]
+        )
+
+        def handle_image_click(base_image, clicked_points, regional_name, evt: gr.SelectData):
             if base_image is None:
                 return None, clicked_points, "Upload a video first"
             x, y = evt.index
             clicked_points = list(clicked_points) + [(x, y)]
+            _persist_regional_calibration(
+                regional_name,
+                calibration_points=clicked_points,
+                calibration_image_size=base_image.size,
+            )
             annotated = _redraw_calibration_image(base_image, clicked_points)
             return annotated, clicked_points, _get_calibration_status_text(len(clicked_points))
 
         calibration_image.select(
             fn=handle_image_click,
-            inputs=[calibration_base_image, calibration_points_state],
+            inputs=[calibration_base_image, calibration_points_state, regional_input],
             outputs=[calibration_image, calibration_points_state, calibration_status]
         )
 
@@ -9699,6 +10247,7 @@ def create_manual_demo():
                 calibration_image_size_state,
                 manual_tracks_json,
                 highlight_ball_robot_dropdown,
+                regional_input,
             ],
             outputs=[
                 center_video_output,
@@ -9713,12 +10262,12 @@ def create_manual_demo():
             js="""
             (centerVideoPath, compositeVideoPath, fps, startSeconds, endSeconds,
              blue1, blue2, blue3, red1, red2, red3, detectFuel,
-             calibrationPoints, calibrationImageSize, manualTracksJson, highlightBallRobot) => {
+             calibrationPoints, calibrationImageSize, manualTracksJson, highlightBallRobot, regionalName) => {
                 const synced = window.manualTrackerSync ? window.manualTrackerSync() : manualTracksJson;
                 return [
                     centerVideoPath, compositeVideoPath, fps, startSeconds, endSeconds,
                     blue1, blue2, blue3, red1, red2, red3, detectFuel,
-                    calibrationPoints, calibrationImageSize, synced, highlightBallRobot
+                    calibrationPoints, calibrationImageSize, synced, highlightBallRobot, regionalName
                 ];
             }
             """
@@ -9741,6 +10290,20 @@ def create_demo():
                     sources=["upload"],
                 )
                 
+                youtube_url_input = gr.Textbox(
+                    label="YouTube Match URL",
+                    placeholder="https://www.youtube.com/watch?v=...",
+                    max_lines=1,
+                )
+                with gr.Row():
+                    youtube_download_btn = gr.Button("Download YouTube Video")
+                    regional_input = gr.Textbox(
+                        label="Regional / Event",
+                        placeholder="Auto-filled from YouTube, or type it for uploads",
+                        max_lines=1,
+                    )
+                video_source_status = gr.Markdown(VIDEO_SOURCE_EMPTY_STATUS)
+
                 # Hidden placeholders for individual camera paths (not shown in UI)
                 blue_video_input = gr.State(None)
                 center_video_input = gr.State(None)
@@ -9980,41 +10543,142 @@ def create_demo():
         
         # --- Calibration Event Wiring ---
         
-        def handle_video_upload(video_path, start_seconds):
-            """Extract calibration frame when video is uploaded."""
-            if video_path is None:
-                return (
-                    None, None, [], None, "*Upload a video to begin calibration*",
-                    None, None, [], None, "*Upload a video to calibrate blue side boxes*",
-                    None, None, [], None, "*Upload a video to calibrate red side boxes*"
-                )
-            center_frame, blue_frame, red_frame = _extract_composite_calibration_frames(video_path, start_seconds or 0)
-            if center_frame is None:
-                return (
-                    None, None, [], None, "Failed to extract frame from video",
-                    None, None, [], None, "Failed to extract blue side frame",
-                    None, None, [], None, "Failed to extract red side frame"
-                )
+        def handle_video_upload(video_path, start_seconds, regional_name):
+            """Extract calibration frames and apply any saved regional calibration."""
+            calibration_state = _prepare_composite_video_calibration_state(video_path, start_seconds, regional_name)
+            loaded_saved = calibration_state[-1]
+            status = VIDEO_SOURCE_EMPTY_STATUS if video_path is None else _format_video_source_status(
+                "Uploaded video ready.",
+                regional_name=regional_name,
+                calibration_loaded=loaded_saved,
+            )
+            return (*calibration_state[:-1], status)
 
-            blue_status = _get_side_box_calibration_status_text("blue", 0) if blue_frame is not None else "Failed to extract blue side frame"
-            red_status = _get_side_box_calibration_status_text("red", 0) if red_frame is not None else "Failed to extract red side frame"
+        def handle_youtube_download(youtube_url, start_seconds,
+                                    current_blue_1, current_blue_2, current_blue_3,
+                                    current_red_1, current_red_2, current_red_3,
+                                    current_highlight, current_regional,
+                                    progress=gr.Progress()):
+            video_path, metadata = _download_youtube_video(youtube_url, progress=progress)
+            merged_blue = _merge_prefilled_robot_numbers(
+                metadata.get("blue_robots", []),
+                [current_blue_1, current_blue_2, current_blue_3],
+            )
+            merged_red = _merge_prefilled_robot_numbers(
+                metadata.get("red_robots", []),
+                [current_red_1, current_red_2, current_red_3],
+            )
+            resolved_regional = _clean_text(metadata.get("regional_name") or current_regional)
+            calibration_state = _prepare_composite_video_calibration_state(video_path, start_seconds, resolved_regional)
+            loaded_saved = calibration_state[-1]
+            highlight_update = _update_ball_highlight_dropdown(
+                merged_blue[0], merged_blue[1], merged_blue[2],
+                merged_red[0], merged_red[1], merged_red[2],
+                current_highlight,
+            )
+            status = _format_video_source_status(
+                "YouTube video ready.",
+                regional_name=resolved_regional,
+                match_title=metadata.get("match_title", ""),
+                blue_robots=merged_blue,
+                red_robots=merged_red,
+                calibration_loaded=loaded_saved,
+            )
             return (
-                center_frame, center_frame, [], center_frame.size, _get_calibration_status_text(0),
-                blue_frame, blue_frame, [], (blue_frame.size if blue_frame is not None else None), blue_status,
-                red_frame, red_frame, [], (red_frame.size if red_frame is not None else None), red_status
+                video_path,
+                *calibration_state[:-1],
+                merged_blue[0], merged_blue[1], merged_blue[2],
+                merged_red[0], merged_red[1], merged_red[2],
+                resolved_regional,
+                highlight_update,
+                status,
             )
         
         composite_video_input.change(
             fn=handle_video_upload,
-            inputs=[composite_video_input, start_seconds_input],
+            inputs=[composite_video_input, start_seconds_input, regional_input],
             outputs=[
                 calibration_image, calibration_base_image, calibration_points_state, calibration_image_size_state, calibration_status,
                 blue_side_calibration_image, blue_side_base_image, blue_side_box_points_state, blue_side_box_image_size_state, blue_side_status,
                 red_side_calibration_image, red_side_base_image, red_side_box_points_state, red_side_box_image_size_state, red_side_status,
+                video_source_status,
+            ]
+        )
+
+        regional_input.change(
+            fn=handle_video_upload,
+            inputs=[composite_video_input, start_seconds_input, regional_input],
+            outputs=[
+                calibration_image, calibration_base_image, calibration_points_state, calibration_image_size_state, calibration_status,
+                blue_side_calibration_image, blue_side_base_image, blue_side_box_points_state, blue_side_box_image_size_state, blue_side_status,
+                red_side_calibration_image, red_side_base_image, red_side_box_points_state, red_side_box_image_size_state, red_side_status,
+                video_source_status,
+            ]
+        )
+
+        youtube_download_btn.click(
+            fn=handle_youtube_download,
+            inputs=[
+                youtube_url_input,
+                start_seconds_input,
+                blue_robot_1,
+                blue_robot_2,
+                blue_robot_3,
+                red_robot_1,
+                red_robot_2,
+                red_robot_3,
+                highlight_ball_robot_dropdown,
+                regional_input,
+            ],
+            outputs=[
+                composite_video_input,
+                calibration_image, calibration_base_image, calibration_points_state, calibration_image_size_state, calibration_status,
+                blue_side_calibration_image, blue_side_base_image, blue_side_box_points_state, blue_side_box_image_size_state, blue_side_status,
+                red_side_calibration_image, red_side_base_image, red_side_box_points_state, red_side_box_image_size_state, red_side_status,
+                blue_robot_1,
+                blue_robot_2,
+                blue_robot_3,
+                red_robot_1,
+                red_robot_2,
+                red_robot_3,
+                regional_input,
+                highlight_ball_robot_dropdown,
+                video_source_status,
+            ]
+        )
+
+        youtube_url_input.submit(
+            fn=handle_youtube_download,
+            inputs=[
+                youtube_url_input,
+                start_seconds_input,
+                blue_robot_1,
+                blue_robot_2,
+                blue_robot_3,
+                red_robot_1,
+                red_robot_2,
+                red_robot_3,
+                highlight_ball_robot_dropdown,
+                regional_input,
+            ],
+            outputs=[
+                composite_video_input,
+                calibration_image, calibration_base_image, calibration_points_state, calibration_image_size_state, calibration_status,
+                blue_side_calibration_image, blue_side_base_image, blue_side_box_points_state, blue_side_box_image_size_state, blue_side_status,
+                red_side_calibration_image, red_side_base_image, red_side_box_points_state, red_side_box_image_size_state, red_side_status,
+                blue_robot_1,
+                blue_robot_2,
+                blue_robot_3,
+                red_robot_1,
+                red_robot_2,
+                red_robot_3,
+                regional_input,
+                highlight_ball_robot_dropdown,
+                video_source_status,
             ]
         )
         
-        def handle_image_click(base_image, clicked_points, evt: gr.SelectData):
+        def handle_image_click(base_image, clicked_points, regional_name, evt: gr.SelectData):
             if base_image is None:
                 return None, clicked_points, "Upload a video first"
             x, y = evt.index
@@ -10023,6 +10687,11 @@ def create_demo():
             img_w, img_h = base_image.size
             print(f"[Calibration UI] Click #{n+1} ({label}): raw=({x}, {y}), base_image_size=({img_w}x{img_h})")
             clicked_points = list(clicked_points) + [(x, y)]
+            _persist_regional_calibration(
+                regional_name,
+                calibration_points=clicked_points,
+                calibration_image_size=base_image.size,
+            )
             n = len(clicked_points)
             annotated = _redraw_calibration_image(base_image, clicked_points)
             status = _get_calibration_status_text(n)
@@ -10035,11 +10704,11 @@ def create_demo():
         
         calibration_image.select(
             fn=handle_image_click,
-            inputs=[calibration_base_image, calibration_points_state],
+            inputs=[calibration_base_image, calibration_points_state, regional_input],
             outputs=[calibration_image, calibration_points_state, calibration_status]
         )
 
-        def handle_side_box_click(base_image, clicked_points, camera_side, evt: gr.SelectData):
+        def handle_side_box_click(base_image, clicked_points, camera_side, regional_name, evt: gr.SelectData):
             if base_image is None:
                 return None, clicked_points, "Upload a video first"
             x, y = evt.index
@@ -10050,18 +10719,30 @@ def create_demo():
             label = _get_side_box_point_labels(camera_side)[n]
             print(f"[Side Box UI] {camera_side} click #{n+1} ({label}): raw=({x}, {y})")
             clicked_points = list(clicked_points) + [(x, y)]
+            if camera_side == "blue":
+                _persist_regional_calibration(
+                    regional_name,
+                    blue_side_box_points=clicked_points,
+                    blue_side_box_image_size=base_image.size,
+                )
+            else:
+                _persist_regional_calibration(
+                    regional_name,
+                    red_side_box_points=clicked_points,
+                    red_side_box_image_size=base_image.size,
+                )
             annotated = _redraw_side_calibration_image(base_image, clicked_points, camera_side)
             return annotated, clicked_points, _get_side_box_calibration_status_text(camera_side, len(clicked_points))
 
         blue_side_calibration_image.select(
             fn=handle_side_box_click,
-            inputs=[blue_side_base_image, blue_side_box_points_state, blue_side_name_state],
+            inputs=[blue_side_base_image, blue_side_box_points_state, blue_side_name_state, regional_input],
             outputs=[blue_side_calibration_image, blue_side_box_points_state, blue_side_status]
         )
 
         red_side_calibration_image.select(
             fn=handle_side_box_click,
-            inputs=[red_side_base_image, red_side_box_points_state, red_side_name_state],
+            inputs=[red_side_base_image, red_side_box_points_state, red_side_name_state, regional_input],
             outputs=[red_side_calibration_image, red_side_box_points_state, red_side_status]
         )
         
@@ -10134,7 +10815,7 @@ def create_demo():
         # Connect the processing function
         process_btn.click(
             fn=process_dual_videos,
-            inputs=[blue_video_input, red_video_input, center_video_input, composite_video_input, fps_slider, start_seconds_input, end_seconds_input, blue_robot_1, blue_robot_2, blue_robot_3, red_robot_1, red_robot_2, red_robot_3, detect_robots_checkbox, detect_fuel_checkbox, side_ref_image_input, center_ref_image_input, enable_blue_cam, enable_center_cam, enable_red_cam, detect_people_checkbox, calibration_points_state, calibration_image_size_state, blue_side_box_points_state, blue_side_box_image_size_state, red_side_box_points_state, red_side_box_image_size_state, show_unlabeled_checkbox, highlight_ball_robot_dropdown],
+            inputs=[blue_video_input, red_video_input, center_video_input, composite_video_input, fps_slider, start_seconds_input, end_seconds_input, blue_robot_1, blue_robot_2, blue_robot_3, red_robot_1, red_robot_2, red_robot_3, detect_robots_checkbox, detect_fuel_checkbox, side_ref_image_input, center_ref_image_input, enable_blue_cam, enable_center_cam, enable_red_cam, detect_people_checkbox, calibration_points_state, calibration_image_size_state, blue_side_box_points_state, blue_side_box_image_size_state, red_side_box_points_state, red_side_box_image_size_state, show_unlabeled_checkbox, highlight_ball_robot_dropdown, regional_input],
             outputs=[
                 blue_video_output, red_video_output, center_video_output, map_video_output,
                 blue1_map, blue1_stats,

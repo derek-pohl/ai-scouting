@@ -7,3 +7,4 @@ python-dotenv
 google-genai
 ultralytics
 static-ffmpeg
+yt-dlp
