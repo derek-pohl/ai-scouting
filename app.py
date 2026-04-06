@@ -348,7 +348,7 @@ def _download_youtube_video(youtube_url: str, progress=None) -> tuple:
         "quiet": True,
         "no_warnings": True,
         "outtmpl": str(download_dir / "%(title).180B [%(id)s].%(ext)s"),
-        "format": "bv*[ext=mp4]+ba[ext=m4a]/b[ext=mp4]/bv*+ba/b",
+        "format": "bestvideo*[ext=mp4]+bestaudio[ext=m4a]/bestvideo*+bestaudio/best[ext=mp4]/best",
         "merge_output_format": "mp4",
     }
     cookiefile = _get_ytdlp_cookiefile_path()
