@@ -101,6 +101,23 @@ except Exception:
     pytesseract = None
     TesseractNotFoundError = RuntimeError
 
+if pytesseract is not None:
+    try:
+        detected_tesseract = shutil.which("tesseract")
+        if not detected_tesseract:
+            candidate_paths = [
+                Path("C:/Program Files/Tesseract-OCR/tesseract.exe"),
+                Path("C:/Program Files (x86)/Tesseract-OCR/tesseract.exe"),
+            ]
+            detected_tesseract = next((str(path) for path in candidate_paths if path.exists()), "")
+        if detected_tesseract:
+            pytesseract.pytesseract.tesseract_cmd = str(detected_tesseract)
+            print(f"Tesseract executable configured: {detected_tesseract}")
+        else:
+            print("Tesseract executable not found on PATH or in standard install locations")
+    except Exception as e:
+        print(f"Failed to configure Tesseract executable: {e}")
+
 YOUTUBE_URL_PATTERN = re.compile(r"(?i)^(https?://)?(www\.)?(youtube\.com|youtu\.be)/")
 VIDEO_SOURCE_EMPTY_STATUS = "*Upload a file or paste a YouTube link to begin.*"
 FIELD_CALIBRATION_CACHE_PATH = Path(__file__).parent / "field_calibration_cache.json"
@@ -1621,6 +1638,10 @@ CENTER_SCORE_OCR_SAMPLE_FPS = 5.0
 CENTER_SCORE_OCR_MIN_CONFIRMATIONS = 2
 CENTER_SCORE_OCR_EVENT_WINDOW_SECONDS = 4.0
 CENTER_SCORE_OCR_POST_ROLL_SECONDS = 4.0
+CENTER_SCORE_OCR_ATTRIBUTION_MIN_LAG_SECONDS = 1.0
+CENTER_SCORE_OCR_ATTRIBUTION_MAX_LAG_SECONDS = 4.0
+CENTER_SCORE_OCR_ATTRIBUTION_PREFERRED_LAG_SECONDS = 2.5
+CENTER_SCORE_OCR_ATTRIBUTION_RELAXED_MAX_LAG_SECONDS = 6.0
 MANUAL_TRACK_SHOOTING_PERSIST_SECONDS = 4.0
 MULTI_CAMERA_SHOT_DEDUP_WINDOW_SECONDS = 3.0
 CENTER_MATCH_CLOCK_RECT = (900, 61, 1020, 128)
@@ -1744,39 +1765,55 @@ def _ocr_center_roi_text(frame_bgr: np.ndarray, rect: tuple, whitelist: str, sca
     return outputs
 
 
-def _ocr_center_score_counter(frame_bgr: np.ndarray, alliance: str):
+def _ocr_center_score_counter(frame_bgr: np.ndarray, alliance: str, return_debug: bool = False):
     """Run lightweight OCR on the center-camera alliance score counter."""
     global _CENTER_SCORE_OCR_DISABLED, _CENTER_SCORE_OCR_DISABLED_REASON_PRINTED
 
+    debug_info = {
+        "alliance": str(alliance).strip().lower(),
+        "value": None,
+        "raw_texts": [],
+        "parsed_values": [],
+        "error": None,
+        "disabled": bool(_CENTER_SCORE_OCR_DISABLED or pytesseract is None),
+    }
+
     if _CENTER_SCORE_OCR_DISABLED or pytesseract is None or frame_bgr is None:
-        return None
+        return debug_info if return_debug else None
 
     rect = CENTER_SCORE_COUNTER_RECTS.get(str(alliance).strip().lower())
     if rect is None:
-        return None
+        debug_info["error"] = "missing_rect"
+        return debug_info if return_debug else None
 
     parsed_counts = []
 
     try:
         raw_texts = _ocr_center_roi_text(frame_bgr, rect, "0123456789/")
+        debug_info["raw_texts"] = list(raw_texts or [])
     except TesseractNotFoundError as e:
         _CENTER_SCORE_OCR_DISABLED = True
+        debug_info["disabled"] = True
+        debug_info["error"] = str(e)
         if not _CENTER_SCORE_OCR_DISABLED_REASON_PRINTED:
             print(f"Center score OCR disabled: {e}")
             _CENTER_SCORE_OCR_DISABLED_REASON_PRINTED = True
-        return None
-    except Exception:
-        return None
+        return debug_info if return_debug else None
+    except Exception as e:
+        debug_info["error"] = str(e)
+        return debug_info if return_debug else None
 
-    for text in raw_texts:
+    for text in debug_info["raw_texts"]:
         parsed = _parse_center_score_counter_text(text)
         if parsed is not None:
             parsed_counts.append(parsed)
+    debug_info["parsed_values"] = list(parsed_counts)
 
     if not parsed_counts:
-        return None
+        return debug_info if return_debug else None
 
-    return Counter(parsed_counts).most_common(1)[0][0]
+    debug_info["value"] = Counter(parsed_counts).most_common(1)[0][0]
+    return debug_info if return_debug else debug_info["value"]
 
 
 class CenterScoreOCRTracker:
@@ -1790,6 +1827,10 @@ class CenterScoreOCRTracker:
         self.pending_hits = {"blue": 0, "red": 0}
         self.events = {"blue": [], "red": []}
         self.observation_counts = {"blue": 0, "red": 0}
+        self.latest_debug = {
+            "blue": {"value": None, "raw_texts": [], "parsed_values": [], "disabled": bool(pytesseract is None)},
+            "red": {"value": None, "raw_texts": [], "parsed_values": [], "disabled": bool(pytesseract is None)},
+        }
 
     def _accept_count(self, alliance: str, count: int, elapsed_seconds: float):
         previous = self.confirmed_counts[alliance]
@@ -1803,7 +1844,15 @@ class CenterScoreOCRTracker:
 
     def update(self, frame_bgr: np.ndarray, elapsed_seconds: float):
         for alliance in ("blue", "red"):
-            count = _ocr_center_score_counter(frame_bgr, alliance)
+            read_result = _ocr_center_score_counter(frame_bgr, alliance, return_debug=True)
+            self.latest_debug[alliance] = {
+                **(read_result or {}),
+                "elapsed_seconds": float(elapsed_seconds),
+                "confirmed": self.confirmed_counts[alliance],
+                "pending": self.pending_counts[alliance],
+                "pending_hits": int(self.pending_hits[alliance]),
+            }
+            count = None if not isinstance(read_result, dict) else read_result.get("value")
             if count is None:
                 continue
 
@@ -1826,6 +1875,9 @@ class CenterScoreOCRTracker:
 
             if self.pending_hits[alliance] >= self.min_confirmations:
                 self._accept_count(alliance, count, elapsed_seconds)
+                self.latest_debug[alliance]["confirmed"] = self.confirmed_counts[alliance]
+                self.latest_debug[alliance]["pending"] = self.pending_counts[alliance]
+                self.latest_debug[alliance]["pending_hits"] = int(self.pending_hits[alliance])
 
     def summary(self) -> dict:
         summary = {}
@@ -1839,6 +1891,7 @@ class CenterScoreOCRTracker:
                 "scored": scored,
                 "events": list(self.events[alliance]),
                 "observations": int(self.observation_counts[alliance]),
+                "latest_debug": dict(self.latest_debug.get(alliance, {})),
             }
         return summary
 
@@ -1889,35 +1942,60 @@ def _parse_center_match_clock_text(text: str):
     return None
 
 
-def _ocr_center_match_clock(frame_bgr: np.ndarray):
+def _format_clock_seconds(clock_seconds: int) -> str:
+    """Format a match clock value like 134 as 2:14."""
+    try:
+        total_seconds = max(0, int(clock_seconds))
+    except (TypeError, ValueError):
+        return ""
+    minutes = total_seconds // 60
+    seconds = total_seconds % 60
+    return f"{minutes}:{seconds:02d}"
+
+
+def _ocr_center_match_clock(frame_bgr: np.ndarray, return_debug: bool = False):
     """Run OCR on the center-camera match clock."""
     global _CENTER_MATCH_CLOCK_OCR_DISABLED, _CENTER_MATCH_CLOCK_OCR_DISABLED_REASON_PRINTED
 
+    debug_info = {
+        "value": None,
+        "raw_texts": [],
+        "parsed_values": [],
+        "error": None,
+        "disabled": bool(_CENTER_MATCH_CLOCK_OCR_DISABLED or pytesseract is None),
+    }
+
     if _CENTER_MATCH_CLOCK_OCR_DISABLED or pytesseract is None or frame_bgr is None:
-        return None
+        return debug_info if return_debug else None
 
     parsed_values = []
 
     try:
         raw_texts = _ocr_center_roi_text(frame_bgr, CENTER_MATCH_CLOCK_RECT, "0123456789:", scale=5.0)
+        debug_info["raw_texts"] = list(raw_texts or [])
     except TesseractNotFoundError as e:
         _CENTER_MATCH_CLOCK_OCR_DISABLED = True
+        debug_info["disabled"] = True
+        debug_info["error"] = str(e)
         if not _CENTER_MATCH_CLOCK_OCR_DISABLED_REASON_PRINTED:
             print(f"Center match clock OCR disabled: {e}")
             _CENTER_MATCH_CLOCK_OCR_DISABLED_REASON_PRINTED = True
-        return None
-    except Exception:
-        return None
+        return debug_info if return_debug else None
+    except Exception as e:
+        debug_info["error"] = str(e)
+        return debug_info if return_debug else None
 
-    for text in raw_texts:
+    for text in debug_info["raw_texts"]:
         parsed = _parse_center_match_clock_text(text)
         if parsed is not None:
             parsed_values.append(parsed)
+    debug_info["parsed_values"] = list(parsed_values)
 
     if not parsed_values:
-        return None
+        return debug_info if return_debug else None
 
-    return Counter(parsed_values).most_common(1)[0][0]
+    debug_info["value"] = Counter(parsed_values).most_common(1)[0][0]
+    return debug_info if return_debug else debug_info["value"]
 
 
 class CenterMatchClockOCRTracker:
@@ -1930,6 +2008,7 @@ class CenterMatchClockOCRTracker:
         self.pending_hits = 0
         self.observations = []
         self.observation_count = 0
+        self.latest_debug = {"value": None, "raw_texts": [], "parsed_values": [], "disabled": bool(pytesseract is None)}
 
     def _record_observation(self, elapsed_seconds: float, clock_seconds: int):
         clock_seconds = int(clock_seconds)
@@ -1943,7 +2022,15 @@ class CenterMatchClockOCRTracker:
         self.observations.append((elapsed_seconds, clock_seconds))
 
     def update(self, frame_bgr: np.ndarray, elapsed_seconds: float):
-        clock_seconds = _ocr_center_match_clock(frame_bgr)
+        read_result = _ocr_center_match_clock(frame_bgr, return_debug=True)
+        self.latest_debug = {
+            **(read_result or {}),
+            "elapsed_seconds": float(elapsed_seconds),
+            "confirmed": self.confirmed_clock_seconds,
+            "pending": self.pending_clock_seconds,
+            "pending_hits": int(self.pending_hits),
+        }
+        clock_seconds = None if not isinstance(read_result, dict) else read_result.get("value")
         if clock_seconds is None:
             return
 
@@ -1965,12 +2052,16 @@ class CenterMatchClockOCRTracker:
             self.pending_clock_seconds = None
             self.pending_hits = 0
             self._record_observation(elapsed_seconds, clock_seconds)
+            self.latest_debug["confirmed"] = self.confirmed_clock_seconds
+            self.latest_debug["pending"] = self.pending_clock_seconds
+            self.latest_debug["pending_hits"] = int(self.pending_hits)
 
     def summary(self) -> dict:
         return {
             "observations": list(self.observations),
             "observations_count": int(self.observation_count),
             "last_confirmed": self.confirmed_clock_seconds,
+            "latest_debug": dict(self.latest_debug),
         }
 
 
@@ -2002,7 +2093,7 @@ def _allocate_proportional_integers(raw_values: dict, target_total: int) -> dict
 
 def _get_marked_shooters_for_ocr_event(shooting_snapshots: list, alliance: str, event_time: float,
                                        max_gap_seconds: float = CENTER_SCORE_OCR_EVENT_WINDOW_SECONDS) -> list:
-    """Return the nearest set of manually marked shooters for an OCR score event."""
+    """Return shooters marked during the plausible pre-OCR launch window."""
     if not shooting_snapshots:
         return []
 
@@ -2015,12 +2106,24 @@ def _get_marked_shooters_for_ocr_event(shooting_snapshots: list, alliance: str, 
     if not snapshot_times:
         return []
 
-    insert_idx = bisect_right(snapshot_times, target_time)
-    candidate_indices = []
-    if insert_idx > 0:
-        candidate_indices.append(insert_idx - 1)
-    if insert_idx < len(shooting_snapshots):
-        candidate_indices.append(insert_idx)
+    min_lag = max(0.0, float(CENTER_SCORE_OCR_ATTRIBUTION_MIN_LAG_SECONDS))
+    preferred_lag = max(min_lag, float(CENTER_SCORE_OCR_ATTRIBUTION_PREFERRED_LAG_SECONDS))
+    window_end = target_time - min_lag
+    window_start = target_time - max(0.0, float(max_gap_seconds or 0.0))
+    preferred_time = target_time - preferred_lag
+    if window_end < window_start:
+        window_start = window_end
+
+    candidate_indices = [
+        idx for idx, snapshot_time in enumerate(snapshot_times)
+        if window_start <= snapshot_time <= window_end
+    ]
+    if not candidate_indices:
+        insert_idx = bisect_right(snapshot_times, preferred_time)
+        if insert_idx > 0:
+            candidate_indices.append(insert_idx - 1)
+        if insert_idx < len(shooting_snapshots):
+            candidate_indices.append(insert_idx)
     if not candidate_indices:
         return []
 
@@ -2028,9 +2131,13 @@ def _get_marked_shooters_for_ocr_event(shooting_snapshots: list, alliance: str, 
     best_gap = None
     for idx in candidate_indices:
         snapshot = shooting_snapshots[idx]
-        gap = abs(float(snapshot[0]) - target_time)
-        if gap > max_gap_seconds:
+        snapshot_time = float(snapshot[0])
+        if (
+            not (window_start <= snapshot_time <= window_end) and
+            abs(snapshot_time - preferred_time) > max(0.0, float(max_gap_seconds or 0.0))
+        ):
             continue
+        gap = abs(snapshot_time - preferred_time)
         if best_gap is None or gap < best_gap:
             best_gap = gap
             best_snapshot = snapshot
@@ -2042,18 +2149,73 @@ def _get_marked_shooters_for_ocr_event(shooting_snapshots: list, alliance: str, 
     return [str(label).strip() for label in (labels or []) if str(label).strip()]
 
 
+def _rank_ocr_attempt_indices(attempts: list, candidate_indices: list, event_time: float,
+                              preferred_lag_seconds: float = CENTER_SCORE_OCR_ATTRIBUTION_PREFERRED_LAG_SECONDS) -> list:
+    """Prefer made-hinted attempts whose timestamps fit the expected OCR lag best."""
+    preferred_lag = max(0.0, float(preferred_lag_seconds or 0.0))
+    return sorted(
+        candidate_indices,
+        key=lambda idx: (
+            not bool(attempts[idx].get("made_hint")),
+            abs((float(event_time) - float(attempts[idx].get("time", 0.0))) - preferred_lag),
+            abs(float(event_time) - float(attempts[idx].get("time", 0.0))),
+            -float(attempts[idx].get("time", 0.0)),
+            str(attempts[idx].get("label", "")),
+        )
+    )
+
+
+def _select_ocr_attempt_indices(attempts: list, event_time: float, target_count: int, allowed_labels: set = None,
+                                min_lag_seconds: float = CENTER_SCORE_OCR_ATTRIBUTION_MIN_LAG_SECONDS,
+                                max_lag_seconds: float = CENTER_SCORE_OCR_ATTRIBUTION_MAX_LAG_SECONDS,
+                                relaxed_max_lag_seconds: float = CENTER_SCORE_OCR_ATTRIBUTION_RELAXED_MAX_LAG_SECONDS) -> list:
+    """Pick unmatched prior attempts that could realistically explain an OCR score jump."""
+    target_count = max(0, int(target_count or 0))
+    if target_count <= 0 or not attempts:
+        return []
+
+    min_lag = max(0.0, float(min_lag_seconds or 0.0))
+    max_lag = max(min_lag, float(max_lag_seconds or 0.0))
+    relaxed_max = max(max_lag, float(relaxed_max_lag_seconds or 0.0))
+
+    strict_candidates = []
+    relaxed_candidates = []
+    for idx, attempt in enumerate(attempts):
+        if attempt.get("assigned"):
+            continue
+        label = str(attempt.get("label", "")).strip()
+        if allowed_labels and label not in allowed_labels:
+            continue
+
+        lag = float(event_time) - float(attempt.get("time", 0.0))
+        if lag < 0:
+            continue
+        if min_lag <= lag <= max_lag:
+            strict_candidates.append(idx)
+        elif lag <= relaxed_max:
+            relaxed_candidates.append(idx)
+
+    selected = []
+    for pool in (strict_candidates, relaxed_candidates):
+        for idx in _rank_ocr_attempt_indices(attempts, pool, event_time):
+            if idx in selected:
+                continue
+            selected.append(idx)
+            if len(selected) >= target_count:
+                return selected
+    return selected
+
+
 def _apply_ocr_score_correction(stats: dict, center_score_ocr: dict, blue_robots: list, red_robots: list,
                                 all_shot_events: list = None, shooting_snapshots: list = None,
                                 manual_mode: bool = False, match_clock_ocr: dict = None) -> dict:
     """
-    Reconcile SAM-attributed made shots with the authoritative alliance counters
-    shown on the center-camera scoreboard. Misses are preserved from SAM.
+    Ground per-robot makes to the center-score OCR timeline.
 
-    When manual center tracking marks exactly one robot on an alliance as
-    shooting, OCR score deltas are awarded directly to that robot. If multiple
-    robots are marked shooting, SAM 3 shot attribution is still used to split
-    the OCR-confirmed makes between them. In manual mode, OCR increases are
-    assigned only to robots explicitly marked as shooting at that time.
+    Each positive OCR delta is treated as the hard budget for made shots at that
+    moment, and those makes are only assigned to plausible prior attempts from
+    the same alliance. This keeps robot totals within what the scoreboard says
+    was actually possible, while still preserving the original attempt counts.
     """
     if not isinstance(center_score_ocr, dict):
         return stats
@@ -2098,239 +2260,104 @@ def _apply_ocr_score_correction(stats: dict, center_score_ocr: dict, blue_robots
     ):
         ocr_data = center_score_ocr.get(alliance, {}) if isinstance(center_score_ocr.get(alliance, {}), dict) else {}
         ocr_total = ocr_data.get("scored")
-        if ocr_total is None:
-            continue
 
         participating_labels = [label for label in robot_labels if label in corrected]
         if not participating_labels:
             continue
 
         sam_total = sum(corrected[label]["made"] for label in participating_labels)
-        ocr_total = max(0, int(ocr_total))
+        if ocr_total is not None:
+            ocr_total = max(0, int(ocr_total))
         ocr_events = list(ocr_data.get("events") or [])
         positive_ocr_events = [
             (float(event_time), max(0, int(delta or 0)), raw_total)
             for event_time, delta, raw_total in ocr_events
             if max(0, int(delta or 0)) > 0
         ]
+        if ocr_total is None and not positive_ocr_events:
+            continue
+
+        alliance_attempts = sorted(
+            [
+                {
+                    "time": float(elapsed),
+                    "label": str(robot_label).strip(),
+                    "made_hint": bool(made),
+                    "assigned": False,
+                }
+                for elapsed, robot_label, made in deduped_shot_events
+                if str(robot_label).strip() in participating_labels
+            ],
+            key=lambda attempt: (float(attempt["time"]), str(attempt["label"])),
+        )
         scaled_makes = {label: 0 for label in participating_labels}
         scaled_period_makes = {
             label: {period_name: 0 for period_name, _, _ in MATCH_PERIODS}
             for label in participating_labels
         }
+        unmatched_ocr_total = 0
+        ocr_only_total = 0
+        allocated_total = 0
 
-        if manual_mode:
-            alliance_made_events = [
-                (float(elapsed), robot_label)
-                for elapsed, robot_label, made in deduped_shot_events
-                if made and robot_label in participating_labels
-            ]
-            alliance_attempt_events = [
-                (float(elapsed), robot_label)
-                for elapsed, robot_label, _ in deduped_shot_events
-                if robot_label in participating_labels
-            ]
-            ignored_ocr_total = 0
+        for event_time, delta, _ in positive_ocr_events:
+            remaining_budget = delta
+            if ocr_total is not None:
+                remaining_budget = min(remaining_budget, max(0, ocr_total - allocated_total))
+            if remaining_budget <= 0:
+                continue
 
-            for event_time, delta, _ in positive_ocr_events:
-                event_period = get_match_period_for_elapsed(float(event_time), match_clock_ocr=match_clock_ocr)
-                marked_shooters = list(dict.fromkeys(
-                    label for label in _get_marked_shooters_for_ocr_event(
-                        shooting_snapshots,
-                        alliance,
-                        event_time,
-                    )
-                    if label in participating_labels
-                ))
-
-                if not marked_shooters:
-                    ignored_ocr_total += delta
-                    continue
-
-                if len(marked_shooters) == 1:
-                    single_label = marked_shooters[0]
-                    scaled_makes[single_label] = scaled_makes.get(single_label, 0) + delta
-                    if event_period in scaled_period_makes.get(single_label, {}):
-                        scaled_period_makes[single_label][event_period] += delta
-                    continue
-
-                candidate_weights = Counter(
-                    robot_label
-                    for elapsed, robot_label in alliance_made_events
-                    if (
-                        robot_label in marked_shooters and
-                        abs(float(elapsed) - float(event_time)) <= CENTER_SCORE_OCR_EVENT_WINDOW_SECONDS
-                    )
-                )
-                if not candidate_weights:
-                    candidate_weights = Counter(
-                        robot_label
-                        for elapsed, robot_label in alliance_attempt_events
-                        if (
-                            robot_label in marked_shooters and
-                            abs(float(elapsed) - float(event_time)) <= CENTER_SCORE_OCR_EVENT_WINDOW_SECONDS
-                        )
-                    )
-                if not candidate_weights:
-                    candidate_weights = Counter(
-                        robot_label
-                        for _, robot_label in alliance_made_events
-                        if robot_label in marked_shooters
-                    )
-                if not candidate_weights:
-                    candidate_weights = Counter(
-                        robot_label
-                        for _, robot_label in alliance_attempt_events
-                        if robot_label in marked_shooters
-                    )
-                if not candidate_weights:
-                    candidate_weights = Counter({label: 1 for label in marked_shooters})
-
-                event_scaled = _allocate_proportional_integers(candidate_weights, delta)
-                for label, amount in event_scaled.items():
-                    scaled_makes[label] = scaled_makes.get(label, 0) + int(amount)
-                    if event_period in scaled_period_makes.get(label, {}):
-                        scaled_period_makes[label][event_period] += int(amount)
-
-            allocated_total = sum(scaled_makes.values())
-            print(
-                f"[Center Score OCR] {alliance.title()} alliance correction (manual): "
-                f"SAM made={sam_total}, OCR made={ocr_total}, allocated={allocated_total}, "
-                f"ignored_no_shooter={ignored_ocr_total}, scaled={scaled_makes}"
-            )
-        else:
-            unique_marked_shooters = {
-                label
-                for event_time, _, _ in positive_ocr_events
-                for label in _get_marked_shooters_for_ocr_event(
+            marked_shooters = list(dict.fromkeys(
+                label for label in _get_marked_shooters_for_ocr_event(
                     shooting_snapshots,
                     alliance,
                     event_time,
                 )
                 if label in participating_labels
-            }
-            lone_marked_shooter = next(iter(unique_marked_shooters)) if len(unique_marked_shooters) == 1 else None
-            has_relevant_manual_hints = any(
-                _get_marked_shooters_for_ocr_event(shooting_snapshots, alliance, event_time)
-                for event_time, _, _ in positive_ocr_events
+            ))
+            allowed_labels = set(marked_shooters) if marked_shooters else None
+            candidate_indices = _select_ocr_attempt_indices(
+                alliance_attempts,
+                event_time,
+                remaining_budget,
+                allowed_labels=allowed_labels,
             )
-            if not has_relevant_manual_hints and (sam_total <= 0 or sam_total == ocr_total):
-                continue
 
-            alliance_events = [
-                (elapsed, robot_label)
-                for elapsed, robot_label, made in deduped_shot_events
-                if made and robot_label in participating_labels
-            ]
-            remaining_event_indices = set(range(len(alliance_events)))
+            for attempt_idx in candidate_indices:
+                attempt = alliance_attempts[attempt_idx]
+                attempt["assigned"] = True
+                label = attempt["label"]
+                scaled_makes[label] = scaled_makes.get(label, 0) + 1
+                allocated_total += 1
+                period_name = get_match_period_for_elapsed(float(attempt["time"]), match_clock_ocr=match_clock_ocr)
+                if period_name in scaled_period_makes.get(label, {}):
+                    scaled_period_makes[label][period_name] += 1
 
-            for event_time, delta, _ in positive_ocr_events:
-                event_period = get_match_period_for_elapsed(float(event_time), match_clock_ocr=match_clock_ocr)
-                marked_shooters = [
-                    label for label in _get_marked_shooters_for_ocr_event(
-                        shooting_snapshots,
-                        alliance,
-                        event_time,
-                    )
-                    if label in participating_labels
-                ]
-                if len(marked_shooters) == 1:
-                    single_label = marked_shooters[0]
-                    scaled_makes[single_label] = scaled_makes.get(single_label, 0) + delta
-                    if event_period in scaled_period_makes[single_label]:
-                        scaled_period_makes[single_label][event_period] += delta
-                    single_label_indices = sorted(
-                        [
-                            idx for idx in remaining_event_indices
-                            if (
-                                alliance_events[idx][1] == single_label and
-                                abs(float(alliance_events[idx][0]) - float(event_time)) <= CENTER_SCORE_OCR_EVENT_WINDOW_SECONDS
-                            )
-                        ],
-                        key=lambda idx: abs(float(alliance_events[idx][0]) - float(event_time))
-                    )
-                    for idx in single_label_indices[:delta]:
-                        remaining_event_indices.discard(idx)
-                    continue
+            remaining_budget -= len(candidate_indices)
+            if remaining_budget > 0 and manual_mode and allowed_labels and len(allowed_labels) == 1:
+                fallback_label = next(iter(allowed_labels))
+                fallback_period = get_match_period_for_elapsed(float(event_time), match_clock_ocr=match_clock_ocr)
+                scaled_makes[fallback_label] = scaled_makes.get(fallback_label, 0) + remaining_budget
+                allocated_total += remaining_budget
+                ocr_only_total += remaining_budget
+                if fallback_period in scaled_period_makes.get(fallback_label, {}):
+                    scaled_period_makes[fallback_label][fallback_period] += remaining_budget
+                remaining_budget = 0
 
-                allowed_labels = set(marked_shooters) if len(marked_shooters) >= 2 else None
-                candidate_indices = [
-                    idx for idx in remaining_event_indices
-                    if (
-                        abs(float(alliance_events[idx][0]) - float(event_time)) <= CENTER_SCORE_OCR_EVENT_WINDOW_SECONDS and
-                        (allowed_labels is None or alliance_events[idx][1] in allowed_labels)
-                    )
-                ]
-                if not candidate_indices:
-                    if lone_marked_shooter:
-                        scaled_makes[lone_marked_shooter] = scaled_makes.get(lone_marked_shooter, 0) + delta
-                        if event_period in scaled_period_makes.get(lone_marked_shooter, {}):
-                            scaled_period_makes[lone_marked_shooter][event_period] += delta
-                        continue
-                    if allowed_labels:
-                        sam_weights = Counter({
-                            label: corrected[label]["made"]
-                            for label in allowed_labels
-                            if int(corrected.get(label, {}).get("made", 0) or 0) > 0
-                        })
-                        if sam_weights:
-                            event_scaled = _allocate_proportional_integers(sam_weights, delta)
-                            for label, amount in event_scaled.items():
-                                scaled_makes[label] = scaled_makes.get(label, 0) + int(amount)
-                                if event_period in scaled_period_makes.get(label, {}):
-                                    scaled_period_makes[label][event_period] += int(amount)
-                    continue
-                candidate_weights = Counter(alliance_events[idx][1] for idx in candidate_indices)
-                event_scaled = _allocate_proportional_integers(candidate_weights, delta)
-                for label, amount in event_scaled.items():
-                    scaled_makes[label] = scaled_makes.get(label, 0) + int(amount)
-                    if event_period in scaled_period_makes.get(label, {}):
-                        scaled_period_makes[label][event_period] += int(amount)
-                for label, amount in event_scaled.items():
-                    label_candidates = sorted(
-                        [idx for idx in candidate_indices if alliance_events[idx][1] == label],
-                        key=lambda idx: abs(float(alliance_events[idx][0]) - float(event_time))
-                    )
-                    for idx in label_candidates[:max(0, int(amount))]:
-                        remaining_event_indices.discard(idx)
+            if remaining_budget > 0:
+                unmatched_ocr_total += remaining_budget
 
-            allocated_total = sum(scaled_makes.values())
-            remaining_total = max(0, ocr_total - allocated_total)
-            if remaining_total > 0:
-                if lone_marked_shooter:
-                    scaled_makes[lone_marked_shooter] = scaled_makes.get(lone_marked_shooter, 0) + remaining_total
-                elif remaining_event_indices:
-                    fallback_weights = Counter(alliance_events[idx][1] for idx in remaining_event_indices)
-                    fallback_scaled = _allocate_proportional_integers(fallback_weights, remaining_total)
-                    for label, amount in fallback_scaled.items():
-                        scaled_makes[label] = scaled_makes.get(label, 0) + int(amount)
-                else:
-                    fallback_weights = Counter({label: corrected[label]["made"] for label in participating_labels})
-                    fallback_scaled = _allocate_proportional_integers(fallback_weights, remaining_total)
-                    for label, amount in fallback_scaled.items():
-                        scaled_makes[label] = scaled_makes.get(label, 0) + int(amount)
-
-            print(
-                f"[Center Score OCR] {alliance.title()} alliance correction: "
-                f"SAM made={sam_total}, OCR made={ocr_total}, scaled={scaled_makes}"
-            )
+        print(
+            f"[Center Score OCR] {alliance.title()} alliance grounding"
+            f"{' (manual)' if manual_mode else ''}: "
+            f"SAM made={sam_total}, OCR made={ocr_total}, attributed={allocated_total}, "
+            f"unmatched_ocr={unmatched_ocr_total}, ocr_only={ocr_only_total}, grounded={scaled_makes}"
+        )
 
         for label in participating_labels:
             robot_data = corrected[label]
-            original_made = int(robot_data["made"])
             original_attempts = int(robot_data["attempts"])
-            original_missed = max(0, original_attempts - original_made)
-
-            original_period_made = {
-                period_name: int(robot_data["by_period"].get(period_name, {}).get("made", 0))
-                for period_name, _, _ in MATCH_PERIODS
-            }
-            original_period_missed = {
-                period_name: max(
-                    0,
-                    int(robot_data["by_period"].get(period_name, {}).get("attempts", 0))
-                    - int(robot_data["by_period"].get(period_name, {}).get("made", 0))
-                )
+            original_period_attempts = {
+                period_name: int(robot_data["by_period"].get(period_name, {}).get("attempts", 0))
                 for period_name, _, _ in MATCH_PERIODS
             }
 
@@ -2341,12 +2368,12 @@ def _apply_ocr_score_correction(stats: dict, center_score_ocr: dict, blue_robots
             }
             remaining_period_made = max(0, corrected_made - sum(corrected_period_made.values()))
             if remaining_period_made > 0:
-                period_weights = dict(original_period_made)
+                period_weights = {
+                    period_name: int(corrected_period_made.get(period_name, 0))
+                    for period_name, _, _ in MATCH_PERIODS
+                }
                 if sum(period_weights.values()) <= 0:
-                    period_weights = {
-                        period_name: int(robot_data["by_period"].get(period_name, {}).get("attempts", 0))
-                        for period_name, _, _ in MATCH_PERIODS
-                    }
+                    period_weights = dict(original_period_attempts)
                 if sum(period_weights.values()) <= 0:
                     period_weights = {period_name: 0 for period_name, _, _ in MATCH_PERIODS}
                     fallback_period = next(
@@ -2358,12 +2385,12 @@ def _apply_ocr_score_correction(stats: dict, center_score_ocr: dict, blue_robots
                 for period_name, amount in extra_period_made.items():
                     corrected_period_made[period_name] = corrected_period_made.get(period_name, 0) + int(amount)
             robot_data["made"] = corrected_made
-            robot_data["attempts"] = corrected_made + original_missed
+            robot_data["attempts"] = max(original_attempts, corrected_made)
 
             for period_name, _, _ in MATCH_PERIODS:
                 period_made = int(corrected_period_made.get(period_name, 0))
                 robot_data["by_period"][period_name] = {
-                    "attempts": period_made + original_period_missed[period_name],
+                    "attempts": max(original_period_attempts[period_name], period_made),
                     "made": period_made,
                 }
 
@@ -2376,6 +2403,171 @@ def _normalize_highlight_ball_robot(highlight_ball_robot: str = None) -> str:
     if not label or label == BALL_HIGHLIGHT_ALL_OPTION:
         return ""
     return label
+
+
+def _summarize_ocr_raw_texts(raw_texts: list, max_items: int = 3, max_length: int = 28) -> str:
+    """Create a compact one-line summary of the latest OCR raw strings."""
+    cleaned = []
+    seen = set()
+    for item in list(raw_texts or []):
+        text = _clean_text(str(item or ""))
+        if not text or text in seen:
+            continue
+        cleaned.append(text)
+        seen.add(text)
+        if len(cleaned) >= max_items:
+            break
+    if not cleaned:
+        return "no raw read"
+    summary = " | ".join(cleaned)
+    if len(summary) > max_length:
+        return summary[:max_length - 3] + "..."
+    return summary
+
+
+def _build_center_ocr_debug_region_specs(frame_width: int, frame_height: int,
+                                         center_score_ocr_tracker: CenterScoreOCRTracker = None,
+                                         center_match_clock_ocr_tracker: CenterMatchClockOCRTracker = None) -> list:
+    """Describe the center-camera OCR debug badges to render on top of the video."""
+    specs = []
+    if frame_width <= 0 or frame_height <= 0:
+        return specs
+
+    if center_score_ocr_tracker is not None:
+        score_colors = {"blue": (70, 130, 255), "red": (255, 95, 95)}
+        for alliance in ("blue", "red"):
+            rect = CENTER_SCORE_COUNTER_RECTS.get(alliance)
+            if rect is None:
+                continue
+            scaled_rect = _scale_ref_rect(rect, frame_width, frame_height)
+            debug = center_score_ocr_tracker.latest_debug.get(alliance, {}) if hasattr(center_score_ocr_tracker, "latest_debug") else {}
+            latest_value = debug.get("value")
+            confirmed_value = debug.get("confirmed")
+            if debug.get("disabled"):
+                read_text = "OCR disabled"
+            elif debug.get("error"):
+                read_text = "OCR error"
+            elif latest_value is None:
+                read_text = "read --"
+            else:
+                read_text = f"read {int(latest_value)}"
+            if confirmed_value is not None:
+                read_text += f" | conf {int(confirmed_value)}"
+            raw_summary = _summarize_ocr_raw_texts(debug.get("raw_texts"))
+            specs.append({
+                "rect": scaled_rect,
+                "title": f"{alliance.title()} Score OCR",
+                "value_line": read_text,
+                "raw_line": raw_summary,
+                "color": score_colors.get(alliance, (255, 255, 255)),
+                "align": "left" if alliance == "blue" else "right",
+            })
+
+    if center_match_clock_ocr_tracker is not None:
+        scaled_rect = _scale_ref_rect(CENTER_MATCH_CLOCK_RECT, frame_width, frame_height)
+        debug = center_match_clock_ocr_tracker.latest_debug if hasattr(center_match_clock_ocr_tracker, "latest_debug") else {}
+        latest_value = debug.get("value")
+        confirmed_value = debug.get("confirmed")
+        if debug.get("disabled"):
+            read_text = "OCR disabled"
+        elif debug.get("error"):
+            read_text = "OCR error"
+        elif latest_value is None:
+            read_text = "read --:--"
+        else:
+            read_text = f"read {_format_clock_seconds(latest_value)}"
+        if confirmed_value is not None:
+            read_text += f" | conf {_format_clock_seconds(confirmed_value)}"
+        raw_summary = _summarize_ocr_raw_texts(debug.get("raw_texts"))
+        specs.append({
+            "rect": scaled_rect,
+            "title": "Match Clock OCR",
+            "value_line": read_text,
+            "raw_line": raw_summary,
+            "color": (255, 220, 110),
+            "align": "center",
+        })
+
+    return specs
+
+
+def draw_center_ocr_debug_overlay(frame: Image.Image, center_score_ocr_tracker: CenterScoreOCRTracker = None,
+                                  center_match_clock_ocr_tracker: CenterMatchClockOCRTracker = None) -> Image.Image:
+    """Draw persistent OCR debug badges near the center-camera OCR regions."""
+    if frame is None:
+        return frame
+
+    width, height = frame.size
+    specs = _build_center_ocr_debug_region_specs(
+        width,
+        height,
+        center_score_ocr_tracker=center_score_ocr_tracker,
+        center_match_clock_ocr_tracker=center_match_clock_ocr_tracker,
+    )
+    if not specs:
+        return frame
+
+    overlay = Image.new("RGBA", frame.size, (0, 0, 0, 0))
+    draw = ImageDraw.Draw(overlay)
+    title_font = get_font(15)
+    body_font = get_font(13)
+    padding_x = 8
+    padding_y = 6
+    line_gap = 3
+    region_pad = 6
+
+    for spec in specs:
+        x1, y1, x2, y2 = spec["rect"]
+        color = spec.get("color", (255, 255, 255))
+        draw.rectangle([x1, y1, x2, y2], outline=color + (220,), width=2)
+
+        title = str(spec.get("title", "OCR"))
+        value_line = str(spec.get("value_line", ""))
+        raw_line = f"raw {str(spec.get('raw_line', ''))}"
+        lines = [title, value_line, raw_line]
+
+        line_heights = []
+        max_text_width = 0
+        for idx, line in enumerate(lines):
+            font = title_font if idx == 0 else body_font
+            bbox = draw.textbbox((0, 0), line, font=font)
+            max_text_width = max(max_text_width, bbox[2] - bbox[0])
+            line_heights.append(bbox[3] - bbox[1])
+        box_width = max_text_width + (padding_x * 2)
+        box_height = sum(line_heights) + (padding_y * 2) + (line_gap * (len(lines) - 1))
+
+        align = spec.get("align", "left")
+        if align == "right":
+            box_x1 = x2 - box_width
+        elif align == "center":
+            box_x1 = int(round(((x1 + x2) / 2.0) - (box_width / 2.0)))
+        else:
+            box_x1 = x1
+        box_x1 = max(8, min(width - box_width - 8, box_x1))
+
+        preferred_y1 = y2 + region_pad
+        if preferred_y1 + box_height > height - 8:
+            preferred_y1 = y1 - box_height - region_pad
+        box_y1 = max(8, min(height - box_height - 8, preferred_y1))
+        box_x2 = box_x1 + box_width
+        box_y2 = box_y1 + box_height
+
+        draw.rounded_rectangle(
+            [box_x1, box_y1, box_x2, box_y2],
+            radius=10,
+            fill=(16, 18, 24, 180),
+            outline=color + (235,),
+            width=2,
+        )
+
+        cursor_y = box_y1 + padding_y
+        for idx, line in enumerate(lines):
+            font = title_font if idx == 0 else body_font
+            fill = color + (255,) if idx == 0 else (255, 255, 255, 235)
+            draw.text((box_x1 + padding_x, cursor_y), line, fill=fill, font=font)
+            cursor_y += line_heights[idx] + line_gap
+
+    return Image.alpha_composite(frame.convert("RGBA"), overlay).convert("RGB")
 
 
 def _build_ball_highlight_choices(blue_robots: list = None, red_robots: list = None) -> list:
@@ -2992,16 +3184,20 @@ class BallTracker:
         """Get elapsed match time based on current frame."""
         return self.start_seconds + (self.current_frame / self.fps)
     
-    def _record_shot(self, robot_label: str, made: bool):
+    def _record_shot(self, robot_label: str, made: bool, event_elapsed: float = None):
         """
         Record a shot attempt for a robot, tracking both total and by period.
         
         Args:
             robot_label: The robot's team number
             made: True if shot was made, False if missed
+            event_elapsed: Timestamp of the actual launch event when known
         """
         stats = self._get_robot_stats(robot_label)
-        elapsed = self._get_elapsed_seconds()
+        try:
+            elapsed = float(event_elapsed) if event_elapsed is not None else self._get_elapsed_seconds()
+        except (TypeError, ValueError):
+            elapsed = self._get_elapsed_seconds()
         period = get_match_period(elapsed)
         
         # Log shot event for cross-camera deduplication
@@ -3595,7 +3791,7 @@ class BallTracker:
     def _resolve_shot_result(self, robot_label: str, x: float, y: float,
                              was_ever_in_goal: bool = False, prediction: dict = None,
                              shot_origin_pos: tuple = None, trace_visible: bool = False,
-                             context: str = "") -> bool:
+                             context: str = "", shot_frame: int = None) -> bool:
         """
         Finalize a shot using observed goal entry if available, otherwise the
         latest trajectory prediction.
@@ -3616,9 +3812,17 @@ class BallTracker:
             )
             return False
         made = observed_make or predicted_make
-        self._record_shot(robot_label, made=made)
+        try:
+            event_elapsed = (
+                self.start_seconds + (float(shot_frame) / max(1.0, float(self.fps)))
+                if shot_frame is not None else
+                self._get_elapsed_seconds()
+            )
+        except (TypeError, ValueError, ZeroDivisionError):
+            event_elapsed = self._get_elapsed_seconds()
+        self._record_shot(robot_label, made=made, event_elapsed=event_elapsed)
 
-        period = get_match_period(self._get_elapsed_seconds())
+        period = get_match_period(event_elapsed)
         if raw_observed_make and not trace_visible:
             reason = "goal entry ignored because no shot trace was ever armed"
         elif raw_predicted_make and not trace_visible:
@@ -3904,6 +4108,7 @@ class BallTracker:
                         shot_origin_pos=lost_data['data'].get('shot_origin_pos'),
                         trace_visible=bool(lost_data['data'].get('trace_visible_once', False)),
                         context="lost timeout",
+                        shot_frame=lost_data['data'].get('shot_time'),
                     )
         
         # Merge new and updated lost balls
@@ -4066,6 +4271,7 @@ class BallTracker:
                         shot_origin_pos=shot_origin_pos,
                         trace_visible=trace_visible_once,
                         context="2sec eval",
+                        shot_frame=shot_time,
                     )
                     shot_evaluated = True
             
@@ -4190,6 +4396,7 @@ class BallTracker:
                     shot_origin_pos=ball_data.get('shot_origin_pos'),
                     trace_visible=bool(ball_data.get('trace_visible_once', False)),
                     context="finalize tracked",
+                    shot_frame=ball_data.get('shot_time'),
                 )
         
         # Finalize all balls in the lost pool — only count MADE shots
@@ -4208,6 +4415,7 @@ class BallTracker:
                     shot_origin_pos=lost_data['data'].get('shot_origin_pos'),
                     trace_visible=bool(lost_data['data'].get('trace_visible_once', False)),
                     context="finalize lost",
+                    shot_frame=lost_data['data'].get('shot_time'),
                 )
         
         print(f"[FINAL STATS] {self.robot_stats}")
@@ -7438,6 +7646,7 @@ def process_single_video(video_path: str, camera_side: str = "blue", target_fps:
     ball_fps = min(30.0, original_fps)
     ball_frame_interval = max(1, round(original_fps / ball_fps))
     score_ocr_frame_interval = max(1, round(original_fps / CENTER_SCORE_OCR_SAMPLE_FPS))
+    match_clock_ocr_frame_interval = max(1, round(original_fps / CENTER_MATCH_CLOCK_OCR_SAMPLE_FPS))
     # Person detection at 6fps (independent of robot FPS)
     person_frame_interval = max(1, int(original_fps / 6))
     
@@ -7451,6 +7660,7 @@ def process_single_video(video_path: str, camera_side: str = "blue", target_fps:
     robot_tracks = {}  # label -> list of (center_x, center_y, camera_side)
     tracks_by_frame = []  # List of dicts {label: (cx, cy, side)} for each frame
     center_score_ocr_tracker = CenterScoreOCRTracker() if camera_side == "center" else None
+    center_match_clock_overlay_tracker = CenterMatchClockOCRTracker() if camera_side == "center" else None
     score_ocr_delay_frames = int(round((original_fps or 30.0) * CENTER_SCORE_OCR_POST_ROLL_SECONDS))
     reader_end_frame = max(
         end_frame,
@@ -7577,6 +7787,8 @@ def process_single_video(video_path: str, camera_side: str = "blue", target_fps:
 
         if center_score_ocr_tracker and frame_count % score_ocr_frame_interval == 0:
             center_score_ocr_tracker.update(frame, frame_count / max(1.0, original_fps))
+        if center_match_clock_overlay_tracker and frame_count % match_clock_ocr_frame_interval == 0:
+            center_match_clock_overlay_tracker.update(frame, frame_count / max(1.0, original_fps))
 
         if frame_count >= end_frame:
             continue
@@ -7956,6 +8168,13 @@ def process_single_video(video_path: str, camera_side: str = "blue", target_fps:
                     ]
                     draw.polygon(roi_poly, outline=(255, 255, 255), width=2)
                     draw.text((roi_poly[0][0] + 5, roi_poly[0][1] + 5), "SAM 3 ROI", fill=(255, 255, 255), font=font)
+
+            if camera_side == "center":
+                annotated_frame = draw_center_ocr_debug_overlay(
+                    annotated_frame,
+                    center_score_ocr_tracker=center_score_ocr_tracker,
+                    center_match_clock_ocr_tracker=center_match_clock_overlay_tracker,
+                )
             
             
             # Convert back to BGR for OpenCV
