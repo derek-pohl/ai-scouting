@@ -121,6 +121,7 @@ if pytesseract is not None:
 YOUTUBE_URL_PATTERN = re.compile(r"(?i)^(https?://)?(www\.)?(youtube\.com|youtu\.be)/")
 VIDEO_SOURCE_EMPTY_STATUS = "*Upload a file or paste a YouTube link to begin.*"
 FIELD_CALIBRATION_CACHE_PATH = Path(__file__).parent / "field_calibration_cache.json"
+YTDLP_COOKIEFILE_PATH = Path(__file__).parent / "cookies.txt"
 VIDEO_FILE_EXTENSIONS = {".mp4", ".mov", ".mkv", ".webm", ".avi", ".m4v"}
 DEFAULT_PAGE_TITLE = "Robot Scouter"
 MANUAL_PREVIEW_TARGET_WIDTH = 1280
@@ -285,6 +286,17 @@ def _cleanup_old_youtube_downloads() -> int:
     return removed
 
 
+def _get_ytdlp_cookiefile_path() -> str:
+    """Return the repo-local yt-dlp cookie file path when present."""
+    try:
+        cookie_path = Path(YTDLP_COOKIEFILE_PATH)
+    except Exception:
+        return ""
+    if cookie_path.exists() and cookie_path.is_file():
+        return str(cookie_path)
+    return ""
+
+
 def _build_youtube_progress_hook(progress, title_hint: str = ""):
     """Create a yt-dlp progress hook that forwards progress into Gradio."""
     title_hint = _clean_text(title_hint)
@@ -339,6 +351,10 @@ def _download_youtube_video(youtube_url: str, progress=None) -> tuple:
         "format": "bv*[ext=mp4]+ba[ext=m4a]/b[ext=mp4]/bv*+ba/b",
         "merge_output_format": "mp4",
     }
+    cookiefile = _get_ytdlp_cookiefile_path()
+    if cookiefile:
+        ydl_opts["cookiefile"] = cookiefile
+        print(f"[YouTube Download] Using yt-dlp cookies from {cookiefile}")
     if ffmpeg_exe:
         ydl_opts["ffmpeg_location"] = ffmpeg_exe
 
