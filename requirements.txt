@@ -3,8 +3,9 @@ opencv-python
 numpy
 Pillow
 pytesseract
-python-dotenv
+requests
 google-genai
 ultralytics
 static-ffmpeg
 yt-dlp
+gradio_client

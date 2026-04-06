@@ -16,16 +16,38 @@ import cv2
 import numpy as np
 import gradio as gr
 from PIL import Image, ImageDraw, ImageFont, ImageColor
-
-from dotenv import load_dotenv
 from io import BytesIO
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
-# Load environment variables
-load_dotenv()
+CONFIG_PATH = Path(__file__).parent / "config.json"
+DEFAULT_CONFIG = {
+    "robot_tracking_mode": "auto",
+    "local_llm_url": "http://127.0.0.1:1234/v1/chat/completions",
+}
 
-ROBOT_TRACKING_MODE = os.getenv("ROBOT_TRACKING_MODE", "auto").strip().lower()
+
+def _load_app_config() -> dict:
+    """Load non-sensitive app settings from config.json."""
+    if not CONFIG_PATH.exists():
+        return dict(DEFAULT_CONFIG)
+    try:
+        with CONFIG_PATH.open("r", encoding="utf-8") as fh:
+            loaded = json.load(fh)
+    except Exception as e:
+        print(f"Failed to read {CONFIG_PATH.name}: {e}. Using defaults.")
+        return dict(DEFAULT_CONFIG)
+    if not isinstance(loaded, dict):
+        print(f"{CONFIG_PATH.name} must contain a JSON object. Using defaults.")
+        return dict(DEFAULT_CONFIG)
+    config = dict(DEFAULT_CONFIG)
+    config.update(loaded)
+    return config
+
+
+APP_CONFIG = _load_app_config()
+
+ROBOT_TRACKING_MODE = str(APP_CONFIG.get("robot_tracking_mode", "auto")).strip().lower()
 if ROBOT_TRACKING_MODE not in {"auto", "manual"}:
     print(f"Unknown ROBOT_TRACKING_MODE={ROBOT_TRACKING_MODE!r}; defaulting to 'auto'")
     ROBOT_TRACKING_MODE = "auto"
@@ -67,7 +89,7 @@ except Exception as e:
     print(f"SAM 3 initialization failed: {e} - using HSV ball detection")
 
 # LMStudio configuration for local LLM team number detection
-LMSTUDIO_URL = os.getenv("LOCAL_LLM_URL", "http://127.0.0.1:1234/v1/chat/completions")
+LMSTUDIO_URL = str(APP_CONFIG.get("local_llm_url", DEFAULT_CONFIG["local_llm_url"])).strip()
 LMSTUDIO_ENABLED = True  # Set to False to disable LMStudio queries
 
 import requests
@@ -75,9 +97,6 @@ import base64
 try:
     import pytesseract
     from pytesseract import TesseractNotFoundError
-    _tesseract_cmd = os.getenv("TESSERACT_CMD", "").strip()
-    if _tesseract_cmd:
-        pytesseract.pytesseract.tesseract_cmd = _tesseract_cmd
 except Exception:
     pytesseract = None
     TesseractNotFoundError = RuntimeError
@@ -86,6 +105,33 @@ YOUTUBE_URL_PATTERN = re.compile(r"(?i)^(https?://)?(www\.)?(youtube\.com|youtu\
 VIDEO_SOURCE_EMPTY_STATUS = "*Upload a file or paste a YouTube link to begin.*"
 FIELD_CALIBRATION_CACHE_PATH = Path(__file__).parent / "field_calibration_cache.json"
 VIDEO_FILE_EXTENSIONS = {".mp4", ".mov", ".mkv", ".webm", ".avi", ".m4v"}
+DEFAULT_PAGE_TITLE = "Robot Scouter"
+MANUAL_PREVIEW_TARGET_WIDTH = 1280
+MANUAL_PREVIEW_TARGET_HEIGHT = 720
+YOUTUBE_DOWNLOAD_DIR_PREFIX = "youtube_match_"
+PAGE_TITLE_SYNC_HTML = f"""
+<script>
+(() => {{
+  const defaultTitle = {json.dumps(DEFAULT_PAGE_TITLE)};
+  let lastTitle = "";
+  function syncPageTitle() {{
+    const root = document.querySelector("#page-title-state");
+    const input = root ? root.querySelector("input, textarea") : null;
+    const nextTitle = (input && input.value ? input.value.trim() : "") || defaultTitle;
+    if (nextTitle !== lastTitle) {{
+      document.title = nextTitle;
+      lastTitle = nextTitle;
+    }}
+  }}
+  if (document.readyState === "loading") {{
+    document.addEventListener("DOMContentLoaded", syncPageTitle);
+  }} else {{
+    syncPageTitle();
+  }}
+  setInterval(syncPageTitle, 300);
+}})();
+</script>
+"""
 
 
 def _clean_text(value: str) -> str:
@@ -112,15 +158,13 @@ def _ensure_ffmpeg_executable() -> str:
     return ffmpeg_exe
 
 
-def _parse_match_title_and_regional(title: str) -> tuple:
-    """Split a match title into full title and trailing regional / event name."""
-    match_title = _clean_text(title)
-    if " - " in match_title:
-        _, regional_name = match_title.split(" - ", 1)
-        regional_name = _clean_text(regional_name)
-    else:
-        regional_name = ""
-    return match_title, regional_name
+def _parse_match_title_parts(title: str) -> tuple:
+    """Split a match title into the match label, full title, and regional / event name."""
+    full_title = _clean_text(title)
+    if " - " in full_title:
+        match_label, regional_name = full_title.split(" - ", 1)
+        return _clean_text(match_label), full_title, _clean_text(regional_name)
+    return full_title, full_title, ""
 
 
 def _parse_alliance_teams_from_description(description: str) -> dict:
@@ -141,9 +185,10 @@ def _parse_alliance_teams_from_description(description: str) -> dict:
 
 def _parse_youtube_match_metadata(title: str, description: str) -> dict:
     """Parse the useful scouting metadata from a YouTube title / description."""
-    match_title, regional_name = _parse_match_title_and_regional(title)
+    match_label, match_title, regional_name = _parse_match_title_parts(title)
     alliance_teams = _parse_alliance_teams_from_description(description)
     return {
+        "match_label": match_label,
         "match_title": match_title,
         "regional_name": regional_name,
         "blue_robots": alliance_teams.get("blue", ["", "", ""]),
@@ -178,6 +223,81 @@ def _resolve_downloaded_video_path(info: dict, download_dir: Path, ydl=None) -> 
     return ""
 
 
+def _get_managed_youtube_download_dir(video_path: str = None) -> Path:
+    """Return the managed YouTube download directory for a path, if applicable."""
+    if not video_path:
+        return None
+    try:
+        path = Path(video_path).resolve()
+    except Exception:
+        return None
+    parent = path.parent
+    if parent.name.startswith(YOUTUBE_DOWNLOAD_DIR_PREFIX):
+        return parent
+    return None
+
+
+def _cleanup_managed_youtube_dir(path: Path) -> bool:
+    """Delete a managed YouTube download directory if it still exists."""
+    if path is None:
+        return False
+    try:
+        target = Path(path)
+    except Exception:
+        return False
+    if not target.exists() or not target.is_dir() or not target.name.startswith(YOUTUBE_DOWNLOAD_DIR_PREFIX):
+        return False
+    try:
+        shutil.rmtree(target, ignore_errors=False)
+        print(f"[YouTube Cleanup] Removed {target}")
+        return True
+    except Exception as exc:
+        print(f"[YouTube Cleanup] Failed to remove {target}: {exc}")
+        return False
+
+
+def _cleanup_old_youtube_downloads() -> int:
+    """Remove leftover managed YouTube downloads from prior unfinished runs."""
+    temp_root = Path(tempfile.gettempdir())
+    removed = 0
+    for path in temp_root.glob(f"{YOUTUBE_DOWNLOAD_DIR_PREFIX}*"):
+        if _cleanup_managed_youtube_dir(path):
+            removed += 1
+    if removed:
+        print(f"[YouTube Cleanup] Removed {removed} stale download folder(s) on startup")
+    return removed
+
+
+def _build_youtube_progress_hook(progress, title_hint: str = ""):
+    """Create a yt-dlp progress hook that forwards progress into Gradio."""
+    title_hint = _clean_text(title_hint)
+
+    def _hook(update: dict):
+        if progress is None or not isinstance(update, dict):
+            return
+        status = str(update.get("status", "")).strip().lower()
+        label = title_hint or "YouTube match"
+
+        if status == "downloading":
+            downloaded = float(update.get("downloaded_bytes") or 0.0)
+            total = float(
+                update.get("total_bytes")
+                or update.get("total_bytes_estimate")
+                or 0.0
+            )
+            if total > 0:
+                fraction = max(0.0, min(downloaded / total, 1.0))
+                progress(0.1 + (0.8 * fraction), desc=f"Downloading {label}... {fraction * 100:.1f}%")
+            else:
+                progress(0.5, desc=f"Downloading {label}...")
+        elif status == "finished":
+            progress(0.93, desc=f"Finalizing {label}...")
+        elif status == "error":
+            progress(0.1, desc=f"Download failed for {label}")
+
+    return _hook
+
+
 def _download_youtube_video(youtube_url: str, progress=None) -> tuple:
     """Download a YouTube match video and return its local path plus parsed metadata."""
     url = str(youtube_url or "").strip()
@@ -192,7 +312,7 @@ def _download_youtube_video(youtube_url: str, progress=None) -> tuple:
         raise gr.Error("yt-dlp is not installed. Please reinstall dependencies.") from exc
 
     ffmpeg_exe = _ensure_ffmpeg_executable()
-    download_dir = Path(tempfile.mkdtemp(prefix="youtube_match_"))
+    download_dir = Path(tempfile.mkdtemp(prefix=YOUTUBE_DOWNLOAD_DIR_PREFIX))
 
     ydl_opts = {
         "noplaylist": True,
@@ -209,26 +329,120 @@ def _download_youtube_video(youtube_url: str, progress=None) -> tuple:
         progress(0.05, desc="Fetching YouTube match metadata...")
 
     with YoutubeDL(ydl_opts) as ydl:
-        info = ydl.extract_info(url, download=False)
-        metadata = _parse_youtube_match_metadata(
-            info.get("title", ""),
-            info.get("description", ""),
-        )
-        if progress is not None:
-            progress(0.35, desc=f"Downloading {metadata.get('match_title') or 'YouTube match'}...")
-        info = ydl.extract_info(url, download=True)
-        video_path = _resolve_downloaded_video_path(info, download_dir, ydl=ydl)
+        try:
+            info = ydl.extract_info(url, download=False)
+            metadata = _parse_youtube_match_metadata(
+                info.get("title", ""),
+                info.get("description", ""),
+            )
+            if progress is not None:
+                progress(0.12, desc=f"Starting download for {metadata.get('match_title') or 'YouTube match'}...")
+            ydl_opts["progress_hooks"] = [_build_youtube_progress_hook(progress, metadata.get("match_label") or metadata.get("match_title") or "YouTube match")]
+        except Exception:
+            _cleanup_managed_youtube_dir(download_dir)
+            raise
+
+    with YoutubeDL(ydl_opts) as ydl:
+        try:
+            info = ydl.extract_info(url, download=True)
+            video_path = _resolve_downloaded_video_path(info, download_dir, ydl=ydl)
+        except Exception:
+            _cleanup_managed_youtube_dir(download_dir)
+            raise
 
     if not video_path:
+        _cleanup_managed_youtube_dir(download_dir)
         raise gr.Error("The YouTube download completed, but the video file could not be found.")
 
     metadata.update({
+        "match_label": _clean_text(
+            _parse_match_title_parts(info.get("title", ""))[0] or metadata.get("match_label", "")
+        ),
         "match_title": _clean_text(info.get("title", metadata.get("match_title", ""))),
         "regional_name": _clean_text(
-            _parse_match_title_and_regional(info.get("title", ""))[1] or metadata.get("regional_name", "")
+            _parse_match_title_parts(info.get("title", ""))[2] or metadata.get("regional_name", "")
         ),
     })
+    if progress is not None:
+        progress(0.98, desc=f"Download complete: {metadata.get('match_title') or 'YouTube match'}")
     return video_path, metadata
+
+
+def _get_page_title_for_match(metadata: dict) -> str:
+    """Return the short browser-tab title for a downloaded match."""
+    if isinstance(metadata, dict):
+        return _clean_text(metadata.get("match_label") or metadata.get("match_title") or DEFAULT_PAGE_TITLE)
+    return DEFAULT_PAGE_TITLE
+
+
+def _create_scaled_video_preview(video_path: str, target_width: int = MANUAL_PREVIEW_TARGET_WIDTH,
+                                 target_height: int = MANUAL_PREVIEW_TARGET_HEIGHT,
+                                 progress=None) -> str:
+    """Create a lighter-weight 720p preview video for manual playback."""
+    if not video_path:
+        return ""
+
+    cap = cv2.VideoCapture(video_path)
+    if not cap.isOpened():
+        raise gr.Error("Could not open preview video source.")
+
+    source_width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH) or 0)
+    source_height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT) or 0)
+    fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
+    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
+    cap.release()
+
+    if source_width <= 0 or source_height <= 0:
+        raise gr.Error("Could not determine preview video dimensions.")
+    if source_width <= target_width and source_height <= target_height:
+        return video_path
+
+    scaled_width = max(2, int(target_width))
+    scaled_height = max(2, int(target_height))
+
+    output_path = tempfile.NamedTemporaryFile(suffix="_manual_preview.mp4", delete=False).name
+    ffmpeg_exe = _ensure_ffmpeg_executable()
+
+    if ffmpeg_exe:
+        if progress:
+            progress(0.02, desc="Preparing 720p-class manual preview...")
+        cmd = [
+            ffmpeg_exe, "-y",
+            "-i", video_path,
+            "-vf", f"scale={scaled_width}:{scaled_height}:flags=lanczos",
+            "-c:v", "libx264", "-preset", "ultrafast", "-crf", "24",
+            "-an",
+            output_path,
+        ]
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
+        if result.returncode != 0:
+            raise gr.Error(f"Preview video creation failed: {result.stderr[-500:]}")
+        return output_path
+
+    cap = cv2.VideoCapture(video_path)
+    if not cap.isOpened():
+        raise gr.Error("Could not reopen preview video source.")
+
+    fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+    out = cv2.VideoWriter(output_path, fourcc, fps, (scaled_width, scaled_height))
+    if not out.isOpened():
+        cap.release()
+        raise gr.Error("Could not create manual preview video.")
+
+    frame_idx = 0
+    while True:
+        ret, frame = cap.read()
+        if not ret:
+            break
+        resized = cv2.resize(frame, (scaled_width, scaled_height), interpolation=cv2.INTER_AREA)
+        out.write(resized)
+        frame_idx += 1
+        if progress and frame_idx % 100 == 0 and total_frames > 0:
+            progress(min(0.98, frame_idx / total_frames), desc=f"Preparing manual preview... {frame_idx}/{total_frames}")
+
+    cap.release()
+    out.release()
+    return output_path
 
 
 def _serialize_calibration_points(points: list, image_size: tuple) -> list:
@@ -418,6 +632,7 @@ def _prepare_manual_video_calibration_state(video_path: str, start_seconds: floa
         return None, None, None, None, [], None, "Failed to extract center calibration frame", "{}", False
 
     center_video_path = extract_center_video_from_composite(video_path)
+    preview_video_path = _create_scaled_video_preview(center_video_path, target_width=MANUAL_PREVIEW_TARGET_WIDTH)
     center_points, _, _, loaded_saved = _get_saved_calibration_points(
         regional_name,
         center_frame=center_frame,
@@ -426,7 +641,7 @@ def _prepare_manual_video_calibration_state(video_path: str, start_seconds: floa
     )
     center_image = _redraw_calibration_image(center_frame, center_points) if center_points else center_frame
     return (
-        center_video_path,
+        preview_video_path,
         center_video_path,
         center_image,
         center_frame,
@@ -6932,6 +7147,14 @@ def _parse_manual_robot_tracks_json(manual_tracks_json: str, blue_robots: list, 
     if not isinstance(slot_payload, dict):
         raise gr.Error("Manual robot tracks are missing slot data.")
 
+    video_payload = payload.get("video") if isinstance(payload.get("video"), dict) else {}
+    try:
+        source_width = float(video_payload.get("width") or 0)
+        source_height = float(video_payload.get("height") or 0)
+    except (TypeError, ValueError):
+        source_width = 0.0
+        source_height = 0.0
+
     parsed_tracks = {}
     missing_labels = []
 
@@ -6970,6 +7193,8 @@ def _parse_manual_robot_tracks_json(manual_tracks_json: str, blue_robots: list, 
             "alliance": alliance,
             "samples": deduped,
             "times": [sample[0] for sample in deduped],
+            "source_width": source_width,
+            "source_height": source_height,
         }
 
     if missing_labels:
@@ -7090,6 +7315,11 @@ def build_manual_robot_bboxes_json(manual_robot_tracks: dict, target_time: float
             continue
 
         center_x, center_y, is_shooting = interp
+        source_width = float(robot_track.get("source_width") or 0)
+        source_height = float(robot_track.get("source_height") or 0)
+        if source_width > 0 and source_height > 0:
+            center_x = (float(center_x) / source_width) * float(frame_width)
+            center_y = (float(center_y) / source_height) * float(frame_height)
         x1, y1, x2, y2 = _estimate_manual_robot_bbox(center_x, center_y, frame_width, frame_height)
         bbox_area = (x2 - x1) * (y2 - y1)
         track_y = min(float(frame_height - 1), center_y + ((y2 - y1) / 6.0))
@@ -8336,234 +8566,521 @@ def process_dual_videos(blue_video_path: str, red_video_path: str, center_video_
     """
 
     
-    # If composite video provided, split it into 3 separate camera feeds
-    if composite_video_path:
-        progress(0, desc="Splitting composite video into camera feeds...")
-        center_video_path, blue_video_path, red_video_path = split_composite_video(composite_video_path, progress)
-    
-    # Handle single video input (backwards compatibility)
-    if not blue_video_path and not red_video_path and not center_video_path:
-        raise gr.Error("Please upload at least one video file.")
-    
-    # Create separate lists for blue and red robots
-    blue_robots = [blue_robot_1, blue_robot_2, blue_robot_3]
-    red_robots = [red_robot_1, red_robot_2, red_robot_3]
+    managed_youtube_dir = _get_managed_youtube_download_dir(composite_video_path)
+    try:
+        # If composite video provided, split it into 3 separate camera feeds
+        if composite_video_path:
+            progress(0, desc="Splitting composite video into camera feeds...")
+            center_video_path, blue_video_path, red_video_path = split_composite_video(composite_video_path, progress)
+        
+        # Handle single video input (backwards compatibility)
+        if not blue_video_path and not red_video_path and not center_video_path:
+            raise gr.Error("Please upload at least one video file.")
+        
+        # Create separate lists for blue and red robots
+        blue_robots = [blue_robot_1, blue_robot_2, blue_robot_3]
+        red_robots = [red_robot_1, red_robot_2, red_robot_3]
 
-    _persist_regional_calibration(
-        regional_name,
-        calibration_points=calibration_points,
-        calibration_image_size=calibration_image_size,
-        blue_side_box_points=blue_side_box_points,
-        blue_side_box_image_size=blue_side_box_image_size,
-        red_side_box_points=red_side_box_points,
-        red_side_box_image_size=red_side_box_image_size,
-    )
-    
-    results = {}
-    
-    # Process videos sequentially to allow real-time progress updates
-    if blue_video_path and enable_blue_camera:
-        progress(0, desc="Starting Blue Camera processing...")
-        try:
-            output_path, robot_tracks, tracks_by_frame, width, height, robot_stats, ferry_counts, disabled_statuses, shot_events, shooting_snapshots, side_visible_robots, center_score_ocr = process_single_video(
-                blue_video_path,
-                "blue",
-                target_fps,
-                start_seconds,
-                end_seconds,
-                blue_robots,
-                red_robots,
-                enable_robot_detection,
-                False,  # Side cameras only used for positioning, not shot detection
-                progress,
-                "Blue Camera",
-                enable_person_detection=enable_person_detection,
-                side_box_points=blue_side_box_points,
-                side_box_image_size=blue_side_box_image_size,
-                highlight_ball_robot=highlight_ball_robot,
-            )
-            results['blue'] = {
-                'output_path': output_path,
-                'robot_tracks': robot_tracks,
-                'tracks_by_frame': tracks_by_frame,
-                'width': width,
-                'height': height,
-                'robot_stats': robot_stats,
-                'ferry_counts': ferry_counts,
-                'disabled_statuses': disabled_statuses,
-                'shot_events': shot_events,
-                'shooting_snapshots': shooting_snapshots,
-                'side_visible_robots': side_visible_robots,
-                'center_score_ocr': center_score_ocr,
-            }
-        except Exception as e:
-            import traceback
-            print(f"Error processing blue camera: {e}")
-            print(traceback.format_exc())
-            raise gr.Error(f"Error processing blue camera: {e}")
-    
-    if red_video_path and enable_red_camera:
-        progress(0.5, desc="Starting Red Camera processing...")
-        try:
-            output_path, robot_tracks, tracks_by_frame, width, height, robot_stats, ferry_counts, disabled_statuses, shot_events, shooting_snapshots, side_visible_robots, center_score_ocr = process_single_video(
-                red_video_path,
-                "red",
-                target_fps,
-                start_seconds,
-                end_seconds,
-                blue_robots,
-                red_robots,
-                enable_robot_detection,
-                False,  # Side cameras only used for positioning, not shot detection
-                progress,
-                "Red Camera",
-                enable_person_detection=enable_person_detection,
-                side_box_points=red_side_box_points,
-                side_box_image_size=red_side_box_image_size,
-                highlight_ball_robot=highlight_ball_robot,
-            )
-            results['red'] = {
-                'output_path': output_path,
-                'robot_tracks': robot_tracks,
-                'tracks_by_frame': tracks_by_frame,
-                'width': width,
-                'height': height,
-                'robot_stats': robot_stats,
-                'ferry_counts': ferry_counts,
-                'disabled_statuses': disabled_statuses,
-                'shot_events': shot_events,
-                'shooting_snapshots': shooting_snapshots,
-                'side_visible_robots': side_visible_robots,
-                'center_score_ocr': center_score_ocr,
-            }
-        except Exception as e:
-            import traceback
-            print(f"Error processing red camera: {e}")
-            print(traceback.format_exc())
-            raise gr.Error(f"Error processing red camera: {e}")
-    
-    # Process center camera
-    if center_video_path and enable_center_camera:
-        progress(0.4, desc="Starting Center Camera processing...")
-        try:
-            output_path, robot_tracks, tracks_by_frame, width, height, robot_stats, ferry_counts, disabled_statuses, shot_events, shooting_snapshots, _, center_score_ocr = process_single_video(
-                center_video_path,
-                "center",
-                target_fps,
-                start_seconds,
-                end_seconds,
-                blue_robots,
-                red_robots,
-                enable_robot_detection,
-                enable_fuel_detection,
-                progress,
-                "Center Camera",
-                enable_person_detection=enable_person_detection,
-                calibration_points=calibration_points,
-                calibration_image_size=calibration_image_size,
-                side_camera_visible_robots={
-                    'blue': results.get('blue', {}).get('side_visible_robots', {}),
-                    'red': results.get('red', {}).get('side_visible_robots', {}),
-                },
-                show_unlabeled_robots=show_unlabeled_robots,
-                highlight_ball_robot=highlight_ball_robot,
-            )
-            results['center'] = {
-                'output_path': output_path,
-                'robot_tracks': robot_tracks,
-                'tracks_by_frame': tracks_by_frame,
-                'width': width,
-                'height': height,
-                'robot_stats': robot_stats,
-                'ferry_counts': ferry_counts,
-                'disabled_statuses': disabled_statuses,
-                'shot_events': shot_events,
-                'shooting_snapshots': shooting_snapshots,
-                'center_score_ocr': center_score_ocr,
-            }
-        except Exception as e:
-            import traceback
-            print(f"Error processing center camera: {e}")
-            print(traceback.format_exc())
-            raise gr.Error(f"Error processing center camera: {e}")
-    
-    # Use dimensions from blue camera (or red, or center if others not available)
-    frame_width = results.get('blue', results.get('red', results.get('center', {}))).get('width', 1068)
-    frame_height = results.get('blue', results.get('red', results.get('center', {}))).get('height', 836)
-    
-    # Merge robot tracks from all cameras (with field-position-based camera trust)
-    blue_tracks = results.get('blue', {}).get('robot_tracks', {})
-    red_tracks = results.get('red', {}).get('robot_tracks', {})
-    center_tracks = results.get('center', {}).get('robot_tracks', {})
-    
-    # Merge blue and red camera tracks first
-    merged_tracks = merge_robot_tracks(blue_tracks, red_tracks, frame_width, frame_height)
-    
-    # Add center camera tracks (center camera provides full-field view)
-    # For robots seen by center camera, add those positions to merged_tracks
-    for label, positions in center_tracks.items():
-        if label not in merged_tracks:
-            merged_tracks[label] = []
-        # Append center camera positions (they have camera_side="center")
-        merged_tracks[label].extend(positions)
-    
-    # Merge frame-by-frame tracks for video (with field-position-based camera trust)
-    blue_frames = results.get('blue', {}).get('tracks_by_frame', [])
-    red_frames = results.get('red', {}).get('tracks_by_frame', [])
-    center_frames = results.get('center', {}).get('tracks_by_frame', [])
-    merged_frames = merge_frame_tracks(blue_frames, red_frames, frame_width, frame_height)
-    
-    # Merge center camera frame data into merged_frames
-    for i, center_data in enumerate(center_frames):
-        if i < len(merged_frames):
-            # Add center camera detections to merged frames
-            for label, pos in center_data.items():
-                if label not in merged_frames[i]:
-                    merged_frames[i][label] = pos
-                # If robot already in merged_frames, center provides additional confidence
-                # but we keep the blue/red merged position as primary
-        else:
-            # Center camera has more frames than blue/red - append
-            merged_frames.append(center_data)
-    
-    # Generate individual robot movement maps (15 seconds each)
-    progress(0.75, desc="Generating individual robot maps...")
-    all_robot_labels = blue_robots + red_robots
-    robot_map_paths = []
-    
-    for robot_label in all_robot_labels:
-        if robot_label and robot_label.strip():
-            label = robot_label.strip()
-            # Filter merged_tracks to only include this robot
-            single_robot_tracks = {label: merged_tracks.get(label, [])}
-            
-            # Only generate map if robot has position data
-            if single_robot_tracks[label]:
-                robot_map = draw_robot_paths(
-                    MAP_IMAGE_PATH, single_robot_tracks, frame_width, frame_height, 
-                    "blue", blue_robots, red_robots, max_seconds=15, fps=target_fps
+        _persist_regional_calibration(
+            regional_name,
+            calibration_points=calibration_points,
+            calibration_image_size=calibration_image_size,
+            blue_side_box_points=blue_side_box_points,
+            blue_side_box_image_size=blue_side_box_image_size,
+            red_side_box_points=red_side_box_points,
+            red_side_box_image_size=red_side_box_image_size,
+        )
+        
+        results = {}
+        
+        # Process videos sequentially to allow real-time progress updates
+        if blue_video_path and enable_blue_camera:
+            progress(0, desc="Starting Blue Camera processing...")
+            try:
+                output_path, robot_tracks, tracks_by_frame, width, height, robot_stats, ferry_counts, disabled_statuses, shot_events, shooting_snapshots, side_visible_robots, center_score_ocr = process_single_video(
+                    blue_video_path,
+                    "blue",
+                    target_fps,
+                    start_seconds,
+                    end_seconds,
+                    blue_robots,
+                    red_robots,
+                    enable_robot_detection,
+                    False,  # Side cameras only used for positioning, not shot detection
+                    progress,
+                    "Blue Camera",
+                    enable_person_detection=enable_person_detection,
+                    side_box_points=blue_side_box_points,
+                    side_box_image_size=blue_side_box_image_size,
+                    highlight_ball_robot=highlight_ball_robot,
                 )
-                robot_map_path = tempfile.NamedTemporaryFile(suffix=".png", delete=False).name
-                robot_map.save(robot_map_path)
-                robot_map_paths.append(robot_map_path)
+                results['blue'] = {
+                    'output_path': output_path,
+                    'robot_tracks': robot_tracks,
+                    'tracks_by_frame': tracks_by_frame,
+                    'width': width,
+                    'height': height,
+                    'robot_stats': robot_stats,
+                    'ferry_counts': ferry_counts,
+                    'disabled_statuses': disabled_statuses,
+                    'shot_events': shot_events,
+                    'shooting_snapshots': shooting_snapshots,
+                    'side_visible_robots': side_visible_robots,
+                    'center_score_ocr': center_score_ocr,
+                }
+            except Exception as e:
+                import traceback
+                print(f"Error processing blue camera: {e}")
+                print(traceback.format_exc())
+                raise gr.Error(f"Error processing blue camera: {e}")
+        
+        if red_video_path and enable_red_camera:
+            progress(0.5, desc="Starting Red Camera processing...")
+            try:
+                output_path, robot_tracks, tracks_by_frame, width, height, robot_stats, ferry_counts, disabled_statuses, shot_events, shooting_snapshots, side_visible_robots, center_score_ocr = process_single_video(
+                    red_video_path,
+                    "red",
+                    target_fps,
+                    start_seconds,
+                    end_seconds,
+                    blue_robots,
+                    red_robots,
+                    enable_robot_detection,
+                    False,  # Side cameras only used for positioning, not shot detection
+                    progress,
+                    "Red Camera",
+                    enable_person_detection=enable_person_detection,
+                    side_box_points=red_side_box_points,
+                    side_box_image_size=red_side_box_image_size,
+                    highlight_ball_robot=highlight_ball_robot,
+                )
+                results['red'] = {
+                    'output_path': output_path,
+                    'robot_tracks': robot_tracks,
+                    'tracks_by_frame': tracks_by_frame,
+                    'width': width,
+                    'height': height,
+                    'robot_stats': robot_stats,
+                    'ferry_counts': ferry_counts,
+                    'disabled_statuses': disabled_statuses,
+                    'shot_events': shot_events,
+                    'shooting_snapshots': shooting_snapshots,
+                    'side_visible_robots': side_visible_robots,
+                    'center_score_ocr': center_score_ocr,
+                }
+            except Exception as e:
+                import traceback
+                print(f"Error processing red camera: {e}")
+                print(traceback.format_exc())
+                raise gr.Error(f"Error processing red camera: {e}")
+        
+        # Process center camera
+        if center_video_path and enable_center_camera:
+            progress(0.4, desc="Starting Center Camera processing...")
+            try:
+                output_path, robot_tracks, tracks_by_frame, width, height, robot_stats, ferry_counts, disabled_statuses, shot_events, shooting_snapshots, _, center_score_ocr = process_single_video(
+                    center_video_path,
+                    "center",
+                    target_fps,
+                    start_seconds,
+                    end_seconds,
+                    blue_robots,
+                    red_robots,
+                    enable_robot_detection,
+                    enable_fuel_detection,
+                    progress,
+                    "Center Camera",
+                    enable_person_detection=enable_person_detection,
+                    calibration_points=calibration_points,
+                    calibration_image_size=calibration_image_size,
+                    side_camera_visible_robots={
+                        'blue': results.get('blue', {}).get('side_visible_robots', {}),
+                        'red': results.get('red', {}).get('side_visible_robots', {}),
+                    },
+                    show_unlabeled_robots=show_unlabeled_robots,
+                    highlight_ball_robot=highlight_ball_robot,
+                )
+                results['center'] = {
+                    'output_path': output_path,
+                    'robot_tracks': robot_tracks,
+                    'tracks_by_frame': tracks_by_frame,
+                    'width': width,
+                    'height': height,
+                    'robot_stats': robot_stats,
+                    'ferry_counts': ferry_counts,
+                    'disabled_statuses': disabled_statuses,
+                    'shot_events': shot_events,
+                    'shooting_snapshots': shooting_snapshots,
+                    'center_score_ocr': center_score_ocr,
+                }
+            except Exception as e:
+                import traceback
+                print(f"Error processing center camera: {e}")
+                print(traceback.format_exc())
+                raise gr.Error(f"Error processing center camera: {e}")
+    
+        # Use dimensions from blue camera (or red, or center if others not available)
+        frame_width = results.get('blue', results.get('red', results.get('center', {}))).get('width', 1068)
+        frame_height = results.get('blue', results.get('red', results.get('center', {}))).get('height', 836)
+    
+        # Merge robot tracks from all cameras (with field-position-based camera trust)
+        blue_tracks = results.get('blue', {}).get('robot_tracks', {})
+        red_tracks = results.get('red', {}).get('robot_tracks', {})
+        center_tracks = results.get('center', {}).get('robot_tracks', {})
+        
+        # Merge blue and red camera tracks first
+        merged_tracks = merge_robot_tracks(blue_tracks, red_tracks, frame_width, frame_height)
+        
+        # Add center camera tracks (center camera provides full-field view)
+        # For robots seen by center camera, add those positions to merged_tracks
+        for label, positions in center_tracks.items():
+            if label not in merged_tracks:
+                merged_tracks[label] = []
+            # Append center camera positions (they have camera_side="center")
+            merged_tracks[label].extend(positions)
+        
+        # Merge frame-by-frame tracks for video (with field-position-based camera trust)
+        blue_frames = results.get('blue', {}).get('tracks_by_frame', [])
+        red_frames = results.get('red', {}).get('tracks_by_frame', [])
+        center_frames = results.get('center', {}).get('tracks_by_frame', [])
+        merged_frames = merge_frame_tracks(blue_frames, red_frames, frame_width, frame_height)
+        
+        # Merge center camera frame data into merged_frames
+        for i, center_data in enumerate(center_frames):
+            if i < len(merged_frames):
+                # Add center camera detections to merged frames
+                for label, pos in center_data.items():
+                    if label not in merged_frames[i]:
+                        merged_frames[i][label] = pos
+                    # If robot already in merged_frames, center provides additional confidence
+                    # but we keep the blue/red merged position as primary
+            else:
+                # Center camera has more frames than blue/red - append
+                merged_frames.append(center_data)
+        
+        # Generate individual robot movement maps (15 seconds each)
+        progress(0.75, desc="Generating individual robot maps...")
+        all_robot_labels = blue_robots + red_robots
+        robot_map_paths = []
+        
+        for robot_label in all_robot_labels:
+            if robot_label and robot_label.strip():
+                label = robot_label.strip()
+                # Filter merged_tracks to only include this robot
+                single_robot_tracks = {label: merged_tracks.get(label, [])}
+                
+                # Only generate map if robot has position data
+                if single_robot_tracks[label]:
+                    robot_map = draw_robot_paths(
+                        MAP_IMAGE_PATH, single_robot_tracks, frame_width, frame_height, 
+                        "blue", blue_robots, red_robots, max_seconds=15, fps=target_fps
+                    )
+                    robot_map_path = tempfile.NamedTemporaryFile(suffix=".png", delete=False).name
+                    robot_map.save(robot_map_path)
+                    robot_map_paths.append(robot_map_path)
+                else:
+                    robot_map_paths.append(None)
             else:
                 robot_map_paths.append(None)
-        else:
+        
+        # Pad to exactly 6 entries (3 blue + 3 red)
+        while len(robot_map_paths) < 6:
             robot_map_paths.append(None)
     
-    # Pad to exactly 6 entries (3 blue + 3 red)
-    while len(robot_map_paths) < 6:
-        robot_map_paths.append(None)
-    
-    # Interpolate positions for smooth movement on map
-    smoothed_frames = interpolate_robot_tracks(merged_frames, max_gap=15)
-    
-    # Generate map video (with alliance colors and smooth interpolation)
-    progress(0.9, desc="Generating map video...")
-    map_video_path = generate_map_video(MAP_IMAGE_PATH, smoothed_frames, frame_width, frame_height, target_fps=target_fps, blue_robots=blue_robots, red_robots=red_robots)
+            # Interpolate positions for smooth movement on map
+            smoothed_frames = interpolate_robot_tracks(merged_frames, max_gap=15)
+        
+            # Generate map video (with alliance colors and smooth interpolation)
+            progress(0.9, desc="Generating map video...")
+            map_video_path = generate_map_video(MAP_IMAGE_PATH, smoothed_frames, frame_width, frame_height, target_fps=target_fps, blue_robots=blue_robots, red_robots=red_robots)
 
-    center_match_clock_ocr = None
-    if center_video_path:
+            center_match_clock_ocr = None
+            if center_video_path:
+                progress(0.96, desc="Reading center match clock...")
+                center_match_clock_ocr = extract_center_match_clock_ocr(
+                    center_video_path,
+                    start_seconds=start_seconds,
+                    end_seconds=end_seconds,
+                )
+
+            progress(1.0, desc="All processing complete!")
+        
+            # Merge robot stats from all cameras using shot event deduplication
+            # Collect shot events from all cameras
+            all_shot_events = []  # List of (elapsed_seconds, robot_label, made_bool)
+            for camera in ['blue', 'red', 'center']:
+                camera_events = results.get(camera, {}).get('shot_events', [])
+                all_shot_events.extend(camera_events)
+        
+            merged_stats = _build_stats_from_shot_events(
+                all_shot_events,
+                dedup_window_seconds=MULTI_CAMERA_SHOT_DEDUP_WINDOW_SECONDS,
+                match_clock_ocr=center_match_clock_ocr,
+            )
+    
+    
+        # Legacy dedupe block left inert after switching to the shared stats builder above.
+        for robot_label, events in {}.items():
+            # Sort by timestamp
+            events.sort(key=lambda e: e[0])
+        
+            # Walk through events, deduplicating within time window
+            # Merge events regardless of result — if cameras disagree, prefer "made"
+            deduped_events = []
+            for elapsed, made in events:
+                # Check if this event is a duplicate of a recent one
+                is_duplicate = False
+                for i, (prev_elapsed, prev_made) in enumerate(deduped_events):
+                    if abs(elapsed - prev_elapsed) <= DEDUP_WINDOW_SECONDS:
+                        is_duplicate = True
+                        # If any camera saw it as made, count as made (optimistic)
+                        if made and not prev_made:
+                            deduped_events[i] = (prev_elapsed, True)
+                        break
+                if not is_duplicate:
+                    deduped_events.append((elapsed, made))
+        
+            # Build stats from deduplicated events
+            by_period = {name: {'attempts': 0, 'made': 0} for name, _, _ in MATCH_PERIODS}
+            total_attempts = 0
+            total_made = 0
+        
+            for elapsed, made in deduped_events:
+                period = get_match_period(elapsed)
+                total_attempts += 1
+                if made:
+                    total_made += 1
+                if period in by_period:
+                    by_period[period]['attempts'] += 1
+                    if made:
+                        by_period[period]['made'] += 1
+        
+            merged_stats[robot_label] = {
+                'attempts': total_attempts,
+                'made': total_made,
+                'by_period': by_period
+            }
+        
+            # Debug: show deduplication results
+            original_count = len(events)
+            deduped_count = len(deduped_events)
+            if original_count != deduped_count:
+                print(f"[DEDUP] Robot {robot_label}: {original_count} events -> {deduped_count} after dedup ({original_count - deduped_count} duplicates removed)")
+
+        center_score_ocr = results.get('center', {}).get('center_score_ocr')
+        center_shooting_snapshots = results.get('center', {}).get('shooting_snapshots')
+        merged_stats = _apply_ocr_score_correction(
+            merged_stats,
+            center_score_ocr,
+            blue_robots,
+            red_robots,
+            all_shot_events=all_shot_events,
+            shooting_snapshots=center_shooting_snapshots,
+            manual_mode=False,
+            match_clock_ocr=center_match_clock_ocr,
+        )
+    
+        # Get ferry counts from all cameras (ferry cycles complete per camera)
+        blue_ferry = results.get('blue', {}).get('ferry_counts', {})
+        red_ferry = results.get('red', {}).get('ferry_counts', {})
+        center_ferry = results.get('center', {}).get('ferry_counts', {})
+        merged_ferry_counts = {}
+    
+        # Merge ferry counts (take max from any camera since same crossing might be seen by multiple)
+        for label in set(blue_ferry.keys()) | set(red_ferry.keys()) | set(center_ferry.keys()):
+            merged_ferry_counts[label] = max(blue_ferry.get(label, 0), red_ferry.get(label, 0), center_ferry.get(label, 0))
+    
+        # Get disabled statuses from all cameras
+        blue_disabled = results.get('blue', {}).get('disabled_statuses', {})
+        red_disabled = results.get('red', {}).get('disabled_statuses', {})
+        center_disabled = results.get('center', {}).get('disabled_statuses', {})
+        merged_disabled_statuses = {}
+    
+        # Merge disabled statuses (use worst status, max time)
+        status_priority = {"Full": 2, "Partially": 1, "None": 0}
+        for label in set(blue_disabled.keys()) | set(red_disabled.keys()) | set(center_disabled.keys()):
+            statuses = [
+                blue_disabled.get(label, ("None", 0)),
+                red_disabled.get(label, ("None", 0)),
+                center_disabled.get(label, ("None", 0))
+            ]
+            # Pick worst status (highest priority) and max time
+            best = max(statuses, key=lambda s: status_priority.get(s[0], 0))
+            max_time = max(s[1] for s in statuses)
+            merged_disabled_statuses[label] = (best[0], max_time)
+    
+        # Format stats as markdown for Gradio display
+        def format_robot_stats_md(stats: dict, robot_label: str, ferry_counts: dict, disabled_statuses: dict) -> str:
+            ferry_count = ferry_counts.get(robot_label, 0)
+            disabled_status, disabled_time = disabled_statuses.get(robot_label, ("None", 0))
+        
+            # Format disabled status line
+            if disabled_status == "Full":
+                disabled_line = f"**🔴 Disabled: Full** - Robot was disabled for the entire match ({disabled_time:.1f}s longest)"
+            elif disabled_status == "Partially":
+                disabled_line = f"**🟡 Disabled: Partially** - Robot was disabled for part of the match ({disabled_time:.1f}s longest)"
+            else:
+                disabled_line = "**🟢 Disabled: None** - Robot was not disabled"
+        
+            if robot_label not in stats or not stats[robot_label].get('by_period'):
+                result = disabled_line + "\n\n"
+                if ferry_count > 0:
+                    result += f"**Ferried Fuel: {ferry_count}x**\n\n"
+                result += "*No shots recorded*"
+                return result
+        
+            robot_data = stats[robot_label]
+            total = f"**{robot_data['made']} shots made**"
+        
+            # Add ferry count if any
+            if ferry_count > 0:
+                total += f" | **Ferried: {ferry_count}x**"
+        
+            # Build period table
+            rows = ["| Period | Made |", "|--------|------|"]
+            for period_name, _, _ in MATCH_PERIODS:
+                p = robot_data['by_period'].get(period_name, {'attempts': 0, 'made': 0})
+                if p['attempts'] > 0:
+                    rows.append(f"| {period_name} | {p['made']} |")
+        
+            if len(rows) == 2:  # Only header rows
+                result = disabled_line + "\n\n"
+                if ferry_count > 0:
+                    result += f"**Ferried Fuel: {ferry_count}x**\n\n"
+                result += "*No shots recorded*"
+                return result
+        
+            return f"{disabled_line}\n\n{total}\n\n" + "\n".join(rows)
+    
+        # Generate markdown for each robot (all 6)
+        robot_stats_markdowns = []
+        for label in all_robot_labels:
+            if label and label.strip():
+                robot_stats_markdowns.append(format_robot_stats_md(merged_stats, label.strip(), merged_ferry_counts, merged_disabled_statuses))
+            else:
+                robot_stats_markdowns.append("*Robot not configured*")
+    
+        # Pad to exactly 6 entries
+        while len(robot_stats_markdowns) < 6:
+            robot_stats_markdowns.append("*Robot not configured*")
+    
+        # Return output paths (None if camera not provided)
+        blue_output = results.get('blue', {}).get('output_path', None)
+        red_output = results.get('red', {}).get('output_path', None)
+        center_output = results.get('center', {}).get('output_path', None)
+    
+        # Build labels for each robot (use team number as label)
+        robot_labels = []
+        for label in all_robot_labels:
+            if label and label.strip():
+                robot_labels.append(f"Team {label.strip()} - Autonomous")
+            else:
+                robot_labels.append("Not Configured")
+        while len(robot_labels) < 6:
+            robot_labels.append("Not Configured")
+    
+        # Return: blue_video, red_video, center_video, map_video, 6x(robot_map with dynamic label, robot_stats)
+        return (
+            blue_output, red_output, center_output, map_video_path,
+            gr.update(value=robot_map_paths[0], label=robot_labels[0]), robot_stats_markdowns[0],  # Blue 1
+            gr.update(value=robot_map_paths[1], label=robot_labels[1]), robot_stats_markdowns[1],  # Blue 2
+            gr.update(value=robot_map_paths[2], label=robot_labels[2]), robot_stats_markdowns[2],  # Blue 3
+            gr.update(value=robot_map_paths[3], label=robot_labels[3]), robot_stats_markdowns[3],  # Red 1
+            gr.update(value=robot_map_paths[4], label=robot_labels[4]), robot_stats_markdowns[4],  # Red 2
+            gr.update(value=robot_map_paths[5], label=robot_labels[5]), robot_stats_markdowns[5],  # Red 3
+        )
+    finally:
+        _cleanup_managed_youtube_dir(managed_youtube_dir)
+
+
+def process_manual_center_video(center_video_path: str = None, composite_video_path: str = None, target_fps: int = 3, start_seconds: float = 0, end_seconds: float = 0, blue_robot_1: str = "", blue_robot_2: str = "", blue_robot_3: str = "", red_robot_1: str = "", red_robot_2: str = "", red_robot_3: str = "", enable_fuel_detection: bool = True, calibration_points: list = None, calibration_image_size: tuple = None, manual_tracks_json: str = "", highlight_ball_robot: str = "", regional_name: str = "", progress=gr.Progress()) -> tuple:
+    """
+    Process only the center camera using human-provided robot tracks and SAM 3 ball detection.
+    """
+    managed_youtube_dir = _get_managed_youtube_download_dir(composite_video_path)
+    try:
+        if not center_video_path and composite_video_path:
+            progress(0, desc="Extracting center camera feed...")
+            center_video_path = extract_center_video_from_composite(composite_video_path, progress=progress)
+
+        if not center_video_path:
+            raise gr.Error("Please upload a match video.")
+
+        blue_robots = [blue_robot_1, blue_robot_2, blue_robot_3]
+        red_robots = [red_robot_1, red_robot_2, red_robot_3]
+        manual_robot_tracks = _parse_manual_robot_tracks_json(manual_tracks_json, blue_robots, red_robots)
+
+        _persist_regional_calibration(
+            regional_name,
+            calibration_points=calibration_points,
+            calibration_image_size=calibration_image_size,
+        )
+
+        progress(0.05, desc="Processing center camera with manual robot tracks...")
+        center_output, robot_tracks, tracks_by_frame, width, height, _, ferry_counts, disabled_statuses, shot_events, shooting_snapshots, _, center_score_ocr = process_single_video(
+            center_video_path,
+            "center",
+            target_fps,
+            start_seconds,
+            end_seconds,
+            blue_robots,
+            red_robots,
+            True,
+            enable_fuel_detection,
+            progress,
+            "Center Camera",
+            enable_person_detection=False,
+            calibration_points=calibration_points,
+            calibration_image_size=calibration_image_size,
+            side_camera_visible_robots=None,
+            show_unlabeled_robots=True,
+            manual_robot_tracks=manual_robot_tracks,
+            highlight_ball_robot=highlight_ball_robot,
+        )
+
+        all_robot_labels = blue_robots + red_robots
+        robot_map_paths = []
+
+        progress(0.75, desc="Generating individual robot maps...")
+        for robot_label in all_robot_labels:
+            if robot_label and robot_label.strip():
+                label = robot_label.strip()
+                single_robot_tracks = {label: robot_tracks.get(label, [])}
+                if single_robot_tracks[label]:
+                    robot_map = draw_robot_paths(
+                        MAP_IMAGE_PATH,
+                        single_robot_tracks,
+                        width,
+                        height,
+                        "center",
+                        blue_robots,
+                        red_robots,
+                        max_seconds=15,
+                        fps=target_fps,
+                    )
+                    robot_map_path = tempfile.NamedTemporaryFile(suffix=".png", delete=False).name
+                    robot_map.save(robot_map_path)
+                    robot_map_paths.append(robot_map_path)
+                else:
+                    robot_map_paths.append(None)
+            else:
+                robot_map_paths.append(None)
+
+        while len(robot_map_paths) < 6:
+            robot_map_paths.append(None)
+
+        smoothed_frames = interpolate_robot_tracks(tracks_by_frame, max_gap=15)
+        progress(0.9, desc="Generating map video...")
+        map_video_path = generate_map_video(
+            MAP_IMAGE_PATH,
+            smoothed_frames,
+            width,
+            height,
+            target_fps=target_fps,
+            blue_robots=blue_robots,
+            red_robots=red_robots,
+        )
+
         progress(0.96, desc="Reading center match clock...")
         center_match_clock_ocr = extract_center_match_clock_ocr(
             center_video_path,
@@ -8571,333 +9088,54 @@ def process_dual_videos(blue_video_path: str, red_video_path: str, center_video_
             end_seconds=end_seconds,
         )
 
-    progress(1.0, desc="All processing complete!")
-    
-    # Merge robot stats from all cameras using shot event deduplication
-    # Collect shot events from all cameras
-    all_shot_events = []  # List of (elapsed_seconds, robot_label, made_bool)
-    for camera in ['blue', 'red', 'center']:
-        camera_events = results.get(camera, {}).get('shot_events', [])
-        all_shot_events.extend(camera_events)
-    
-    merged_stats = _build_stats_from_shot_events(
-        all_shot_events,
-        dedup_window_seconds=MULTI_CAMERA_SHOT_DEDUP_WINDOW_SECONDS,
-        match_clock_ocr=center_match_clock_ocr,
-    )
-    
-    
-    # Legacy dedupe block left inert after switching to the shared stats builder above.
-    for robot_label, events in {}.items():
-        # Sort by timestamp
-        events.sort(key=lambda e: e[0])
-        
-        # Walk through events, deduplicating within time window
-        # Merge events regardless of result — if cameras disagree, prefer "made"
-        deduped_events = []
-        for elapsed, made in events:
-            # Check if this event is a duplicate of a recent one
-            is_duplicate = False
-            for i, (prev_elapsed, prev_made) in enumerate(deduped_events):
-                if abs(elapsed - prev_elapsed) <= DEDUP_WINDOW_SECONDS:
-                    is_duplicate = True
-                    # If any camera saw it as made, count as made (optimistic)
-                    if made and not prev_made:
-                        deduped_events[i] = (prev_elapsed, True)
-                    break
-            if not is_duplicate:
-                deduped_events.append((elapsed, made))
-        
-        # Build stats from deduplicated events
-        by_period = {name: {'attempts': 0, 'made': 0} for name, _, _ in MATCH_PERIODS}
-        total_attempts = 0
-        total_made = 0
-        
-        for elapsed, made in deduped_events:
-            period = get_match_period(elapsed)
-            total_attempts += 1
-            if made:
-                total_made += 1
-            if period in by_period:
-                by_period[period]['attempts'] += 1
-                if made:
-                    by_period[period]['made'] += 1
-        
-        merged_stats[robot_label] = {
-            'attempts': total_attempts,
-            'made': total_made,
-            'by_period': by_period
-        }
-        
-        # Debug: show deduplication results
-        original_count = len(events)
-        deduped_count = len(deduped_events)
-        if original_count != deduped_count:
-            print(f"[DEDUP] Robot {robot_label}: {original_count} events -> {deduped_count} after dedup ({original_count - deduped_count} duplicates removed)")
+        progress(1.0, desc="Manual center-camera processing complete!")
 
-    center_score_ocr = results.get('center', {}).get('center_score_ocr')
-    center_shooting_snapshots = results.get('center', {}).get('shooting_snapshots')
-    merged_stats = _apply_ocr_score_correction(
-        merged_stats,
-        center_score_ocr,
-        blue_robots,
-        red_robots,
-        all_shot_events=all_shot_events,
-        shooting_snapshots=center_shooting_snapshots,
-        manual_mode=False,
-        match_clock_ocr=center_match_clock_ocr,
-    )
-    
-    # Get ferry counts from all cameras (ferry cycles complete per camera)
-    blue_ferry = results.get('blue', {}).get('ferry_counts', {})
-    red_ferry = results.get('red', {}).get('ferry_counts', {})
-    center_ferry = results.get('center', {}).get('ferry_counts', {})
-    merged_ferry_counts = {}
-    
-    # Merge ferry counts (take max from any camera since same crossing might be seen by multiple)
-    for label in set(blue_ferry.keys()) | set(red_ferry.keys()) | set(center_ferry.keys()):
-        merged_ferry_counts[label] = max(blue_ferry.get(label, 0), red_ferry.get(label, 0), center_ferry.get(label, 0))
-    
-    # Get disabled statuses from all cameras
-    blue_disabled = results.get('blue', {}).get('disabled_statuses', {})
-    red_disabled = results.get('red', {}).get('disabled_statuses', {})
-    center_disabled = results.get('center', {}).get('disabled_statuses', {})
-    merged_disabled_statuses = {}
-    
-    # Merge disabled statuses (use worst status, max time)
-    status_priority = {"Full": 2, "Partially": 1, "None": 0}
-    for label in set(blue_disabled.keys()) | set(red_disabled.keys()) | set(center_disabled.keys()):
-        statuses = [
-            blue_disabled.get(label, ("None", 0)),
-            red_disabled.get(label, ("None", 0)),
-            center_disabled.get(label, ("None", 0))
-        ]
-        # Pick worst status (highest priority) and max time
-        best = max(statuses, key=lambda s: status_priority.get(s[0], 0))
-        max_time = max(s[1] for s in statuses)
-        merged_disabled_statuses[label] = (best[0], max_time)
-    
-    # Format stats as markdown for Gradio display
-    def format_robot_stats_md(stats: dict, robot_label: str, ferry_counts: dict, disabled_statuses: dict) -> str:
-        ferry_count = ferry_counts.get(robot_label, 0)
-        disabled_status, disabled_time = disabled_statuses.get(robot_label, ("None", 0))
-        
-        # Format disabled status line
-        if disabled_status == "Full":
-            disabled_line = f"**🔴 Disabled: Full** - Robot was disabled for the entire match ({disabled_time:.1f}s longest)"
-        elif disabled_status == "Partially":
-            disabled_line = f"**🟡 Disabled: Partially** - Robot was disabled for part of the match ({disabled_time:.1f}s longest)"
-        else:
-            disabled_line = "**🟢 Disabled: None** - Robot was not disabled"
-        
-        if robot_label not in stats or not stats[robot_label].get('by_period'):
-            result = disabled_line + "\n\n"
-            if ferry_count > 0:
-                result += f"**Ferried Fuel: {ferry_count}x**\n\n"
-            result += "*No shots recorded*"
-            return result
-        
-        robot_data = stats[robot_label]
-        total = f"**{robot_data['made']} shots made**"
-        
-        # Add ferry count if any
-        if ferry_count > 0:
-            total += f" | **Ferried: {ferry_count}x**"
-        
-        # Build period table
-        rows = ["| Period | Made |", "|--------|------|"]
-        for period_name, _, _ in MATCH_PERIODS:
-            p = robot_data['by_period'].get(period_name, {'attempts': 0, 'made': 0})
-            if p['attempts'] > 0:
-                rows.append(f"| {period_name} | {p['made']} |")
-        
-        if len(rows) == 2:  # Only header rows
-            result = disabled_line + "\n\n"
-            if ferry_count > 0:
-                result += f"**Ferried Fuel: {ferry_count}x**\n\n"
-            result += "*No shots recorded*"
-            return result
-        
-        return f"{disabled_line}\n\n{total}\n\n" + "\n".join(rows)
-    
-    # Generate markdown for each robot (all 6)
-    robot_stats_markdowns = []
-    for label in all_robot_labels:
-        if label and label.strip():
-            robot_stats_markdowns.append(format_robot_stats_md(merged_stats, label.strip(), merged_ferry_counts, merged_disabled_statuses))
-        else:
-            robot_stats_markdowns.append("*Robot not configured*")
-    
-    # Pad to exactly 6 entries
-    while len(robot_stats_markdowns) < 6:
-        robot_stats_markdowns.append("*Robot not configured*")
-    
-    # Return output paths (None if camera not provided)
-    blue_output = results.get('blue', {}).get('output_path', None)
-    red_output = results.get('red', {}).get('output_path', None)
-    center_output = results.get('center', {}).get('output_path', None)
-    
-    # Build labels for each robot (use team number as label)
-    robot_labels = []
-    for label in all_robot_labels:
-        if label and label.strip():
-            robot_labels.append(f"Team {label.strip()} - Autonomous")
-        else:
-            robot_labels.append("Not Configured")
-    while len(robot_labels) < 6:
-        robot_labels.append("Not Configured")
-    
-    # Return: blue_video, red_video, center_video, map_video, 6x(robot_map with dynamic label, robot_stats)
-    return (
-        blue_output, red_output, center_output, map_video_path,
-        gr.update(value=robot_map_paths[0], label=robot_labels[0]), robot_stats_markdowns[0],  # Blue 1
-        gr.update(value=robot_map_paths[1], label=robot_labels[1]), robot_stats_markdowns[1],  # Blue 2
-        gr.update(value=robot_map_paths[2], label=robot_labels[2]), robot_stats_markdowns[2],  # Blue 3
-        gr.update(value=robot_map_paths[3], label=robot_labels[3]), robot_stats_markdowns[3],  # Red 1
-        gr.update(value=robot_map_paths[4], label=robot_labels[4]), robot_stats_markdowns[4],  # Red 2
-        gr.update(value=robot_map_paths[5], label=robot_labels[5]), robot_stats_markdowns[5],  # Red 3
-    )
-
-
-def process_manual_center_video(center_video_path: str = None, composite_video_path: str = None, target_fps: int = 3, start_seconds: float = 0, end_seconds: float = 0, blue_robot_1: str = "", blue_robot_2: str = "", blue_robot_3: str = "", red_robot_1: str = "", red_robot_2: str = "", red_robot_3: str = "", enable_fuel_detection: bool = True, calibration_points: list = None, calibration_image_size: tuple = None, manual_tracks_json: str = "", highlight_ball_robot: str = "", regional_name: str = "", progress=gr.Progress()) -> tuple:
-    """
-    Process only the center camera using human-provided robot tracks and SAM 3 ball detection.
-    """
-    if not center_video_path and composite_video_path:
-        progress(0, desc="Extracting center camera feed...")
-        center_video_path = extract_center_video_from_composite(composite_video_path, progress=progress)
-
-    if not center_video_path:
-        raise gr.Error("Please upload a match video.")
-
-    blue_robots = [blue_robot_1, blue_robot_2, blue_robot_3]
-    red_robots = [red_robot_1, red_robot_2, red_robot_3]
-    manual_robot_tracks = _parse_manual_robot_tracks_json(manual_tracks_json, blue_robots, red_robots)
-
-    _persist_regional_calibration(
-        regional_name,
-        calibration_points=calibration_points,
-        calibration_image_size=calibration_image_size,
-    )
-
-    progress(0.05, desc="Processing center camera with manual robot tracks...")
-    center_output, robot_tracks, tracks_by_frame, width, height, _, ferry_counts, disabled_statuses, shot_events, shooting_snapshots, _, center_score_ocr = process_single_video(
-        center_video_path,
-        "center",
-        target_fps,
-        start_seconds,
-        end_seconds,
-        blue_robots,
-        red_robots,
-        True,
-        enable_fuel_detection,
-        progress,
-        "Center Camera",
-        enable_person_detection=False,
-        calibration_points=calibration_points,
-        calibration_image_size=calibration_image_size,
-        side_camera_visible_robots=None,
-        show_unlabeled_robots=True,
-        manual_robot_tracks=manual_robot_tracks,
-        highlight_ball_robot=highlight_ball_robot,
-    )
-
-    all_robot_labels = blue_robots + red_robots
-    robot_map_paths = []
-
-    progress(0.75, desc="Generating individual robot maps...")
-    for robot_label in all_robot_labels:
-        if robot_label and robot_label.strip():
-            label = robot_label.strip()
-            single_robot_tracks = {label: robot_tracks.get(label, [])}
-            if single_robot_tracks[label]:
-                robot_map = draw_robot_paths(
-                    MAP_IMAGE_PATH,
-                    single_robot_tracks,
-                    width,
-                    height,
-                    "center",
-                    blue_robots,
-                    red_robots,
-                    max_seconds=15,
-                    fps=target_fps,
-                )
-                robot_map_path = tempfile.NamedTemporaryFile(suffix=".png", delete=False).name
-                robot_map.save(robot_map_path)
-                robot_map_paths.append(robot_map_path)
+        merged_stats = _build_stats_from_shot_events(
+            shot_events,
+            dedup_window_seconds=None,
+            match_clock_ocr=center_match_clock_ocr,
+        )
+        merged_stats = _apply_ocr_score_correction(
+            merged_stats,
+            center_score_ocr,
+            blue_robots,
+            red_robots,
+            all_shot_events=shot_events,
+            shooting_snapshots=shooting_snapshots,
+            manual_mode=True,
+            match_clock_ocr=center_match_clock_ocr,
+        )
+        robot_stats_markdowns = []
+        for label in all_robot_labels:
+            if label and label.strip():
+                robot_stats_markdowns.append(format_robot_stats_md(merged_stats, label.strip(), ferry_counts, disabled_statuses))
             else:
-                robot_map_paths.append(None)
-        else:
-            robot_map_paths.append(None)
+                robot_stats_markdowns.append("*Robot not configured*")
 
-    while len(robot_map_paths) < 6:
-        robot_map_paths.append(None)
-
-    smoothed_frames = interpolate_robot_tracks(tracks_by_frame, max_gap=15)
-    progress(0.9, desc="Generating map video...")
-    map_video_path = generate_map_video(
-        MAP_IMAGE_PATH,
-        smoothed_frames,
-        width,
-        height,
-        target_fps=target_fps,
-        blue_robots=blue_robots,
-        red_robots=red_robots,
-    )
-
-    progress(0.96, desc="Reading center match clock...")
-    center_match_clock_ocr = extract_center_match_clock_ocr(
-        center_video_path,
-        start_seconds=start_seconds,
-        end_seconds=end_seconds,
-    )
-
-    progress(1.0, desc="Manual center-camera processing complete!")
-
-    merged_stats = _build_stats_from_shot_events(
-        shot_events,
-        dedup_window_seconds=None,
-        match_clock_ocr=center_match_clock_ocr,
-    )
-    merged_stats = _apply_ocr_score_correction(
-        merged_stats,
-        center_score_ocr,
-        blue_robots,
-        red_robots,
-        all_shot_events=shot_events,
-        shooting_snapshots=shooting_snapshots,
-        manual_mode=True,
-        match_clock_ocr=center_match_clock_ocr,
-    )
-    robot_stats_markdowns = []
-    for label in all_robot_labels:
-        if label and label.strip():
-            robot_stats_markdowns.append(format_robot_stats_md(merged_stats, label.strip(), ferry_counts, disabled_statuses))
-        else:
+        while len(robot_stats_markdowns) < 6:
             robot_stats_markdowns.append("*Robot not configured*")
 
-    while len(robot_stats_markdowns) < 6:
-        robot_stats_markdowns.append("*Robot not configured*")
-
-    robot_labels = []
-    for label in all_robot_labels:
-        if label and label.strip():
-            robot_labels.append(f"Team {label.strip()} - Autonomous")
-        else:
+        robot_labels = []
+        for label in all_robot_labels:
+            if label and label.strip():
+                robot_labels.append(f"Team {label.strip()} - Autonomous")
+            else:
+                robot_labels.append("Not Configured")
+        while len(robot_labels) < 6:
             robot_labels.append("Not Configured")
-    while len(robot_labels) < 6:
-        robot_labels.append("Not Configured")
 
-    return (
-        center_output,
-        map_video_path,
-        gr.update(value=robot_map_paths[0], label=robot_labels[0]), robot_stats_markdowns[0],
-        gr.update(value=robot_map_paths[1], label=robot_labels[1]), robot_stats_markdowns[1],
-        gr.update(value=robot_map_paths[2], label=robot_labels[2]), robot_stats_markdowns[2],
-        gr.update(value=robot_map_paths[3], label=robot_labels[3]), robot_stats_markdowns[3],
-        gr.update(value=robot_map_paths[4], label=robot_labels[4]), robot_stats_markdowns[4],
-        gr.update(value=robot_map_paths[5], label=robot_labels[5]), robot_stats_markdowns[5],
-    )
+        return (
+            center_output,
+            map_video_path,
+            gr.update(value=robot_map_paths[0], label=robot_labels[0]), robot_stats_markdowns[0],
+            gr.update(value=robot_map_paths[1], label=robot_labels[1]), robot_stats_markdowns[1],
+            gr.update(value=robot_map_paths[2], label=robot_labels[2]), robot_stats_markdowns[2],
+            gr.update(value=robot_map_paths[3], label=robot_labels[3]), robot_stats_markdowns[3],
+            gr.update(value=robot_map_paths[4], label=robot_labels[4]), robot_stats_markdowns[4],
+            gr.update(value=robot_map_paths[5], label=robot_labels[5]), robot_stats_markdowns[5],
+        )
+    finally:
+        _cleanup_managed_youtube_dir(managed_youtube_dir)
 
 
 MANUAL_TRACKER_HEAD = r"""
@@ -9880,7 +10118,7 @@ def create_manual_demo():
             with gr.Column(scale=1):
                 gr.Markdown("<div class='panel-title'>Manual Center Tracking Mode</div>", elem_classes="input-panel")
                 gr.Markdown(
-                    "This mode is enabled by `ROBOT_TRACKING_MODE=manual`. "
+                    "This mode is enabled by `config.json` with `\"robot_tracking_mode\": \"manual\"`. "
                     "Only the center camera is used. Side cameras, field-mask robot detection, and LLM robot labeling are skipped."
                 )
 
@@ -9902,6 +10140,7 @@ def create_manual_demo():
                         max_lines=1,
                     )
                 video_source_status = gr.Markdown(VIDEO_SOURCE_EMPTY_STATUS)
+                page_title_state = gr.Textbox(value="Robot Scouter - Manual Center Tracking", visible=False, elem_id="page-title-state")
 
                 preview_source_video = gr.Video(
                     label="Center Preview Source",
@@ -9987,6 +10226,7 @@ def create_manual_demo():
 
         with gr.Row():
             gr.HTML(MANUAL_TRACKER_HTML)
+        gr.HTML(PAGE_TITLE_SYNC_HTML)
 
         process_btn = gr.Button("Process Video")
 
@@ -10068,6 +10308,7 @@ def create_manual_demo():
                 resolved_regional,
                 highlight_update,
                 status,
+                _get_page_title_for_match(metadata),
             )
 
         composite_video_input.change(
@@ -10135,6 +10376,7 @@ def create_manual_demo():
                 regional_input,
                 highlight_ball_robot_dropdown,
                 video_source_status,
+                page_title_state,
             ]
         )
 
@@ -10171,6 +10413,7 @@ def create_manual_demo():
                 regional_input,
                 highlight_ball_robot_dropdown,
                 video_source_status,
+                page_title_state,
             ]
         )
 
@@ -10303,6 +10546,7 @@ def create_demo():
                         max_lines=1,
                     )
                 video_source_status = gr.Markdown(VIDEO_SOURCE_EMPTY_STATUS)
+                page_title_state = gr.Textbox(value=DEFAULT_PAGE_TITLE, visible=False, elem_id="page-title-state")
 
                 # Hidden placeholders for individual camera paths (not shown in UI)
                 blue_video_input = gr.State(None)
@@ -10540,6 +10784,7 @@ def create_demo():
                     with gr.Column():
                         red3_map = gr.Image(label="Red Robot 3 - Movement")
                         red3_stats = gr.Markdown("*Waiting for processing...*")
+        gr.HTML(PAGE_TITLE_SYNC_HTML)
         
         # --- Calibration Event Wiring ---
         
@@ -10592,6 +10837,7 @@ def create_demo():
                 resolved_regional,
                 highlight_update,
                 status,
+                _get_page_title_for_match(metadata),
             )
         
         composite_video_input.change(
@@ -10644,6 +10890,7 @@ def create_demo():
                 regional_input,
                 highlight_ball_robot_dropdown,
                 video_source_status,
+                page_title_state,
             ]
         )
 
@@ -10675,6 +10922,7 @@ def create_demo():
                 regional_input,
                 highlight_ball_robot_dropdown,
                 video_source_status,
+                page_title_state,
             ]
         )
         
@@ -10831,6 +11079,7 @@ def create_demo():
 
 
 if __name__ == "__main__":
+    _cleanup_old_youtube_downloads()
     demo = create_manual_demo() if MANUAL_ROBOT_TRACKING else create_demo()
     demo.launch(
         server_name="0.0.0.0",
