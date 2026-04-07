@@ -1980,7 +1980,7 @@ CENTER_SCORE_OCR_ATTRIBUTION_RELAXED_MAX_LAG_SECONDS = 6.0
 MANUAL_TRACK_SHOOTING_PERSIST_SECONDS = 4.0
 MULTI_CAMERA_SHOT_DEDUP_WINDOW_SECONDS = 3.0
 CENTER_MATCH_CLOCK_RECT = (900, 61, 1020, 128)
-CENTER_MATCH_CLOCK_OCR_SAMPLE_FPS = 5.0
+CENTER_MATCH_CLOCK_OCR_SAMPLE_FPS = 2.0
 CENTER_MATCH_CLOCK_OCR_MIN_CONFIRMATIONS = 2
 MATCH_CLOCK_LOOKUP_MAX_GAP_SECONDS = 6.0
 _CENTER_SCORE_OCR_DISABLED = pytesseract is None
@@ -2058,8 +2058,14 @@ def _parse_center_score_counter_text(text: str):
         return None
 
 
-def _ocr_center_roi_text(frame_bgr: np.ndarray, rect: tuple, whitelist: str, scale: float = 4.0):
-    """Run OCR on a scaled center-camera ROI and return a list of raw variant reads."""
+def _ocr_center_roi_text(
+    frame_bgr: np.ndarray,
+    rect: tuple,
+    whitelist: str,
+    scale: float = 4.0,
+    variant_mode: str = "all",
+):
+    """Run OCR on a scaled center-camera ROI and return raw OCR reads."""
     if pytesseract is None or frame_bgr is None or rect is None:
         return []
 
@@ -2076,17 +2082,21 @@ def _ocr_center_roi_text(frame_bgr: np.ndarray, rect: tuple, whitelist: str, sca
     gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
     gray = cv2.resize(gray, None, fx=scale, fy=scale, interpolation=cv2.INTER_CUBIC)
     gray = cv2.GaussianBlur(gray, (3, 3), 0)
-    _, thresh = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-    _, thresh_inv = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
-    adaptive = cv2.adaptiveThreshold(
-        gray,
-        255,
-        cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
-        cv2.THRESH_BINARY,
-        31,
-        5,
-    )
-    variants = [gray, thresh, thresh_inv, adaptive]
+    if variant_mode == "single":
+        _, single_variant = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+        variants = [single_variant]
+    else:
+        _, thresh = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+        _, thresh_inv = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
+        adaptive = cv2.adaptiveThreshold(
+            gray,
+            255,
+            cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+            cv2.THRESH_BINARY,
+            31,
+            5,
+        )
+        variants = [gray, thresh, thresh_inv, adaptive]
     outputs = []
 
     for variant in variants:
@@ -2306,7 +2316,13 @@ def _ocr_center_match_clock(frame_bgr: np.ndarray, return_debug: bool = False):
     parsed_values = []
 
     try:
-        raw_texts = _ocr_center_roi_text(frame_bgr, CENTER_MATCH_CLOCK_RECT, "0123456789:", scale=5.0)
+        raw_texts = _ocr_center_roi_text(
+            frame_bgr,
+            CENTER_MATCH_CLOCK_RECT,
+            "0123456789:",
+            scale=5.0,
+            variant_mode="single",
+        )
         debug_info["raw_texts"] = list(raw_texts or [])
     except TesseractNotFoundError as e:
         _CENTER_MATCH_CLOCK_OCR_DISABLED = True
@@ -8123,7 +8139,11 @@ def process_single_video(video_path: str, camera_side: str = "blue", target_fps:
 
         if center_score_ocr_tracker and frame_count % score_ocr_frame_interval == 0:
             center_score_ocr_tracker.update(frame, frame_count / max(1.0, original_fps))
-        if center_match_clock_overlay_tracker and frame_count % match_clock_ocr_frame_interval == 0:
+        if (
+            center_match_clock_overlay_tracker
+            and frame_count < end_frame
+            and frame_count % match_clock_ocr_frame_interval == 0
+        ):
             center_match_clock_overlay_tracker.update(frame, frame_count / max(1.0, original_fps))
 
         if frame_count >= end_frame:
@@ -8547,6 +8567,7 @@ def process_single_video(video_path: str, camera_side: str = "blue", target_fps:
     disabled_statuses = disabled_tracker.get_all_disabled_statuses()
     
     center_score_ocr = center_score_ocr_tracker.summary() if center_score_ocr_tracker else None
+    center_match_clock_ocr = center_match_clock_overlay_tracker.summary() if center_match_clock_overlay_tracker else None
     return (
         output_path,
         robot_tracks,
@@ -8560,6 +8581,7 @@ def process_single_video(video_path: str, camera_side: str = "blue", target_fps:
         ball_tracker.shooting_snapshots,
         side_visible_robots_by_frame,
         center_score_ocr,
+        center_match_clock_ocr,
     )
 
 
@@ -9165,7 +9187,7 @@ def process_dual_videos(blue_video_path: str, red_video_path: str, center_video_
         if blue_video_path and enable_blue_camera:
             progress(0, desc="Starting Blue Camera processing...")
             try:
-                output_path, robot_tracks, tracks_by_frame, width, height, robot_stats, ferry_counts, disabled_statuses, shot_events, shooting_snapshots, side_visible_robots, center_score_ocr = process_single_video(
+                output_path, robot_tracks, tracks_by_frame, width, height, robot_stats, ferry_counts, disabled_statuses, shot_events, shooting_snapshots, side_visible_robots, center_score_ocr, center_match_clock_ocr = process_single_video(
                     blue_video_path,
                     "blue",
                     target_fps,
@@ -9195,6 +9217,7 @@ def process_dual_videos(blue_video_path: str, red_video_path: str, center_video_
                     'shooting_snapshots': shooting_snapshots,
                     'side_visible_robots': side_visible_robots,
                     'center_score_ocr': center_score_ocr,
+                    'center_match_clock_ocr': center_match_clock_ocr,
                 }
             except Exception as e:
                 import traceback
@@ -9205,7 +9228,7 @@ def process_dual_videos(blue_video_path: str, red_video_path: str, center_video_
         if red_video_path and enable_red_camera:
             progress(0.5, desc="Starting Red Camera processing...")
             try:
-                output_path, robot_tracks, tracks_by_frame, width, height, robot_stats, ferry_counts, disabled_statuses, shot_events, shooting_snapshots, side_visible_robots, center_score_ocr = process_single_video(
+                output_path, robot_tracks, tracks_by_frame, width, height, robot_stats, ferry_counts, disabled_statuses, shot_events, shooting_snapshots, side_visible_robots, center_score_ocr, center_match_clock_ocr = process_single_video(
                     red_video_path,
                     "red",
                     target_fps,
@@ -9235,6 +9258,7 @@ def process_dual_videos(blue_video_path: str, red_video_path: str, center_video_
                     'shooting_snapshots': shooting_snapshots,
                     'side_visible_robots': side_visible_robots,
                     'center_score_ocr': center_score_ocr,
+                    'center_match_clock_ocr': center_match_clock_ocr,
                 }
             except Exception as e:
                 import traceback
@@ -9246,7 +9270,7 @@ def process_dual_videos(blue_video_path: str, red_video_path: str, center_video_
         if center_video_path and enable_center_camera:
             progress(0.4, desc="Starting Center Camera processing...")
             try:
-                output_path, robot_tracks, tracks_by_frame, width, height, robot_stats, ferry_counts, disabled_statuses, shot_events, shooting_snapshots, _, center_score_ocr = process_single_video(
+                output_path, robot_tracks, tracks_by_frame, width, height, robot_stats, ferry_counts, disabled_statuses, shot_events, shooting_snapshots, _, center_score_ocr, center_match_clock_ocr = process_single_video(
                     center_video_path,
                     "center",
                     target_fps,
@@ -9280,6 +9304,7 @@ def process_dual_videos(blue_video_path: str, red_video_path: str, center_video_
                     'shot_events': shot_events,
                     'shooting_snapshots': shooting_snapshots,
                     'center_score_ocr': center_score_ocr,
+                    'center_match_clock_ocr': center_match_clock_ocr,
                 }
             except Exception as e:
                 import traceback
@@ -9362,14 +9387,7 @@ def process_dual_videos(blue_video_path: str, red_video_path: str, center_video_
             progress(0.9, desc="Generating map video...")
             map_video_path = generate_map_video(MAP_IMAGE_PATH, smoothed_frames, frame_width, frame_height, target_fps=target_fps, blue_robots=blue_robots, red_robots=red_robots)
 
-            center_match_clock_ocr = None
-            if center_video_path:
-                progress(0.96, desc="Reading center match clock...")
-                center_match_clock_ocr = extract_center_match_clock_ocr(
-                    center_video_path,
-                    start_seconds=start_seconds,
-                    end_seconds=end_seconds,
-                )
+            center_match_clock_ocr = results.get('center', {}).get('center_match_clock_ocr')
 
             progress(1.0, desc="All processing complete!")
         
@@ -9586,7 +9604,7 @@ def process_manual_center_video(center_video_path: str = None, composite_video_p
         )
 
         progress(0.05, desc="Processing center camera with manual robot tracks...")
-        center_output, robot_tracks, tracks_by_frame, width, height, _, ferry_counts, disabled_statuses, shot_events, shooting_snapshots, _, center_score_ocr = process_single_video(
+        center_output, robot_tracks, tracks_by_frame, width, height, _, ferry_counts, disabled_statuses, shot_events, shooting_snapshots, _, center_score_ocr, center_match_clock_ocr = process_single_video(
             center_video_path,
             "center",
             target_fps,
@@ -9655,13 +9673,6 @@ def process_manual_center_video(center_video_path: str = None, composite_video_p
         else:
             while len(robot_map_paths) < 6:
                 robot_map_paths.append(None)
-
-        progress(0.96 if include_visual_outputs else 0.86, desc="Reading center match clock...")
-        center_match_clock_ocr = extract_center_match_clock_ocr(
-            center_video_path,
-            start_seconds=start_seconds,
-            end_seconds=end_seconds,
-        )
 
         progress(1.0, desc="Manual center-camera processing complete!")
 
