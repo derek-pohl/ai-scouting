@@ -286,7 +286,18 @@ def _merge_match_metadata(existing: dict, incoming: dict) -> dict:
         current_values = list(merged.get(alliance_key) or [])
         while len(current_values) < 3:
             current_values.append("")
-        for idx, value in enumerate(list(incoming.get(alliance_key) or [])[:3]):
+        incoming_values = list(incoming.get(alliance_key) or [])
+        while len(incoming_values) < 3:
+            incoming_values.append("")
+
+        current_filled = sum(1 for value in current_values[:3] if _clean_text(value))
+        incoming_filled = sum(1 for value in incoming_values[:3] if _clean_text(value))
+
+        if incoming_filled > current_filled:
+            merged[alliance_key] = [_clean_text(value) for value in incoming_values[:3]]
+            continue
+
+        for idx, value in enumerate(incoming_values[:3]):
             cleaned = _clean_text(value)
             if cleaned and not _clean_text(current_values[idx]):
                 current_values[idx] = cleaned
@@ -417,13 +428,32 @@ def _ensure_ffprobe_executable() -> str:
         return ""
 
 
+def _normalize_metadata_tag_name(tag_name: str) -> str:
+    """Normalize an ffprobe tag name for fuzzy matching."""
+    return re.sub(r"[^a-z0-9]+", "", str(tag_name or "").strip().lower())
+
+
+def _categorize_metadata_tag(tag_name: str) -> str:
+    """Classify ffprobe tags into title, description, or other buckets."""
+    normalized = _normalize_metadata_tag_name(tag_name)
+    if not normalized:
+        return "other"
+    if normalized == "title" or normalized.endswith("title"):
+        return "title"
+    if any(token in normalized for token in ("description", "comment", "synopsis", "caption", "summary")):
+        return "description"
+    return "other"
+
+
 def _extract_uploaded_video_match_metadata(video_path: str) -> dict:
     """Read embedded video metadata and parse any regional/team information it contains."""
     metadata = _blank_match_metadata()
     if not video_path:
         return metadata
 
-    candidate_texts = []
+    title_candidate_texts = []
+    description_candidate_texts = []
+    other_candidate_texts = []
     ffprobe_exe = _ensure_ffprobe_executable()
     if ffprobe_exe:
         try:
@@ -451,41 +481,29 @@ def _extract_uploaded_video_match_metadata(video_path: str) -> dict:
                     if isinstance(stream_tags, dict):
                         tag_dicts.append(stream_tags)
 
-                preferred_keys = (
-                    "title",
-                    "comment",
-                    "description",
-                    "synopsis",
-                    "purl",
-                    "caption",
-                )
-                for key in preferred_keys:
-                    for tag_dict in tag_dicts:
-                        value = next(
-                            (
-                                tag_value for tag_name, tag_value in tag_dict.items()
-                                if str(tag_name).strip().lower() == key and _clean_text(tag_value)
-                            ),
-                            "",
-                        )
-                        if value:
-                            candidate_texts.append(value)
-
                 for tag_dict in tag_dicts:
-                    for value in tag_dict.values():
+                    for tag_name, value in tag_dict.items():
                         cleaned_value = _clean_text(value)
-                        if cleaned_value:
-                            candidate_texts.append(cleaned_value)
+                        if not cleaned_value:
+                            continue
+                        bucket = _categorize_metadata_tag(tag_name)
+                        if bucket == "title":
+                            title_candidate_texts.append(cleaned_value)
+                        elif bucket == "description":
+                            description_candidate_texts.append(cleaned_value)
+                        else:
+                            other_candidate_texts.append(cleaned_value)
         except Exception as exc:
             print(f"[Video Metadata] Failed to read metadata from {video_path}: {exc}")
 
     try:
-        candidate_texts.append(Path(video_path).stem)
+        other_candidate_texts.append(Path(video_path).stem)
     except Exception:
         pass
 
     deduped_texts = []
     seen_texts = set()
+    candidate_texts = title_candidate_texts + description_candidate_texts + other_candidate_texts
     for text in candidate_texts:
         cleaned = _clean_text(text)
         if cleaned and cleaned not in seen_texts:
