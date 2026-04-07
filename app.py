@@ -638,7 +638,7 @@ def _build_youtube_progress_hook(progress, title_hint: str = ""):
 
 
 def _download_youtube_video(youtube_url: str, progress=None) -> tuple:
-    """Download a YouTube match video and return its local path plus parsed metadata."""
+    """Download a YouTube match video and return its local path plus basic title metadata."""
     url = str(youtube_url or "").strip()
     if not url:
         raise gr.Error("Please enter a YouTube URL.")
@@ -671,25 +671,8 @@ def _download_youtube_video(youtube_url: str, progress=None) -> tuple:
     })
 
     if progress is not None:
-        progress(0.05, desc="Fetching YouTube match metadata...")
-
-    try:
-        with YoutubeDL(metadata_ydl_opts) as ydl:
-            info = ydl.extract_info(url, download=False)
-            metadata = _parse_youtube_match_metadata(
-                info.get("title", ""),
-                info.get("description", ""),
-            )
-    except DownloadError:
-        _cleanup_managed_youtube_dir(download_dir)
-        raise
-    except Exception:
-        _cleanup_managed_youtube_dir(download_dir)
-        raise
-
-    if progress is not None:
-        progress(0.12, desc=f"Starting download for {metadata.get('match_title') or 'YouTube match'}...")
-    download_ydl_opts["progress_hooks"] = [_build_youtube_progress_hook(progress, metadata.get("match_label") or metadata.get("match_title") or "YouTube match")]
+        progress(0.05, desc="Starting YouTube video download...")
+    download_ydl_opts["progress_hooks"] = [_build_youtube_progress_hook(progress, "YouTube video")]
 
     try:
         with YoutubeDL(download_ydl_opts) as ydl:
@@ -706,17 +689,11 @@ def _download_youtube_video(youtube_url: str, progress=None) -> tuple:
         _cleanup_managed_youtube_dir(download_dir)
         raise gr.Error("The YouTube download completed, but the video file could not be found.")
 
-    metadata.update({
-        "match_label": _clean_text(
-            _parse_match_title_parts(info.get("title", ""))[0] or metadata.get("match_label", "")
-        ),
-        "match_title": _clean_text(info.get("title", metadata.get("match_title", ""))),
-        "regional_name": _clean_text(
-            _parse_match_title_parts(info.get("title", ""))[2] or metadata.get("regional_name", "")
-        ),
-    })
+    metadata = _blank_match_metadata()
+    metadata["match_title"] = _clean_text(info.get("title", ""))
+    metadata["match_label"] = _clean_text(_parse_match_title_parts(info.get("title", ""))[0])
     if progress is not None:
-        progress(0.98, desc=f"Download complete: {metadata.get('match_title') or 'YouTube match'}")
+        progress(0.98, desc=f"Download complete: {metadata.get('match_title') or 'YouTube video'}")
     return video_path, metadata
 
 
@@ -11140,7 +11117,7 @@ def create_manual_demo(limited_mode: bool = False):
                     youtube_download_btn = gr.Button("Download YouTube Video")
                     regional_input = gr.Textbox(
                         label="Regional / Event",
-                        placeholder="Auto-filled from YouTube, or type it for uploads",
+                        placeholder="Enter the event name to reuse saved calibration",
                         max_lines=1,
                     )
                 video_source_status = gr.Markdown(VIDEO_SOURCE_EMPTY_STATUS)
@@ -11177,15 +11154,15 @@ def create_manual_demo(limited_mode: bool = False):
 
                 gr.Markdown("### Blue Alliance")
                 with gr.Row():
-                    blue_robot_1 = gr.Textbox(label="Robot 1", value="1796", max_lines=1, elem_id="blue-robot-1-input")
-                    blue_robot_2 = gr.Textbox(label="Robot 2", value="250", max_lines=1, elem_id="blue-robot-2-input")
-                    blue_robot_3 = gr.Textbox(label="Robot 3", value="11331", max_lines=1, elem_id="blue-robot-3-input")
+                    blue_robot_1 = gr.Textbox(label="Robot 1", value="", placeholder="e.g., 1919", max_lines=1, elem_id="blue-robot-1-input")
+                    blue_robot_2 = gr.Textbox(label="Robot 2", value="", placeholder="e.g., 334", max_lines=1, elem_id="blue-robot-2-input")
+                    blue_robot_3 = gr.Textbox(label="Robot 3", value="", placeholder="e.g., 254", max_lines=1, elem_id="blue-robot-3-input")
 
                 gr.Markdown("### Red Alliance")
                 with gr.Row():
-                    red_robot_1 = gr.Textbox(label="Robot 1", value="7759", max_lines=1, elem_id="red-robot-1-input")
-                    red_robot_2 = gr.Textbox(label="Robot 2", value="6621", max_lines=1, elem_id="red-robot-2-input")
-                    red_robot_3 = gr.Textbox(label="Robot 3", value="333", max_lines=1, elem_id="red-robot-3-input")
+                    red_robot_1 = gr.Textbox(label="Robot 1", value="", placeholder="e.g., 118", max_lines=1, elem_id="red-robot-1-input")
+                    red_robot_2 = gr.Textbox(label="Robot 2", value="", placeholder="e.g., 973", max_lines=1, elem_id="red-robot-2-input")
+                    red_robot_3 = gr.Textbox(label="Robot 3", value="", placeholder="e.g., 2056", max_lines=1, elem_id="red-robot-3-input")
 
                 with gr.Row():
                     fps_slider = gr.Slider(
@@ -11217,7 +11194,7 @@ def create_manual_demo(limited_mode: bool = False):
                     )
 
                 highlight_ball_robot_dropdown = gr.Dropdown(
-                    choices=_build_ball_highlight_choices(["1768", "4909", "5962"], ["2342", "6328", "2877"]),
+                    choices=_build_ball_highlight_choices(["", "", ""], ["", "", ""]),
                     value=BALL_HIGHLIGHT_ALL_OPTION,
                     label="Ball Overlay Highlight",
                     info="Only this robot's attributed balls stay fully colored in the annotated export."
@@ -11278,41 +11255,33 @@ def create_manual_demo(limited_mode: bool = False):
                                        current_blue_1, current_blue_2, current_blue_3,
                                        current_red_1, current_red_2, current_red_3,
                                        current_highlight, current_regional):
-            metadata = _extract_uploaded_video_match_metadata(video_path)
-            merged_blue = _merge_prefilled_robot_numbers(
-                metadata.get("blue_robots", []),
-                [current_blue_1, current_blue_2, current_blue_3],
-            )
-            merged_red = _merge_prefilled_robot_numbers(
-                metadata.get("red_robots", []),
-                [current_red_1, current_red_2, current_red_3],
-            )
-            resolved_regional = _clean_text(metadata.get("regional_name") or current_regional)
+            manual_blue = [current_blue_1, current_blue_2, current_blue_3]
+            manual_red = [current_red_1, current_red_2, current_red_3]
+            resolved_regional = _clean_text(current_regional)
             manual_state = _prepare_manual_video_calibration_state(video_path, start_seconds, resolved_regional)
             loaded_saved = manual_state[-1]
             highlight_update = _update_ball_highlight_dropdown(
-                merged_blue[0], merged_blue[1], merged_blue[2],
-                merged_red[0], merged_red[1], merged_red[2],
+                manual_blue[0], manual_blue[1], manual_blue[2],
+                manual_red[0], manual_red[1], manual_red[2],
                 current_highlight,
             )
             status = VIDEO_SOURCE_EMPTY_STATUS if video_path is None else _format_video_source_status(
                 "Uploaded video ready.",
                 regional_name=resolved_regional,
-                match_title=metadata.get("match_title", ""),
-                blue_robots=merged_blue,
-                red_robots=merged_red,
+                blue_robots=manual_blue,
+                red_robots=manual_red,
                 calibration_loaded=loaded_saved,
             )
-            resolved_page_title = _get_page_title_for_match(metadata) if _clean_text(metadata.get("match_title") or metadata.get("match_label")) else page_title
+            metadata = _blank_match_metadata()
             return (
                 *manual_state[:-1],
-                merged_blue[0], merged_blue[1], merged_blue[2],
-                merged_red[0], merged_red[1], merged_red[2],
+                manual_blue[0], manual_blue[1], manual_blue[2],
+                manual_red[0], manual_red[1], manual_red[2],
                 resolved_regional,
                 highlight_update,
                 status,
                 metadata,
-                resolved_page_title,
+                page_title,
             )
 
         def handle_manual_regional_change(video_path, start_seconds, regional_name,
@@ -11339,40 +11308,34 @@ def create_manual_demo(limited_mode: bool = False):
                                            current_highlight, current_regional,
                                            progress=gr.Progress()):
             video_path, metadata = _download_youtube_video(youtube_url, progress=progress)
-            merged_blue = _merge_prefilled_robot_numbers(
-                metadata.get("blue_robots", []),
-                [current_blue_1, current_blue_2, current_blue_3],
-            )
-            merged_red = _merge_prefilled_robot_numbers(
-                metadata.get("red_robots", []),
-                [current_red_1, current_red_2, current_red_3],
-            )
-            resolved_regional = _clean_text(metadata.get("regional_name") or current_regional)
+            manual_blue = [current_blue_1, current_blue_2, current_blue_3]
+            manual_red = [current_red_1, current_red_2, current_red_3]
+            resolved_regional = _clean_text(current_regional)
             manual_state = _prepare_manual_video_calibration_state(video_path, start_seconds, resolved_regional)
             loaded_saved = manual_state[-1]
             highlight_update = _update_ball_highlight_dropdown(
-                merged_blue[0], merged_blue[1], merged_blue[2],
-                merged_red[0], merged_red[1], merged_red[2],
+                manual_blue[0], manual_blue[1], manual_blue[2],
+                manual_red[0], manual_red[1], manual_red[2],
                 current_highlight,
             )
             status = _format_video_source_status(
                 "YouTube video ready.",
                 regional_name=resolved_regional,
                 match_title=metadata.get("match_title", ""),
-                blue_robots=merged_blue,
-                red_robots=merged_red,
+                blue_robots=manual_blue,
+                red_robots=manual_red,
                 calibration_loaded=loaded_saved,
             )
             return (
                 video_path,
                 *manual_state[:-1],
-                merged_blue[0], merged_blue[1], merged_blue[2],
-                merged_red[0], merged_red[1], merged_red[2],
+                manual_blue[0], manual_blue[1], manual_blue[2],
+                manual_red[0], manual_red[1], manual_red[2],
                 resolved_regional,
                 highlight_update,
                 status,
                 metadata,
-                _get_page_title_for_match(metadata),
+                _get_page_title_for_match(metadata) if _clean_text(metadata.get("match_title")) else page_title,
             )
 
         composite_video_input.change(
@@ -11645,7 +11608,7 @@ def create_demo():
                     youtube_download_btn = gr.Button("Download YouTube Video")
                     regional_input = gr.Textbox(
                         label="Regional / Event",
-                        placeholder="Auto-filled from YouTube, or type it for uploads",
+                        placeholder="Enter the event name to reuse saved calibration",
                         max_lines=1,
                     )
                 video_source_status = gr.Markdown(VIDEO_SOURCE_EMPTY_STATUS)
@@ -11727,19 +11690,19 @@ def create_demo():
                 with gr.Row():
                     blue_robot_1 = gr.Textbox(
                         label="Robot 1",
-                        value="1796",
+                        value="",
                         placeholder="e.g., 1919",
                         max_lines=1
                     )
                     blue_robot_2 = gr.Textbox(
                         label="Robot 2",
-                        value="250",
+                        value="",
                         placeholder="e.g., 334",
                         max_lines=1
                     )
                     blue_robot_3 = gr.Textbox(
                         label="Robot 3",
-                        value="11331",
+                        value="",
                         placeholder="e.g., 254",
                         max_lines=1
                     )
@@ -11748,19 +11711,19 @@ def create_demo():
                 with gr.Row():
                     red_robot_1 = gr.Textbox(
                         label="Robot 1",
-                        value="7759",
+                        value="",
                         placeholder="e.g., 118",
                         max_lines=1
                     )
                     red_robot_2 = gr.Textbox(
                         label="Robot 2",
-                        value="6621",
+                        value="",
                         placeholder="e.g., 973",
                         max_lines=1
                     )
                     red_robot_3 = gr.Textbox(
                         label="Robot 3",
-                        value="333",
+                        value="",
                         placeholder="e.g., 2056",
                         max_lines=1
                     )
@@ -11832,7 +11795,7 @@ def create_demo():
                     )
 
                 highlight_ball_robot_dropdown = gr.Dropdown(
-                    choices=_build_ball_highlight_choices(["1768", "4909", "5962"], ["2342", "6328", "2877"]),
+                    choices=_build_ball_highlight_choices(["", "", ""], ["", "", ""]),
                     value=BALL_HIGHLIGHT_ALL_OPTION,
                     label="Ball Overlay Highlight",
                     info="Only this robot's attributed balls stay fully colored in the annotated export."
@@ -11898,41 +11861,33 @@ def create_demo():
                                 current_red_1, current_red_2, current_red_3,
                                 current_highlight, current_regional):
             """Extract calibration frames and apply any saved regional calibration."""
-            metadata = _extract_uploaded_video_match_metadata(video_path)
-            merged_blue = _merge_prefilled_robot_numbers(
-                metadata.get("blue_robots", []),
-                [current_blue_1, current_blue_2, current_blue_3],
-            )
-            merged_red = _merge_prefilled_robot_numbers(
-                metadata.get("red_robots", []),
-                [current_red_1, current_red_2, current_red_3],
-            )
-            resolved_regional = _clean_text(metadata.get("regional_name") or current_regional)
+            manual_blue = [current_blue_1, current_blue_2, current_blue_3]
+            manual_red = [current_red_1, current_red_2, current_red_3]
+            resolved_regional = _clean_text(current_regional)
             calibration_state = _prepare_composite_video_calibration_state(video_path, start_seconds, resolved_regional)
             loaded_saved = calibration_state[-1]
             highlight_update = _update_ball_highlight_dropdown(
-                merged_blue[0], merged_blue[1], merged_blue[2],
-                merged_red[0], merged_red[1], merged_red[2],
+                manual_blue[0], manual_blue[1], manual_blue[2],
+                manual_red[0], manual_red[1], manual_red[2],
                 current_highlight,
             )
             status = VIDEO_SOURCE_EMPTY_STATUS if video_path is None else _format_video_source_status(
                 "Uploaded video ready.",
                 regional_name=resolved_regional,
-                match_title=metadata.get("match_title", ""),
-                blue_robots=merged_blue,
-                red_robots=merged_red,
+                blue_robots=manual_blue,
+                red_robots=manual_red,
                 calibration_loaded=loaded_saved,
             )
-            resolved_page_title = _get_page_title_for_match(metadata) if _clean_text(metadata.get("match_title") or metadata.get("match_label")) else DEFAULT_PAGE_TITLE
+            metadata = _blank_match_metadata()
             return (
                 *calibration_state[:-1],
-                merged_blue[0], merged_blue[1], merged_blue[2],
-                merged_red[0], merged_red[1], merged_red[2],
+                manual_blue[0], manual_blue[1], manual_blue[2],
+                manual_red[0], manual_red[1], manual_red[2],
                 resolved_regional,
                 highlight_update,
                 status,
                 metadata,
-                resolved_page_title,
+                DEFAULT_PAGE_TITLE,
             )
 
         def handle_regional_change(video_path, start_seconds, regional_name,
@@ -11959,40 +11914,34 @@ def create_demo():
                                     current_highlight, current_regional,
                                     progress=gr.Progress()):
             video_path, metadata = _download_youtube_video(youtube_url, progress=progress)
-            merged_blue = _merge_prefilled_robot_numbers(
-                metadata.get("blue_robots", []),
-                [current_blue_1, current_blue_2, current_blue_3],
-            )
-            merged_red = _merge_prefilled_robot_numbers(
-                metadata.get("red_robots", []),
-                [current_red_1, current_red_2, current_red_3],
-            )
-            resolved_regional = _clean_text(metadata.get("regional_name") or current_regional)
+            manual_blue = [current_blue_1, current_blue_2, current_blue_3]
+            manual_red = [current_red_1, current_red_2, current_red_3]
+            resolved_regional = _clean_text(current_regional)
             calibration_state = _prepare_composite_video_calibration_state(video_path, start_seconds, resolved_regional)
             loaded_saved = calibration_state[-1]
             highlight_update = _update_ball_highlight_dropdown(
-                merged_blue[0], merged_blue[1], merged_blue[2],
-                merged_red[0], merged_red[1], merged_red[2],
+                manual_blue[0], manual_blue[1], manual_blue[2],
+                manual_red[0], manual_red[1], manual_red[2],
                 current_highlight,
             )
             status = _format_video_source_status(
                 "YouTube video ready.",
                 regional_name=resolved_regional,
                 match_title=metadata.get("match_title", ""),
-                blue_robots=merged_blue,
-                red_robots=merged_red,
+                blue_robots=manual_blue,
+                red_robots=manual_red,
                 calibration_loaded=loaded_saved,
             )
             return (
                 video_path,
                 *calibration_state[:-1],
-                merged_blue[0], merged_blue[1], merged_blue[2],
-                merged_red[0], merged_red[1], merged_red[2],
+                manual_blue[0], manual_blue[1], manual_blue[2],
+                manual_red[0], manual_red[1], manual_red[2],
                 resolved_regional,
                 highlight_update,
                 status,
                 metadata,
-                _get_page_title_for_match(metadata),
+                _get_page_title_for_match(metadata) if _clean_text(metadata.get("match_title")) else DEFAULT_PAGE_TITLE,
             )
         
         composite_video_input.change(
