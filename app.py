@@ -472,9 +472,26 @@ def _extract_uploaded_video_match_metadata(video_path: str) -> dict:
             )
             if result.returncode == 0 and result.stdout.strip():
                 probe_data = json.loads(result.stdout)
-                tag_dicts = []
                 format_tags = probe_data.get("format", {}).get("tags")
-                if isinstance(format_tags, dict):
+                if not isinstance(format_tags, dict):
+                    format_tags = {}
+
+                # Prefer the long-form description fields first because MatchLIVE MP4s
+                # place alliance team numbers there, while title only contains the match/event.
+                preferred_probe_texts = []
+                for key in ("description", "synopsis", "comment", "title"):
+                    for tag_name, tag_value in format_tags.items():
+                        if _normalize_metadata_tag_name(tag_name) == key and _clean_text(tag_value):
+                            preferred_probe_texts.append(tag_value)
+
+                if preferred_probe_texts:
+                    metadata = _merge_match_metadata(
+                        metadata,
+                        _parse_match_metadata_from_texts(*preferred_probe_texts),
+                    )
+
+                tag_dicts = []
+                if format_tags:
                     tag_dicts.append(format_tags)
                 for stream in probe_data.get("streams") or []:
                     stream_tags = stream.get("tags")
@@ -511,7 +528,10 @@ def _extract_uploaded_video_match_metadata(video_path: str) -> dict:
             deduped_texts.append(cleaned)
 
     if deduped_texts:
-        metadata = _parse_match_metadata_from_texts(*deduped_texts)
+        metadata = _merge_match_metadata(
+            metadata,
+            _parse_match_metadata_from_texts(*deduped_texts),
+        )
     return metadata
 
 
