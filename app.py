@@ -251,6 +251,9 @@ def _build_composite_crop_layout(source_width: int, source_height: int) -> dict:
 INLINE_ALLIANCE_TEAMS_PATTERN = re.compile(
     r"(?i)\b(red|blue)\s*\(teams?\s*([^)]+)\)"
 )
+FLEXIBLE_ALLIANCE_TEAMS_PATTERN = re.compile(
+    r"(?is)\b(red|blue)\b(.*?)(?=\b(?:red|blue)\b|https?://|\buploaded by\b|\Z)"
+)
 MATCH_TEXT_HINT_PATTERN = re.compile(
     r"(?i)\b("
     r"qual(?:ification)?|practice|playoff|quarterfinal|semifinal|final|"
@@ -330,13 +333,38 @@ def _parse_match_title_parts(title: str) -> tuple:
 def _parse_alliance_teams_from_text(text: str) -> dict:
     """Extract blue / red alliance team numbers from any metadata text blob."""
     teams_by_alliance = {"blue": ["", "", ""], "red": ["", "", ""]}
-    for match in INLINE_ALLIANCE_TEAMS_PATTERN.finditer(str(text or "")):
+    cleaned_text = str(text or "")
+
+    for match in INLINE_ALLIANCE_TEAMS_PATTERN.finditer(cleaned_text):
         alliance = str(match.group(1)).strip().lower()
         team_blob = str(match.group(2)).strip()
         team_numbers = re.findall(r"\d+", team_blob)
         if team_numbers:
             padded = (team_numbers[:3] + ["", "", ""])[:3]
             teams_by_alliance[alliance] = padded
+
+    # Fall back to a more forgiving parser for MP4 metadata variants where
+    # the alliance text is flattened or scores are mixed into the same tag.
+    for match in FLEXIBLE_ALLIANCE_TEAMS_PATTERN.finditer(cleaned_text):
+        alliance = str(match.group(1)).strip().lower()
+        if any(_clean_text(value) for value in teams_by_alliance.get(alliance, [])):
+            continue
+
+        section = _clean_text(match.group(2))
+        if not section or "team" not in section.lower():
+            continue
+
+        teams_match = re.search(
+            r"(?is)\bteams?\b\s*[:=-]?\s*\(?\s*([0-9,\s/]+)",
+            section,
+        )
+        if teams_match:
+            team_numbers = re.findall(r"\d+", teams_match.group(1))
+        else:
+            team_numbers = []
+
+        if len(team_numbers) >= 3:
+            teams_by_alliance[alliance] = (team_numbers[:3] + ["", "", ""])[:3]
     return teams_by_alliance
 
 
