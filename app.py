@@ -48,10 +48,12 @@ def _load_app_config() -> dict:
 APP_CONFIG = _load_app_config()
 
 ROBOT_TRACKING_MODE = str(APP_CONFIG.get("robot_tracking_mode", "auto")).strip().lower()
-if ROBOT_TRACKING_MODE not in {"auto", "manual"}:
+VALID_ROBOT_TRACKING_MODES = {"auto", "manual", "manual-limited"}
+if ROBOT_TRACKING_MODE not in VALID_ROBOT_TRACKING_MODES:
     print(f"Unknown ROBOT_TRACKING_MODE={ROBOT_TRACKING_MODE!r}; defaulting to 'auto'")
     ROBOT_TRACKING_MODE = "auto"
-MANUAL_ROBOT_TRACKING = ROBOT_TRACKING_MODE == "manual"
+MANUAL_ROBOT_TRACKING = ROBOT_TRACKING_MODE in {"manual", "manual-limited"}
+MANUAL_LIMITED_ROBOT_TRACKING = ROBOT_TRACKING_MODE == "manual-limited"
 
 # YOLO person segmentation model (always loaded - used to exclude humans from bumper color detection)
 YOLO_PERSON_MODEL = None
@@ -126,6 +128,12 @@ DEFAULT_PAGE_TITLE = "Robot Scouter"
 MANUAL_PREVIEW_TARGET_WIDTH = 1280
 MANUAL_PREVIEW_TARGET_HEIGHT = 720
 YOUTUBE_DOWNLOAD_DIR_PREFIX = "youtube_match_"
+COMPOSITE_REFERENCE_SIZE = (1920, 1080)
+COMPOSITE_REFERENCE_CROP_RECTS = {
+    "center": (1, 0, 1919, 709),
+    "blue": (1, 739, 941, 1078),
+    "red": (979, 739, 1919, 1078),
+}
 PAGE_TITLE_SYNC_HTML = f"""
 <script>
 (() => {{
@@ -150,10 +158,46 @@ PAGE_TITLE_SYNC_HTML = f"""
 </script>
 """
 
+TRACKING_FPS_OPTIONS = (10, 20, 30)
+DEFAULT_TRACKING_FPS = 30
+BALL_TRACKER_BASELINE_FPS = 30.0
+
 
 def _clean_text(value: str) -> str:
     """Collapse whitespace and trim user-facing text."""
     return re.sub(r"\s+", " ", str(value or "").strip())
+
+
+def _normalize_tracking_fps(value, default: int = DEFAULT_TRACKING_FPS) -> int:
+    """Clamp external FPS inputs to the UI-supported tracking rates."""
+    try:
+        requested = int(round(float(value)))
+    except (TypeError, ValueError):
+        requested = int(default)
+    return min(TRACKING_FPS_OPTIONS, key=lambda option: abs(option - requested))
+
+
+def _compute_sampling_stride(source_fps: float, sample_fps: float) -> float:
+    """Return the source-frame stride needed to approximate a target sampling rate."""
+    source_fps = max(1.0, float(source_fps or DEFAULT_TRACKING_FPS))
+    sample_fps = max(1.0, float(sample_fps or source_fps))
+    return max(1.0, source_fps / sample_fps)
+
+
+def _consume_frame_schedule(frame_index: int, next_frame_index: float, frame_stride: float) -> tuple:
+    """
+    Decide whether the current source frame should be sampled for a target rate.
+
+    This keeps 20 FPS accurate on 30 FPS inputs instead of rounding to every
+    frame or every other frame.
+    """
+    current_frame = float(frame_index)
+    if current_frame + 1e-6 < next_frame_index:
+        return False, next_frame_index
+
+    while current_frame + 1e-6 >= next_frame_index:
+        next_frame_index += frame_stride
+    return True, next_frame_index
 
 
 def _normalize_regional_name(regional_name: str) -> str:
@@ -175,22 +219,118 @@ def _ensure_ffmpeg_executable() -> str:
     return ffmpeg_exe
 
 
+def _build_composite_crop_layout(source_width: int, source_height: int) -> dict:
+    """Scale the known composite-camera crop layout to the source video size."""
+    source_width = int(source_width or 0)
+    source_height = int(source_height or 0)
+    if source_width <= 0 or source_height <= 0:
+        raise gr.Error("Could not determine composite video dimensions.")
+
+    ref_width, ref_height = COMPOSITE_REFERENCE_SIZE
+    scale_x = float(source_width) / float(ref_width)
+    scale_y = float(source_height) / float(ref_height)
+    max_x1 = max(0, source_width - 1)
+    max_y1 = max(0, source_height - 1)
+
+    layout = {}
+    for name, (x1, y1, x2, y2) in COMPOSITE_REFERENCE_CROP_RECTS.items():
+        scaled_x1 = max(0, min(max_x1, int(round(x1 * scale_x))))
+        scaled_y1 = max(0, min(max_y1, int(round(y1 * scale_y))))
+        scaled_x2 = max(scaled_x1 + 1, min(source_width, int(round(x2 * scale_x))))
+        scaled_y2 = max(scaled_y1 + 1, min(source_height, int(round(y2 * scale_y))))
+        crop_width = max(1, scaled_x2 - scaled_x1)
+        crop_height = max(1, scaled_y2 - scaled_y1)
+        layout[name] = {
+            "rect": (scaled_x1, scaled_y1, scaled_x2, scaled_y2),
+            "size": (crop_width, crop_height),
+            "filter": f"crop={crop_width}:{crop_height}:{scaled_x1}:{scaled_y1}",
+        }
+    return layout
+
+
+INLINE_ALLIANCE_TEAMS_PATTERN = re.compile(
+    r"(?i)\b(red|blue)\s*\(teams?\s*([^)]+)\)"
+)
+MATCH_TEXT_HINT_PATTERN = re.compile(
+    r"(?i)\b("
+    r"qual(?:ification)?|practice|playoff|quarterfinal|semifinal|final|"
+    r"tiebreaker|match"
+    r")\b"
+)
+
+
+def _blank_match_metadata() -> dict:
+    """Create the shared match-metadata shape used by uploads and YouTube."""
+    return {
+        "match_label": "",
+        "match_title": "",
+        "regional_name": "",
+        "blue_robots": ["", "", ""],
+        "red_robots": ["", "", ""],
+    }
+
+
+def _merge_match_metadata(existing: dict, incoming: dict) -> dict:
+    """Merge parsed metadata without overwriting already-found values."""
+    merged = dict(existing or _blank_match_metadata())
+    incoming = dict(incoming or {})
+
+    for key in ("match_label", "match_title", "regional_name"):
+        if not _clean_text(merged.get(key, "")):
+            merged[key] = _clean_text(incoming.get(key, ""))
+
+    for alliance_key in ("blue_robots", "red_robots"):
+        current_values = list(merged.get(alliance_key) or [])
+        while len(current_values) < 3:
+            current_values.append("")
+        for idx, value in enumerate(list(incoming.get(alliance_key) or [])[:3]):
+            cleaned = _clean_text(value)
+            if cleaned and not _clean_text(current_values[idx]):
+                current_values[idx] = cleaned
+        merged[alliance_key] = current_values[:3]
+
+    return merged
+
+
+def _looks_like_match_text(text: str) -> bool:
+    """Heuristically decide whether a metadata string describes an FRC match."""
+    cleaned = _clean_text(text)
+    if not cleaned:
+        return False
+    lowered = cleaned.lower()
+    if lowered.startswith("http://") or lowered.startswith("https://"):
+        return False
+    return (
+        " - " in cleaned
+        or bool(MATCH_TEXT_HINT_PATTERN.search(cleaned))
+        or bool(INLINE_ALLIANCE_TEAMS_PATTERN.search(cleaned))
+    )
+
+
 def _parse_match_title_parts(title: str) -> tuple:
     """Split a match title into the match label, full title, and regional / event name."""
     full_title = _clean_text(title)
-    if " - " in full_title:
-        match_label, regional_name = full_title.split(" - ", 1)
-        return _clean_text(match_label), full_title, _clean_text(regional_name)
-    return full_title, full_title, ""
+    if not full_title:
+        return "", "", ""
+
+    alliance_match = INLINE_ALLIANCE_TEAMS_PATTERN.search(full_title)
+    if alliance_match and alliance_match.start() == 0:
+        return "", "", ""
+
+    trimmed_title = full_title[:alliance_match.start()] if alliance_match else full_title
+    trimmed_title = re.sub(r"\s*[-|:]+\s*$", "", trimmed_title).strip()
+    base_title = _clean_text(trimmed_title or full_title)
+
+    if " - " in base_title:
+        match_label, regional_name = base_title.split(" - ", 1)
+        return _clean_text(match_label), base_title, _clean_text(regional_name)
+    return base_title, base_title, ""
 
 
-def _parse_alliance_teams_from_description(description: str) -> dict:
-    """Extract blue / red alliance team numbers from a video description."""
+def _parse_alliance_teams_from_text(text: str) -> dict:
+    """Extract blue / red alliance team numbers from any metadata text blob."""
     teams_by_alliance = {"blue": ["", "", ""], "red": ["", "", ""]}
-    pattern = re.compile(
-        r"(?im)^\s*(red|blue)\s*\(teams?\s*([^)]+)\)\s*-\s*(\d+)\s*$"
-    )
-    for match in pattern.finditer(str(description or "")):
+    for match in INLINE_ALLIANCE_TEAMS_PATTERN.finditer(str(text or "")):
         alliance = str(match.group(1)).strip().lower()
         team_blob = str(match.group(2)).strip()
         team_numbers = re.findall(r"\d+", team_blob)
@@ -200,17 +340,133 @@ def _parse_alliance_teams_from_description(description: str) -> dict:
     return teams_by_alliance
 
 
+def _parse_match_metadata_from_texts(*texts: str) -> dict:
+    """Parse the useful scouting metadata from one or more title/description strings."""
+    metadata = _blank_match_metadata()
+    for text in texts:
+        cleaned = _clean_text(text)
+        if not cleaned:
+            continue
+
+        parsed = _blank_match_metadata()
+        if _looks_like_match_text(cleaned):
+            match_label, match_title, regional_name = _parse_match_title_parts(cleaned)
+            parsed.update({
+                "match_label": match_label,
+                "match_title": match_title,
+                "regional_name": regional_name,
+            })
+        parsed.update(_parse_alliance_teams_from_text(cleaned))
+        metadata = _merge_match_metadata(metadata, parsed)
+    return metadata
+
+
 def _parse_youtube_match_metadata(title: str, description: str) -> dict:
     """Parse the useful scouting metadata from a YouTube title / description."""
-    match_label, match_title, regional_name = _parse_match_title_parts(title)
-    alliance_teams = _parse_alliance_teams_from_description(description)
-    return {
-        "match_label": match_label,
-        "match_title": match_title,
-        "regional_name": regional_name,
-        "blue_robots": alliance_teams.get("blue", ["", "", ""]),
-        "red_robots": alliance_teams.get("red", ["", "", ""]),
-    }
+    return _parse_match_metadata_from_texts(title, description)
+
+
+def _ensure_ffprobe_executable() -> str:
+    """Return an FFprobe executable path when available."""
+    ffprobe_exe = shutil.which("ffprobe")
+    if ffprobe_exe:
+        return ffprobe_exe
+
+    ffmpeg_exe = _ensure_ffmpeg_executable()
+    if ffmpeg_exe:
+        ffmpeg_path = Path(ffmpeg_exe)
+        candidate_names = ["ffprobe.exe", "ffprobe"] if ffmpeg_path.suffix.lower() == ".exe" else ["ffprobe"]
+        for candidate_name in candidate_names:
+            candidate = ffmpeg_path.with_name(candidate_name)
+            if candidate.exists():
+                return str(candidate)
+
+    try:
+        import static_ffmpeg
+        static_ffmpeg.add_paths()
+        return shutil.which("ffprobe") or ""
+    except ImportError:
+        return ""
+
+
+def _extract_uploaded_video_match_metadata(video_path: str) -> dict:
+    """Read embedded video metadata and parse any regional/team information it contains."""
+    metadata = _blank_match_metadata()
+    if not video_path:
+        return metadata
+
+    candidate_texts = []
+    ffprobe_exe = _ensure_ffprobe_executable()
+    if ffprobe_exe:
+        try:
+            result = subprocess.run(
+                [
+                    ffprobe_exe,
+                    "-v", "quiet",
+                    "-print_format", "json",
+                    "-show_format",
+                    "-show_streams",
+                    str(video_path),
+                ],
+                capture_output=True,
+                text=True,
+                timeout=20,
+            )
+            if result.returncode == 0 and result.stdout.strip():
+                probe_data = json.loads(result.stdout)
+                tag_dicts = []
+                format_tags = probe_data.get("format", {}).get("tags")
+                if isinstance(format_tags, dict):
+                    tag_dicts.append(format_tags)
+                for stream in probe_data.get("streams") or []:
+                    stream_tags = stream.get("tags")
+                    if isinstance(stream_tags, dict):
+                        tag_dicts.append(stream_tags)
+
+                preferred_keys = (
+                    "title",
+                    "comment",
+                    "description",
+                    "synopsis",
+                    "purl",
+                    "caption",
+                )
+                for key in preferred_keys:
+                    for tag_dict in tag_dicts:
+                        value = next(
+                            (
+                                tag_value for tag_name, tag_value in tag_dict.items()
+                                if str(tag_name).strip().lower() == key and _clean_text(tag_value)
+                            ),
+                            "",
+                        )
+                        if value:
+                            candidate_texts.append(value)
+
+                for tag_dict in tag_dicts:
+                    for value in tag_dict.values():
+                        cleaned_value = _clean_text(value)
+                        if cleaned_value:
+                            candidate_texts.append(cleaned_value)
+        except Exception as exc:
+            print(f"[Video Metadata] Failed to read metadata from {video_path}: {exc}")
+
+    try:
+        candidate_texts.append(Path(video_path).stem)
+    except Exception:
+        pass
+
+    deduped_texts = []
+    seen_texts = set()
+    for text in candidate_texts:
+        cleaned = _clean_text(text)
+        if cleaned and cleaned not in seen_texts:
+            seen_texts.add(cleaned)
+            deduped_texts.append(cleaned)
+
+    if deduped_texts:
+        metadata = _parse_match_metadata_from_texts(*deduped_texts)
+    return metadata
 
 
 def _resolve_downloaded_video_path(info: dict, download_dir: Path, ydl=None) -> str:
@@ -3106,10 +3362,16 @@ class BallTracker:
             frame_width: Actual video frame width (for polygon scaling)
             frame_height: Actual video frame height (for polygon scaling)
         """
-        self.fps = fps
+        self.fps = max(1.0, float(fps))
+        # Lower tracking FPS means each observation is farther apart in time, so widen
+        # per-frame spatial tolerances and gravity integration proportionally.
+        self.frame_step_scale = max(1.0, BALL_TRACKER_BASELINE_FPS / self.fps)
         self.shot_label_duration = shot_label_duration
-        self.min_upward_pixels = min_upward_pixels
-        self.max_matching_distance = max_matching_distance
+        self.min_upward_pixels = max(4.0, float(min_upward_pixels) * self.frame_step_scale)
+        self.max_matching_distance = min(
+            180.0,
+            max(30.0, float(max_matching_distance) * self.frame_step_scale),
+        )
         self.max_frames_lost = max_frames_lost
         self.camera_side = camera_side
         self.blue_robots = [str(r).strip() for r in (blue_robots or []) if r]
@@ -3122,16 +3384,16 @@ class BallTracker:
         self.launch_anchor_y_ratio = 0.35
         self.launch_zone_y_ratio = 0.65
         self.launch_zone_x_ratio = 0.15
-        self.launch_anchor_max_distance = 175.0
+        self.launch_anchor_max_distance = min(325.0, 175.0 * self.frame_step_scale)
         self.min_launch_rise_pixels = max(4, int(round(self.min_upward_pixels * 0.5)))
         self.min_launch_window_gain = max(8, int(round(self.min_upward_pixels * 1.5)))
         self.motion_history_size = 4
-        self.trajectory_gravity = 0.5
+        self.trajectory_gravity = 0.5 * (self.frame_step_scale ** 2)
         self.prediction_horizon_frames = max(18, int(round(self.fps * 2.0)))
-        self.prediction_substeps = 3
+        self.prediction_substeps = max(3, int(round(3 * self.frame_step_scale)))
         self.prediction_bounds_padding = 40.0
         self.min_shot_progress_pixels = max(12.0, float(self.min_upward_pixels) * 2.0)
-        self.min_predicted_make_stable_frames = 3
+        self.min_predicted_make_stable_frames = max(2, int(round(self.fps * 0.10)))
         self.min_predicted_make_progress_pixels = max(24.0, self.min_shot_progress_pixels * 1.5)
         
         # Track balls: {ball_id: {'pos': (x, y, r), 'prev_pos': (x, y, r), 'shot_by': robot_label, ...}}
@@ -4078,7 +4340,7 @@ class BallTracker:
             # Use stored velocity with gravity for parabolic prediction
             vx, vy = lost_data.get('velocity', (0, 0))
             if vx != 0 or vy != 0:
-                vy += 0.5  # Gravity: ~0.5 px/frame² downward acceleration
+                vy += self.trajectory_gravity
                 pred_x += vx
                 pred_y += vy
                 lost_data['velocity'] = (vx, vy)
@@ -4783,9 +5045,9 @@ class CenterCameraCalibrator:
             print("[Calibration] Failed to read frame")
             return None
         
-        # Crop to center camera portion (matches split_composite_video: crop=1918:709:1:0)
         h, w = frame.shape[:2]
-        center_frame = frame[0:min(709, h), 1:min(1919, w)]  # y=0..709, x=1..1919
+        center_x1, center_y1, center_x2, center_y2 = _build_composite_crop_layout(w, h)["center"]["rect"]
+        center_frame = frame[center_y1:center_y2, center_x1:center_x2]
         
         frame_rgb = cv2.cvtColor(center_frame, cv2.COLOR_BGR2RGB)
         print(f"[Calibration] Extracted center camera frame: {center_frame.shape[1]}x{center_frame.shape[0]} from composite {w}x{h}")
@@ -4914,19 +5176,12 @@ def _extract_composite_calibration_frames(video_path: str, start_seconds: float 
         return None, None, None
 
     h, w = frame.shape[:2]
-    crops = {
-        "center": (1, 0, 1919, 709),
-        "blue": (1, 739, 941, 1078),
-        "red": (979, 739, 1919, 1078),
-    }
+    crops = _build_composite_crop_layout(w, h)
 
     images = {}
-    for name, (x1, y1, x2, y2) in crops.items():
-        cx1 = max(0, min(x1, w))
-        cy1 = max(0, min(y1, h))
-        cx2 = max(0, min(x2, w))
-        cy2 = max(0, min(y2, h))
-        crop = frame[cy1:cy2, cx1:cx2]
+    for name, crop_info in crops.items():
+        x1, y1, x2, y2 = crop_info["rect"]
+        crop = frame[y1:y2, x1:x2]
         if crop.size == 0:
             images[name] = None
             continue
@@ -7561,7 +7816,7 @@ def build_manual_robot_bboxes_json(manual_robot_tracks: dict, target_time: float
     return json.dumps(detections), frame_tracks
 
 
-def process_single_video(video_path: str, camera_side: str = "blue", target_fps: int = 3, start_seconds: float = 0, end_seconds: float = 0, blue_robots: list = None, red_robots: list = None, enable_robot_detection: bool = True, enable_fuel_detection: bool = True, progress=gr.Progress(), camera_name: str = "Camera", enable_person_detection: bool = True, calibration_points: list = None, calibration_image_size: tuple = None, side_box_points: list = None, side_box_image_size: tuple = None, side_camera_visible_robots: dict = None, show_unlabeled_robots: bool = True, manual_robot_tracks: dict = None, highlight_ball_robot: str = "") -> tuple:
+def process_single_video(video_path: str, camera_side: str = "blue", target_fps: int = 30, start_seconds: float = 0, end_seconds: float = 0, blue_robots: list = None, red_robots: list = None, enable_robot_detection: bool = True, enable_fuel_detection: bool = True, progress=gr.Progress(), camera_name: str = "Camera", enable_person_detection: bool = True, calibration_points: list = None, calibration_image_size: tuple = None, side_box_points: list = None, side_box_image_size: tuple = None, side_camera_visible_robots: dict = None, show_unlabeled_robots: bool = True, manual_robot_tracks: dict = None, highlight_ball_robot: str = "", render_output_video: bool = True) -> tuple:
     """
     Process a single video, tracking objects at specified FPS.
     Uses bumper color detection for robot identification.
@@ -7569,7 +7824,7 @@ def process_single_video(video_path: str, camera_side: str = "blue", target_fps:
     Args:
         video_path: Path to input video
         camera_side: "blue", "red", or "center" for camera perspective
-        target_fps: Target FPS for processing (default 3)
+        target_fps: Target FPS for robot + ball tracking / output (default 30)
         start_seconds: Start processing at this time (0 = from beginning)
         end_seconds: Stop processing at this time (0 = process to end)
         blue_robots: List of blue alliance team numbers [robot1, robot2, robot3]
@@ -7598,9 +7853,12 @@ def process_single_video(video_path: str, camera_side: str = "blue", target_fps:
     
     # Get video properties
     original_fps = cap.get(cv2.CAP_PROP_FPS)
+    if original_fps <= 0:
+        original_fps = float(DEFAULT_TRACKING_FPS)
     total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
     width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
     height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    target_fps = _normalize_tracking_fps(target_fps)
     
     # Frame interval is computed per-detection type below (robot, ball, person)
     
@@ -7622,42 +7880,41 @@ def process_single_video(video_path: str, camera_side: str = "blue", target_fps:
     if start_frame > 0:
         cap.set(cv2.CAP_PROP_POS_FRAMES, start_frame)
     
-    # Create output video at 30fps (ball detection rate) - use H264 codec for better compatibility
-    output_path = tempfile.NamedTemporaryFile(suffix=".mp4", delete=False).name
-    output_fps = min(30.0, original_fps)  # Output at 30fps or video fps if lower
-    # Try multiple codecs for Windows compatibility
-    fourcc_options = ['avc1', 'H264', 'mp4v', 'XVID']
+    output_path = None
+    ball_fps = min(float(target_fps), float(original_fps))
+    output_fps = ball_fps
     out = None
-    for codec in fourcc_options:
-        try:
-            fourcc = cv2.VideoWriter_fourcc(*codec)
+    if render_output_video:
+        # Create output video at the ball-tracking rate - use H264 codec for better compatibility
+        output_path = tempfile.NamedTemporaryFile(suffix=".mp4", delete=False).name
+        # Try multiple codecs for Windows compatibility
+        fourcc_options = ['avc1', 'H264', 'mp4v', 'XVID']
+        for codec in fourcc_options:
+            try:
+                fourcc = cv2.VideoWriter_fourcc(*codec)
+                out = cv2.VideoWriter(output_path, fourcc, output_fps, (width, height))
+                if out.isOpened():
+                    print(f"Using codec: {codec}")
+                    break
+            except Exception:
+                continue
+
+        if out is None or not out.isOpened():
+            # Fallback to avi format
+            output_path = tempfile.NamedTemporaryFile(suffix=".avi", delete=False).name
+            fourcc = cv2.VideoWriter_fourcc(*'MJPG')
             out = cv2.VideoWriter(output_path, fourcc, output_fps, (width, height))
-            if out.isOpened():
-                print(f"Using codec: {codec}")
-                break
-        except:
-            continue
+
+        if not out.isOpened():
+            cap.release()
+            raise gr.Error("Could not create output video file.")
     
-    if out is None or not out.isOpened():
-        # Fallback to avi format
-        output_path = tempfile.NamedTemporaryFile(suffix=".avi", delete=False).name
-        fourcc = cv2.VideoWriter_fourcc(*'MJPG')
-        out = cv2.VideoWriter(output_path, fourcc, output_fps, (width, height))
-    
-    if not out.isOpened():
-        cap.release()
-        raise gr.Error("Could not create output video file.")
-    
-    # Calculate frame intervals
-    # Robot detection at user-specified FPS
-    # Side cameras query the LLM at a fixed 3 FPS regardless of center camera setting
-    if camera_side in ("blue", "red"):
-        robot_frame_interval = max(1, int(original_fps / 3.0))
-    else:
-        robot_frame_interval = max(1, int(original_fps / target_fps))
-    # Ball detection at 30fps (or video fps if lower)
-    ball_fps = min(30.0, original_fps)
-    ball_frame_interval = max(1, round(original_fps / ball_fps))
+    # Calculate sampling schedules.
+    robot_sample_fps = float(target_fps)
+    robot_frame_stride = _compute_sampling_stride(original_fps, robot_sample_fps)
+    ball_frame_stride = _compute_sampling_stride(original_fps, ball_fps)
+    next_robot_frame = float(start_frame)
+    next_ball_frame = float(start_frame)
     score_ocr_frame_interval = max(1, round(original_fps / CENTER_SCORE_OCR_SAMPLE_FPS))
     match_clock_ocr_frame_interval = max(1, round(original_fps / CENTER_MATCH_CLOCK_OCR_SAMPLE_FPS))
     # Person detection at 6fps (independent of robot FPS)
@@ -7665,7 +7922,7 @@ def process_single_video(video_path: str, camera_side: str = "blue", target_fps:
     
     frame_count = start_frame
     processed_frames = 0
-    total_ball_frames = (end_frame - start_frame) // ball_frame_interval
+    total_ball_frames = max(1, int(np.ceil((end_frame - start_frame) / ball_frame_stride)))
     
 
     
@@ -7692,7 +7949,7 @@ def process_single_video(video_path: str, camera_side: str = "blue", target_fps:
     robot_bbox_persist_frames = max(1, int(round((original_fps or 30.0) * 2.0)))
     
     # Disabled tracker for detecting when robots stop moving
-    disabled_tracker = DisabledTracker(fps=target_fps)
+    disabled_tracker = DisabledTracker(fps=robot_sample_fps)
     
     # Ball tracker for shot detection - filtered by camera alliance
     ball_tracker = BallTracker(
@@ -7791,7 +8048,7 @@ def process_single_video(video_path: str, camera_side: str = "blue", target_fps:
 
     # Use threaded reader/writer to overlap I/O with processing
     reader = ThreadedVideoReader(cap, frame_count, reader_end_frame)
-    writer = ThreadedVideoWriter(out)
+    writer = ThreadedVideoWriter(out) if render_output_video else None
     
     while True:
         ret, frame, frame_count = reader.read()
@@ -7815,8 +8072,15 @@ def process_single_video(video_path: str, camera_side: str = "blue", target_fps:
             if current_person_count > 0:
                 print(f"[Person Detection] Found {current_person_count} people at frame {frame_count}")
         
-        # Robot detection at user-specified FPS (less frequent)
-        if frame_count % robot_frame_interval == 0 and enable_robot_detection:
+        # Robot detection at the requested tracking FPS.
+        should_run_robot = False
+        if enable_robot_detection:
+            should_run_robot, next_robot_frame = _consume_frame_schedule(
+                frame_count,
+                next_robot_frame,
+                robot_frame_stride,
+            )
+        if should_run_robot:
             # Convert BGR (OpenCV) to RGB (PIL)
             frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
             pil_frame = Image.fromarray(frame_rgb)
@@ -8018,12 +8282,13 @@ def process_single_video(video_path: str, camera_side: str = "blue", target_fps:
             
             tracks_by_frame.append(frame_tracks)
         
-        # Ball detection and output at 30fps (or video fps)
-        if frame_count % ball_frame_interval == 0:
-            # Convert BGR (OpenCV) to RGB (PIL)
-            frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-            pil_frame = Image.fromarray(frame_rgb)
-            
+        # Ball detection and output at the requested tracking FPS.
+        should_run_ball, next_ball_frame = _consume_frame_schedule(
+            frame_count,
+            next_ball_frame,
+            ball_frame_stride,
+        )
+        if should_run_ball:
             if progress is not None:
                 progress(
                     processed_frames / max(1, total_ball_frames),
@@ -8044,38 +8309,6 @@ def process_single_video(video_path: str, camera_side: str = "blue", target_fps:
                     width,
                     height,
                     camera_side=camera_side,
-                )
-            
-            # Draw bounding boxes with alliance colors (for robots) - only if robot detection enabled
-            annotated_frame = pil_frame.copy()
-            if camera_side in ("blue", "red"):
-                annotated_frame = annotate_side_camera_guides(
-                    annotated_frame,
-                    camera_side,
-                    calibrated_boxes=side_calibration_boxes
-                )
-            if enable_robot_detection:
-                # Draw bumper color highlights on center camera
-                if camera_side == "center" and not using_manual_robot_tracks:
-                    # Reuse cached masks from last robot detection frame (fast)
-                    annotated_frame = draw_bumper_highlights(annotated_frame, current_bumper_red_mask, current_bumper_blue_mask, field_pixel_mask=field_pixel_mask)
-                
-                # Draw person segmentation in grey
-                if (current_person_mask is not None and enable_person_detection and np.any(current_person_mask)
-                        and not using_manual_robot_tracks):
-                    frame_np = np.array(annotated_frame)  # RGB
-                    overlay = frame_np.copy()
-                    overlay[current_person_mask > 0] = (128, 128, 128)  # Grey
-                    blended = cv2.addWeighted(frame_np, 0.6, overlay, 0.4, 0)
-                    annotated_frame = Image.fromarray(blended)
-
-                annotated_frame = plot_bounding_boxes(
-                    annotated_frame, 
-                    render_bboxes_json, 
-                    blue_robots, 
-                    red_robots,
-                    stats=ball_tracker.robot_stats,
-                    show_unlabeled=show_unlabeled_robots
                 )
             
             # Update ball tracker with best available robot bboxes (interpolated on non-keyframes)
@@ -8104,105 +8337,138 @@ def process_single_video(video_path: str, camera_side: str = "blue", target_fps:
                 
                 # Track balls and detect shots
                 tracked_balls = ball_tracker.update(fuel_detections)
-                
-                # Draw with shot attribution
-                annotated_frame = draw_fuel_detections(
-                    annotated_frame,
-                    tracked_balls,
-                    blue_robots,
-                    red_robots,
-                    highlight_robot_label=highlight_ball_robot,
-                )
             
-            # Draw Gemini Calibration Visualization (Center Camera only)
-            if calib_viz_data is not None:
-                draw = ImageDraw.Draw(annotated_frame)
-                
-                # Define font (fallback to default if necessary)
-                try:
-                    font = ImageFont.truetype("arial.ttf", 20)
-                except IOError:
-                    font = ImageFont.load_default()
-                    
-                frames_left = calib_viz_data['max_frames'] - calib_viz_data['frame_count']
-                has_homography = calib_viz_data.get('homography') is not None
-                status_text = "CALIBRATION LOCKED" if has_homography else "CALIBRATION (no homography)"
-                draw.text((10, 10), f"{status_text} - DISPLAYING: {frames_left} frames remaining", fill=(255, 255, 0), font=font)
-                
-                # Factors to scale reference coords (1918x709) to actual frame
-                sx = width / 1918 if width > 0 else 1.0
-                sy = height / 709 if height > 0 else 1.0
-                
-                # Helper to transform reference point to current frame position
-                def ref_to_current(rx, ry):
-                    """Transform reference coords to current frame coords using forward homography."""
-                    tx, ty = _calibration_transform_point_ref(rx, ry, inverse=False)
-                    return tx * sx, ty * sy
-                
-                # Draw Reference Points (cyan) - where landmarks SHOULD be if camera hasn't moved
-                for label, (ref_x, ref_y) in calib_viz_data['reference_points'].items():
-                    act_x, act_y = ref_to_current(ref_x, ref_y)
-                    pt_radius = 5
-                    color = (0, 200, 255) if label.startswith('B') else (255, 100, 100)
-                    draw.ellipse([act_x - pt_radius, act_y - pt_radius, act_x + pt_radius, act_y + pt_radius], fill=color)
-                    draw.text((act_x + 8, act_y - 8), f"Ref {label}", fill=color, font=font)
-                
-                # Draw Found Points (green) - where Gemini detected the landmarks
-                for label, (found_x, found_y) in calib_viz_data['found_points'].items():
-                    act_x, act_y = found_x * sx, found_y * sy
-                    box_size = 10
-                    draw.rectangle([act_x - box_size, act_y - box_size, act_x + box_size, act_y + box_size], outline=(0, 255, 0), width=3)
-                    draw.text((act_x - box_size, act_y + box_size + 5), f"Found {label}", fill=(0, 255, 0), font=font)
-                    
-                # Helper to transform a reference-coords rectangle to current frame polygon
-                def transform_rect(x1, y1, x2, y2):
-                    corners = [(x1, y1), (x2, y1), (x2, y2), (x1, y2)]
-                    return [ref_to_current(cx, cy) for cx, cy in corners]
-                    
+            if render_output_video:
+                # Convert BGR (OpenCV) to RGB (PIL) only when rendering is enabled.
+                frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                pil_frame = Image.fromarray(frame_rgb)
 
-                
-                # Draw Ball Tracker Goal Zones (transformed from reference to current)
-                if ball_tracker:
-                    for poly in ball_tracker.goal_polygons:
-                        # Goal polygons are in actual frame resolution, transform via actual-res helper
-                        shifted_poly = [_calibration_transform_point(px, py, width, height, inverse=False) for px, py in poly]
-                        draw.polygon(shifted_poly, outline=(255, 0, 255), width=3)
-                        draw.text((shifted_poly[0][0], shifted_poly[0][1] - 25), "Goal Zone", fill=(255, 0, 255), font=font)
-                        
-                # Draw SAM 3 scanner regions at fixed positions
-                roi_sx = width / 1918 if width > 0 else 1.0
-                roi_sy = height / 709 if height > 0 else 1.0
-                for (rx1, ry1, rx2, ry2) in _CENTER_CAM_ROIS:
-                    roi_poly = [
-                        (rx1 * roi_sx, ry1 * roi_sy),
-                        (rx2 * roi_sx, ry1 * roi_sy),
-                        (rx2 * roi_sx, ry2 * roi_sy),
-                        (rx1 * roi_sx, ry2 * roi_sy),
-                    ]
-                    draw.polygon(roi_poly, outline=(255, 255, 255), width=2)
-                    draw.text((roi_poly[0][0] + 5, roi_poly[0][1] + 5), "SAM 3 ROI", fill=(255, 255, 255), font=font)
+                # Draw bounding boxes with alliance colors (for robots) - only if robot detection enabled
+                annotated_frame = pil_frame.copy()
+                if camera_side in ("blue", "red"):
+                    annotated_frame = annotate_side_camera_guides(
+                        annotated_frame,
+                        camera_side,
+                        calibrated_boxes=side_calibration_boxes
+                    )
+                if enable_robot_detection:
+                    # Draw bumper color highlights on center camera
+                    if camera_side == "center" and not using_manual_robot_tracks:
+                        # Reuse cached masks from last robot detection frame (fast)
+                        annotated_frame = draw_bumper_highlights(annotated_frame, current_bumper_red_mask, current_bumper_blue_mask, field_pixel_mask=field_pixel_mask)
 
-            if camera_side == "center":
-                annotated_frame = draw_center_ocr_debug_overlay(
-                    annotated_frame,
-                    center_score_ocr_tracker=center_score_ocr_tracker,
-                    center_match_clock_ocr_tracker=center_match_clock_overlay_tracker,
-                )
-            
-            
-            # Convert back to BGR for OpenCV
-            annotated_bgr = cv2.cvtColor(np.array(annotated_frame), cv2.COLOR_RGB2BGR)
-            
-            # Write frame to output (non-blocking, queued to writer thread)
-            writer.write(annotated_bgr)
+                    # Draw person segmentation in grey
+                    if (current_person_mask is not None and enable_person_detection and np.any(current_person_mask)
+                            and not using_manual_robot_tracks):
+                        frame_np = np.array(annotated_frame)  # RGB
+                        overlay = frame_np.copy()
+                        overlay[current_person_mask > 0] = (128, 128, 128)  # Grey
+                        blended = cv2.addWeighted(frame_np, 0.6, overlay, 0.4, 0)
+                        annotated_frame = Image.fromarray(blended)
+
+                    annotated_frame = plot_bounding_boxes(
+                        annotated_frame,
+                        render_bboxes_json,
+                        blue_robots,
+                        red_robots,
+                        stats=ball_tracker.robot_stats,
+                        show_unlabeled=show_unlabeled_robots
+                    )
+
+                if enable_fuel_detection:
+                    # Draw with shot attribution
+                    annotated_frame = draw_fuel_detections(
+                        annotated_frame,
+                        tracked_balls,
+                        blue_robots,
+                        red_robots,
+                        highlight_robot_label=highlight_ball_robot,
+                    )
+
+                # Draw Gemini Calibration Visualization (Center Camera only)
+                if calib_viz_data is not None:
+                    draw = ImageDraw.Draw(annotated_frame)
+
+                    # Define font (fallback to default if necessary)
+                    try:
+                        font = ImageFont.truetype("arial.ttf", 20)
+                    except IOError:
+                        font = ImageFont.load_default()
+
+                    frames_left = calib_viz_data['max_frames'] - calib_viz_data['frame_count']
+                    has_homography = calib_viz_data.get('homography') is not None
+                    status_text = "CALIBRATION LOCKED" if has_homography else "CALIBRATION (no homography)"
+                    draw.text((10, 10), f"{status_text} - DISPLAYING: {frames_left} frames remaining", fill=(255, 255, 0), font=font)
+
+                    # Factors to scale reference coords (1918x709) to actual frame
+                    sx = width / 1918 if width > 0 else 1.0
+                    sy = height / 709 if height > 0 else 1.0
+
+                    # Helper to transform reference point to current frame position
+                    def ref_to_current(rx, ry):
+                        """Transform reference coords to current frame coords using forward homography."""
+                        tx, ty = _calibration_transform_point_ref(rx, ry, inverse=False)
+                        return tx * sx, ty * sy
+
+                    # Draw Reference Points (cyan) - where landmarks SHOULD be if camera hasn't moved
+                    for label, (ref_x, ref_y) in calib_viz_data['reference_points'].items():
+                        act_x, act_y = ref_to_current(ref_x, ref_y)
+                        pt_radius = 5
+                        color = (0, 200, 255) if label.startswith('B') else (255, 100, 100)
+                        draw.ellipse([act_x - pt_radius, act_y - pt_radius, act_x + pt_radius, act_y + pt_radius], fill=color)
+                        draw.text((act_x + 8, act_y - 8), f"Ref {label}", fill=color, font=font)
+
+                    # Draw Found Points (green) - where Gemini detected the landmarks
+                    for label, (found_x, found_y) in calib_viz_data['found_points'].items():
+                        act_x, act_y = found_x * sx, found_y * sy
+                        box_size = 10
+                        draw.rectangle([act_x - box_size, act_y - box_size, act_x + box_size, act_y + box_size], outline=(0, 255, 0), width=3)
+                        draw.text((act_x - box_size, act_y + box_size + 5), f"Found {label}", fill=(0, 255, 0), font=font)
+
+                    # Draw Ball Tracker Goal Zones (transformed from reference to current)
+                    if ball_tracker:
+                        for poly in ball_tracker.goal_polygons:
+                            # Goal polygons are in actual frame resolution, transform via actual-res helper
+                            shifted_poly = [_calibration_transform_point(px, py, width, height, inverse=False) for px, py in poly]
+                            draw.polygon(shifted_poly, outline=(255, 0, 255), width=3)
+                            draw.text((shifted_poly[0][0], shifted_poly[0][1] - 25), "Goal Zone", fill=(255, 0, 255), font=font)
+
+                    # Draw SAM 3 scanner regions at fixed positions
+                    roi_sx = width / 1918 if width > 0 else 1.0
+                    roi_sy = height / 709 if height > 0 else 1.0
+                    for (rx1, ry1, rx2, ry2) in _CENTER_CAM_ROIS:
+                        roi_poly = [
+                            (rx1 * roi_sx, ry1 * roi_sy),
+                            (rx2 * roi_sx, ry1 * roi_sy),
+                            (rx2 * roi_sx, ry2 * roi_sy),
+                            (rx1 * roi_sx, ry2 * roi_sy),
+                        ]
+                        draw.polygon(roi_poly, outline=(255, 255, 255), width=2)
+                        draw.text((roi_poly[0][0] + 5, roi_poly[0][1] + 5), "SAM 3 ROI", fill=(255, 255, 255), font=font)
+
+                if camera_side == "center":
+                    annotated_frame = draw_center_ocr_debug_overlay(
+                        annotated_frame,
+                        center_score_ocr_tracker=center_score_ocr_tracker,
+                        center_match_clock_ocr_tracker=center_match_clock_overlay_tracker,
+                    )
+
+                # Convert back to BGR for OpenCV
+                annotated_bgr = cv2.cvtColor(np.array(annotated_frame), cv2.COLOR_RGB2BGR)
+
+                # Write frame to output (non-blocking, queued to writer thread)
+                writer.write(annotated_bgr)
+
             processed_frames += 1
         
     
     # Wait for all frames to be written, then release resources
     reader.stop()
-    writer.stop()
+    if writer is not None:
+        writer.stop()
     cap.release()
-    out.release()
+    if out is not None:
+        out.release()
     
     # Finalize all remaining tracked balls to ensure all shots are counted
     # This is critical for counting misses that exit the frame
@@ -8422,29 +8688,31 @@ def merge_frame_tracks(blue_frames: list, red_frames: list, frame_width: int = 1
 
 def split_composite_video(composite_path: str, progress=None) -> tuple:
     """
-    Split a 1920x1080 composite video into 3 separate camera feeds.
-    
-    Crop regions (from HTML image map coords):
-        Center Camera: (1, 0) -> (1919, 709)    = 1918x709
-        Blue Side:     (1, 739) -> (941, 1078)   = 940x339
-        Red Side:      (979, 739) -> (1919, 1078) = 940x339
-    
+    Split a 720p or 1080p composite video into 3 separate camera feeds.
+
+    The crop rectangles are scaled from the known 1920x1080 reference layout so
+    both resolutions follow the same code path.
+
     Uses FFmpeg subprocess for speed (parallel, hardware-friendly).
     Falls back to OpenCV frame loop if FFmpeg is unavailable.
     
     Args:
-        composite_path: Path to the 1920x1080 composite video
+        composite_path: Path to the composite video
         progress: Optional Gradio progress tracker
         
     Returns:
         Tuple of (center_path, blue_path, red_path) temp file paths
     """
-    # FFmpeg crop filter format: crop=w:h:x:y
-    crops = {
-        'center': {'filter': 'crop=1918:709:1:0',   'size': (1918, 709)},
-        'blue':   {'filter': 'crop=940:339:1:739',   'size': (940, 339)},
-        'red':    {'filter': 'crop=940:339:979:739',  'size': (940, 339)},
-    }
+    probe = cv2.VideoCapture(composite_path)
+    if not probe.isOpened():
+        raise gr.Error("Could not open composite video file.")
+    source_width = int(probe.get(cv2.CAP_PROP_FRAME_WIDTH) or 0)
+    source_height = int(probe.get(cv2.CAP_PROP_FRAME_HEIGHT) or 0)
+    fps = probe.get(cv2.CAP_PROP_FPS)
+    total_frames = int(probe.get(cv2.CAP_PROP_FRAME_COUNT))
+    probe.release()
+
+    crops = _build_composite_crop_layout(source_width, source_height)
     
     # Create temp output paths
     paths = {}
@@ -8505,16 +8773,8 @@ def split_composite_video(composite_path: str, progress=None) -> tuple:
     cap = cv2.VideoCapture(composite_path)
     if not cap.isOpened():
         raise gr.Error("Could not open composite video file.")
-    
-    fps = cap.get(cv2.CAP_PROP_FPS)
-    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-    
-    # Crop regions as (x1, y1, x2, y2)
-    crop_rects = {
-        'center': (1, 0, 1919, 709),
-        'blue':   (1, 739, 941, 1078),
-        'red':    (979, 739, 1919, 1078),
-    }
+
+    crop_rects = {name: info["rect"] for name, info in crops.items()}
     
     fourcc = cv2.VideoWriter_fourcc(*'mp4v')
     writers = {}
@@ -8546,12 +8806,22 @@ def split_composite_video(composite_path: str, progress=None) -> tuple:
 
 def extract_center_video_from_composite(composite_path: str, progress=None) -> str:
     """
-    Extract just the center-camera crop from the composite match video.
+    Extract just the center-camera crop from a 720p or 1080p composite match video.
     """
     if not composite_path:
         raise gr.Error("Please upload a match video.")
 
     output_path = tempfile.NamedTemporaryFile(suffix="_center.mp4", delete=False).name
+    probe = cv2.VideoCapture(composite_path)
+    if not probe.isOpened():
+        raise gr.Error("Could not open composite video file.")
+    source_width = int(probe.get(cv2.CAP_PROP_FRAME_WIDTH) or 0)
+    source_height = int(probe.get(cv2.CAP_PROP_FRAME_HEIGHT) or 0)
+    fps = probe.get(cv2.CAP_PROP_FPS)
+    total_frames = int(probe.get(cv2.CAP_PROP_FRAME_COUNT))
+    probe.release()
+
+    center_crop = _build_composite_crop_layout(source_width, source_height)["center"]
     ffmpeg_exe = shutil.which('ffmpeg')
 
     if ffmpeg_exe is None:
@@ -8568,7 +8838,7 @@ def extract_center_video_from_composite(composite_path: str, progress=None) -> s
         cmd = [
             ffmpeg_exe, '-y',
             '-i', composite_path,
-            '-vf', 'crop=1918:709:1:0',
+            '-vf', center_crop["filter"],
             '-c:v', 'libx264', '-preset', 'ultrafast', '-crf', '18',
             '-an',
             output_path,
@@ -8582,20 +8852,19 @@ def extract_center_video_from_composite(composite_path: str, progress=None) -> s
     if not cap.isOpened():
         raise gr.Error("Could not open composite video file.")
 
-    fps = cap.get(cv2.CAP_PROP_FPS)
-    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
     fourcc = cv2.VideoWriter_fourcc(*'mp4v')
-    out = cv2.VideoWriter(output_path, fourcc, fps, (1918, 709))
+    out = cv2.VideoWriter(output_path, fourcc, fps, center_crop["size"])
     if not out.isOpened():
         cap.release()
         raise gr.Error("Could not create center camera video.")
 
+    center_x1, center_y1, center_x2, center_y2 = center_crop["rect"]
     frame_idx = 0
     while True:
         ret, frame = cap.read()
         if not ret:
             break
-        cropped = frame[0:709, 1:1919]
+        cropped = frame[center_y1:center_y2, center_x1:center_x2]
         out.write(cropped)
         frame_idx += 1
         if progress and frame_idx % 100 == 0 and total_frames > 0:
@@ -8775,7 +9044,7 @@ def format_robot_stats_md(stats: dict, robot_label: str, ferry_counts: dict, dis
     return f"{disabled_line}\n\n{total}\n\n" + "\n".join(rows)
 
 
-def process_dual_videos(blue_video_path: str, red_video_path: str, center_video_path: str = None, composite_video_path: str = None, target_fps: int = 3, start_seconds: float = 0, end_seconds: float = 0, blue_robot_1: str = "", blue_robot_2: str = "", blue_robot_3: str = "", red_robot_1: str = "", red_robot_2: str = "", red_robot_3: str = "", enable_robot_detection: bool = True, enable_fuel_detection: bool = True, side_ref_image: Image.Image = None, center_ref_image: Image.Image = None, enable_blue_camera: bool = True, enable_center_camera: bool = True, enable_red_camera: bool = True, enable_person_detection: bool = True, calibration_points: list = None, calibration_image_size: tuple = None, blue_side_box_points: list = None, blue_side_box_image_size: tuple = None, red_side_box_points: list = None, red_side_box_image_size: tuple = None, show_unlabeled_robots: bool = True, highlight_ball_robot: str = "", regional_name: str = "", progress=gr.Progress()) -> tuple:
+def process_dual_videos(blue_video_path: str, red_video_path: str, center_video_path: str = None, composite_video_path: str = None, target_fps: int = 30, start_seconds: float = 0, end_seconds: float = 0, blue_robot_1: str = "", blue_robot_2: str = "", blue_robot_3: str = "", red_robot_1: str = "", red_robot_2: str = "", red_robot_3: str = "", enable_robot_detection: bool = True, enable_fuel_detection: bool = True, side_ref_image: Image.Image = None, center_ref_image: Image.Image = None, enable_blue_camera: bool = True, enable_center_camera: bool = True, enable_red_camera: bool = True, enable_person_detection: bool = True, calibration_points: list = None, calibration_image_size: tuple = None, blue_side_box_points: list = None, blue_side_box_image_size: tuple = None, red_side_box_points: list = None, red_side_box_image_size: tuple = None, show_unlabeled_robots: bool = True, highlight_ball_robot: str = "", regional_name: str = "", progress=gr.Progress()) -> tuple:
     """
     Process blue, red, and center camera videos using bumper detection.
     
@@ -8783,7 +9052,7 @@ def process_dual_videos(blue_video_path: str, red_video_path: str, center_video_
         blue_video_path: Path to blue side camera video
         red_video_path: Path to red side camera video
         center_video_path: Path to center camera video (2136x836, views both sides)
-        target_fps: Target FPS for processing
+        target_fps: Requested 10/20/30 FPS for robot tracking and ball output
         start_seconds: Start processing at this time (0 = from beginning)
         end_seconds: Stop processing at this time (0 = process to end)
         blue_robot_1, blue_robot_2, blue_robot_3: Blue alliance team numbers
@@ -8797,7 +9066,8 @@ def process_dual_videos(blue_video_path: str, red_video_path: str, center_video_
         Tuple of (blue_output_path, red_output_path, center_output_path, map_video_path, ...)
     """
 
-    
+    target_fps = _normalize_tracking_fps(target_fps)
+
     managed_youtube_dir = _get_managed_youtube_download_dir(composite_video_path)
     try:
         # If composite video provided, split it into 3 separate camera feeds
@@ -9225,12 +9495,13 @@ def process_dual_videos(blue_video_path: str, red_video_path: str, center_video_
         _cleanup_managed_youtube_dir(managed_youtube_dir)
 
 
-def process_manual_center_video(center_video_path: str = None, composite_video_path: str = None, target_fps: int = 3, start_seconds: float = 0, end_seconds: float = 0, blue_robot_1: str = "", blue_robot_2: str = "", blue_robot_3: str = "", red_robot_1: str = "", red_robot_2: str = "", red_robot_3: str = "", enable_fuel_detection: bool = True, calibration_points: list = None, calibration_image_size: tuple = None, manual_tracks_json: str = "", highlight_ball_robot: str = "", regional_name: str = "", progress=gr.Progress()) -> tuple:
+def process_manual_center_video(center_video_path: str = None, composite_video_path: str = None, target_fps: int = 30, start_seconds: float = 0, end_seconds: float = 0, blue_robot_1: str = "", blue_robot_2: str = "", blue_robot_3: str = "", red_robot_1: str = "", red_robot_2: str = "", red_robot_3: str = "", enable_fuel_detection: bool = True, calibration_points: list = None, calibration_image_size: tuple = None, manual_tracks_json: str = "", highlight_ball_robot: str = "", regional_name: str = "", progress=gr.Progress(), include_visual_outputs: bool = True, embed_robot_labels_in_stats: bool = False) -> tuple:
     """
     Process only the center camera using human-provided robot tracks and SAM 3 ball detection.
     """
     managed_youtube_dir = _get_managed_youtube_download_dir(composite_video_path)
     try:
+        target_fps = _normalize_tracking_fps(target_fps)
         if not center_video_path and composite_video_path:
             progress(0, desc="Extracting center camera feed...")
             center_video_path = extract_center_video_from_composite(composite_video_path, progress=progress)
@@ -9268,52 +9539,58 @@ def process_manual_center_video(center_video_path: str = None, composite_video_p
             show_unlabeled_robots=True,
             manual_robot_tracks=manual_robot_tracks,
             highlight_ball_robot=highlight_ball_robot,
+            render_output_video=include_visual_outputs,
         )
 
         all_robot_labels = blue_robots + red_robots
         robot_map_paths = []
+        map_video_path = None
 
-        progress(0.75, desc="Generating individual robot maps...")
-        for robot_label in all_robot_labels:
-            if robot_label and robot_label.strip():
-                label = robot_label.strip()
-                single_robot_tracks = {label: robot_tracks.get(label, [])}
-                if single_robot_tracks[label]:
-                    robot_map = draw_robot_paths(
-                        MAP_IMAGE_PATH,
-                        single_robot_tracks,
-                        width,
-                        height,
-                        "center",
-                        blue_robots,
-                        red_robots,
-                        max_seconds=15,
-                        fps=target_fps,
-                    )
-                    robot_map_path = tempfile.NamedTemporaryFile(suffix=".png", delete=False).name
-                    robot_map.save(robot_map_path)
-                    robot_map_paths.append(robot_map_path)
+        if include_visual_outputs:
+            progress(0.75, desc="Generating individual robot maps...")
+            for robot_label in all_robot_labels:
+                if robot_label and robot_label.strip():
+                    label = robot_label.strip()
+                    single_robot_tracks = {label: robot_tracks.get(label, [])}
+                    if single_robot_tracks[label]:
+                        robot_map = draw_robot_paths(
+                            MAP_IMAGE_PATH,
+                            single_robot_tracks,
+                            width,
+                            height,
+                            "center",
+                            blue_robots,
+                            red_robots,
+                            max_seconds=15,
+                            fps=target_fps,
+                        )
+                        robot_map_path = tempfile.NamedTemporaryFile(suffix=".png", delete=False).name
+                        robot_map.save(robot_map_path)
+                        robot_map_paths.append(robot_map_path)
+                    else:
+                        robot_map_paths.append(None)
                 else:
                     robot_map_paths.append(None)
-            else:
+
+            while len(robot_map_paths) < 6:
                 robot_map_paths.append(None)
 
-        while len(robot_map_paths) < 6:
-            robot_map_paths.append(None)
+            smoothed_frames = interpolate_robot_tracks(tracks_by_frame, max_gap=15)
+            progress(0.9, desc="Generating map video...")
+            map_video_path = generate_map_video(
+                MAP_IMAGE_PATH,
+                smoothed_frames,
+                width,
+                height,
+                target_fps=target_fps,
+                blue_robots=blue_robots,
+                red_robots=red_robots,
+            )
+        else:
+            while len(robot_map_paths) < 6:
+                robot_map_paths.append(None)
 
-        smoothed_frames = interpolate_robot_tracks(tracks_by_frame, max_gap=15)
-        progress(0.9, desc="Generating map video...")
-        map_video_path = generate_map_video(
-            MAP_IMAGE_PATH,
-            smoothed_frames,
-            width,
-            height,
-            target_fps=target_fps,
-            blue_robots=blue_robots,
-            red_robots=red_robots,
-        )
-
-        progress(0.96, desc="Reading center match clock...")
+        progress(0.96 if include_visual_outputs else 0.86, desc="Reading center match clock...")
         center_match_clock_ocr = extract_center_match_clock_ocr(
             center_video_path,
             start_seconds=start_seconds,
@@ -9356,6 +9633,12 @@ def process_manual_center_video(center_video_path: str = None, composite_video_p
         while len(robot_labels) < 6:
             robot_labels.append("Not Configured")
 
+        if embed_robot_labels_in_stats:
+            robot_stats_markdowns = [
+                f"### {robot_labels[idx]}\n\n{robot_stats_markdowns[idx]}"
+                for idx in range(len(robot_stats_markdowns))
+            ]
+
         return (
             center_output,
             map_video_path,
@@ -9368,6 +9651,32 @@ def process_manual_center_video(center_video_path: str = None, composite_video_p
         )
     finally:
         _cleanup_managed_youtube_dir(managed_youtube_dir)
+
+
+def process_manual_center_video_table_only(center_video_path: str = None, composite_video_path: str = None, target_fps: int = 30, start_seconds: float = 0, end_seconds: float = 0, blue_robot_1: str = "", blue_robot_2: str = "", blue_robot_3: str = "", red_robot_1: str = "", red_robot_2: str = "", red_robot_3: str = "", enable_fuel_detection: bool = True, calibration_points: list = None, calibration_image_size: tuple = None, manual_tracks_json: str = "", highlight_ball_robot: str = "", regional_name: str = "", progress=gr.Progress()) -> tuple:
+    """Manual mode variant that only returns the scoring tables."""
+    return process_manual_center_video(
+        center_video_path=center_video_path,
+        composite_video_path=composite_video_path,
+        target_fps=target_fps,
+        start_seconds=start_seconds,
+        end_seconds=end_seconds,
+        blue_robot_1=blue_robot_1,
+        blue_robot_2=blue_robot_2,
+        blue_robot_3=blue_robot_3,
+        red_robot_1=red_robot_1,
+        red_robot_2=red_robot_2,
+        red_robot_3=red_robot_3,
+        enable_fuel_detection=enable_fuel_detection,
+        calibration_points=calibration_points,
+        calibration_image_size=calibration_image_size,
+        manual_tracks_json=manual_tracks_json,
+        highlight_ball_robot=highlight_ball_robot,
+        regional_name=regional_name,
+        progress=progress,
+        include_visual_outputs=False,
+        embed_robot_labels_in_stats=True,
+    )
 
 
 MANUAL_TRACKER_HEAD = r"""
@@ -10342,23 +10651,29 @@ MANUAL_TRACKER_HTML = """
 """
 
 
-def create_manual_demo():
+def create_manual_demo(limited_mode: bool = False):
     """Create the center-camera manual tracking interface."""
 
-    with gr.Blocks(title="Robot Scouter - Manual Center Tracking") as demo:
+    page_title = "Robot Scouter - Manual Limited Tracking" if limited_mode else "Robot Scouter - Manual Center Tracking"
+    with gr.Blocks(title=page_title) as demo:
         with gr.Row():
             with gr.Column(scale=1):
                 gr.Markdown("<div class='panel-title'>Manual Center Tracking Mode</div>", elem_classes="input-panel")
-                gr.Markdown(
+                mode_help_text = (
+                    "This mode is enabled by `config.json` with `\"robot_tracking_mode\": \"manual-limited\"`. "
+                    "Only the center camera is used, and non-table outputs are skipped so processing finishes faster."
+                    if limited_mode else
                     "This mode is enabled by `config.json` with `\"robot_tracking_mode\": \"manual\"`. "
                     "Only the center camera is used. Side cameras, field-mask robot detection, and LLM robot labeling are skipped."
                 )
+                gr.Markdown(mode_help_text)
 
                 composite_video_input = gr.Video(
-                    label="Match Video (manual robot tracking on center camera only)",
+                    label="Match Video (720p or 1080p; manual robot tracking on center camera only)",
                     sources=["upload"],
                 )
                 center_video_input = gr.State(None)
+                video_metadata_state = gr.State(_blank_match_metadata())
                 youtube_url_input = gr.Textbox(
                     label="YouTube Match URL",
                     placeholder="https://www.youtube.com/watch?v=...",
@@ -10372,7 +10687,7 @@ def create_manual_demo():
                         max_lines=1,
                     )
                 video_source_status = gr.Markdown(VIDEO_SOURCE_EMPTY_STATUS)
-                page_title_state = gr.Textbox(value="Robot Scouter - Manual Center Tracking", visible=False, elem_id="page-title-state")
+                page_title_state = gr.Textbox(value=page_title, visible=False, elem_id="page-title-state")
 
                 preview_source_video = gr.Video(
                     label="Center Preview Source",
@@ -10415,12 +10730,12 @@ def create_manual_demo():
 
                 with gr.Row():
                     fps_slider = gr.Slider(
-                        minimum=1,
+                        minimum=10,
                         maximum=30,
-                        value=8,
-                        step=1,
-                        label="Map / Tracker FPS",
-                        info="Used for map output, ferry counts, and disabled detection"
+                        value=30,
+                        step=10,
+                        label="Tracking FPS",
+                        info="Run manual center tracking at 10, 20, or 30 FPS. Lower FPS widens ball-tracking thresholds automatically."
                     )
                     detect_fuel_checkbox = gr.Checkbox(
                         label="Detect Yellow Fuel",
@@ -10462,42 +10777,99 @@ def create_manual_demo():
 
         process_btn = gr.Button("Process Video")
 
-        with gr.Row():
+        with gr.Row(visible=not limited_mode):
             with gr.Column(scale=1):
-                gr.Markdown("<div class='panel-title'>Output</div>", elem_classes="output-panel")
-                center_video_output = gr.Video(label="Center Camera - Annotated")
-                map_video_output = gr.Video(label="Map Time-Lapse - Full Match Movement Overview")
+                gr.Markdown("<div class='panel-title'>Output</div>", elem_classes="output-panel", visible=not limited_mode)
+                center_video_output = gr.Video(label="Center Camera - Annotated", visible=not limited_mode)
+                map_video_output = gr.Video(label="Map Time-Lapse - Full Match Movement Overview", visible=not limited_mode)
 
-        gr.Markdown("<div class='panel-title'>Blue Alliance - Autonomous Movement (15 sec)</div>")
+        gr.Markdown(
+            "<div class='panel-title'>Blue Alliance - Scoring Tables</div>"
+            if limited_mode else
+            "<div class='panel-title'>Blue Alliance - Autonomous Movement (15 sec)</div>"
+        )
         with gr.Row():
             with gr.Column():
-                blue1_map = gr.Image(label="Blue Robot 1 - Movement")
+                blue1_map = gr.Image(label="Blue Robot 1 - Movement", visible=not limited_mode)
                 blue1_stats = gr.Markdown("*Waiting for processing...*")
             with gr.Column():
-                blue2_map = gr.Image(label="Blue Robot 2 - Movement")
+                blue2_map = gr.Image(label="Blue Robot 2 - Movement", visible=not limited_mode)
                 blue2_stats = gr.Markdown("*Waiting for processing...*")
             with gr.Column():
-                blue3_map = gr.Image(label="Blue Robot 3 - Movement")
+                blue3_map = gr.Image(label="Blue Robot 3 - Movement", visible=not limited_mode)
                 blue3_stats = gr.Markdown("*Waiting for processing...*")
 
-        gr.Markdown("<div class='panel-title'>Red Alliance - Autonomous Movement (15 sec)</div>")
+        gr.Markdown(
+            "<div class='panel-title'>Red Alliance - Scoring Tables</div>"
+            if limited_mode else
+            "<div class='panel-title'>Red Alliance - Autonomous Movement (15 sec)</div>"
+        )
         with gr.Row():
             with gr.Column():
-                red1_map = gr.Image(label="Red Robot 1 - Movement")
+                red1_map = gr.Image(label="Red Robot 1 - Movement", visible=not limited_mode)
                 red1_stats = gr.Markdown("*Waiting for processing...*")
             with gr.Column():
-                red2_map = gr.Image(label="Red Robot 2 - Movement")
+                red2_map = gr.Image(label="Red Robot 2 - Movement", visible=not limited_mode)
                 red2_stats = gr.Markdown("*Waiting for processing...*")
             with gr.Column():
-                red3_map = gr.Image(label="Red Robot 3 - Movement")
+                red3_map = gr.Image(label="Red Robot 3 - Movement", visible=not limited_mode)
                 red3_stats = gr.Markdown("*Waiting for processing...*")
 
-        def handle_manual_video_upload(video_path, start_seconds, regional_name):
-            manual_state = _prepare_manual_video_calibration_state(video_path, start_seconds, regional_name)
+        def handle_manual_video_upload(video_path, start_seconds,
+                                       current_blue_1, current_blue_2, current_blue_3,
+                                       current_red_1, current_red_2, current_red_3,
+                                       current_highlight, current_regional):
+            metadata = _extract_uploaded_video_match_metadata(video_path)
+            merged_blue = _merge_prefilled_robot_numbers(
+                metadata.get("blue_robots", []),
+                [current_blue_1, current_blue_2, current_blue_3],
+            )
+            merged_red = _merge_prefilled_robot_numbers(
+                metadata.get("red_robots", []),
+                [current_red_1, current_red_2, current_red_3],
+            )
+            resolved_regional = _clean_text(metadata.get("regional_name") or current_regional)
+            manual_state = _prepare_manual_video_calibration_state(video_path, start_seconds, resolved_regional)
             loaded_saved = manual_state[-1]
+            highlight_update = _update_ball_highlight_dropdown(
+                merged_blue[0], merged_blue[1], merged_blue[2],
+                merged_red[0], merged_red[1], merged_red[2],
+                current_highlight,
+            )
             status = VIDEO_SOURCE_EMPTY_STATUS if video_path is None else _format_video_source_status(
                 "Uploaded video ready.",
+                regional_name=resolved_regional,
+                match_title=metadata.get("match_title", ""),
+                blue_robots=merged_blue,
+                red_robots=merged_red,
+                calibration_loaded=loaded_saved,
+            )
+            resolved_page_title = _get_page_title_for_match(metadata) if _clean_text(metadata.get("match_title") or metadata.get("match_label")) else page_title
+            return (
+                *manual_state[:-1],
+                merged_blue[0], merged_blue[1], merged_blue[2],
+                merged_red[0], merged_red[1], merged_red[2],
+                resolved_regional,
+                highlight_update,
+                status,
+                metadata,
+                resolved_page_title,
+            )
+
+        def handle_manual_regional_change(video_path, start_seconds, regional_name,
+                                          current_blue_1, current_blue_2, current_blue_3,
+                                          current_red_1, current_red_2, current_red_3,
+                                          current_metadata):
+            manual_state = _prepare_manual_video_calibration_state(video_path, start_seconds, regional_name)
+            loaded_saved = manual_state[-1]
+            metadata = current_metadata if isinstance(current_metadata, dict) else _blank_match_metadata()
+            source_label = "YouTube video ready." if _get_managed_youtube_download_dir(video_path) else "Uploaded video ready."
+            status = VIDEO_SOURCE_EMPTY_STATUS if video_path is None else _format_video_source_status(
+                source_label,
                 regional_name=regional_name,
+                match_title=metadata.get("match_title", ""),
+                blue_robots=[current_blue_1, current_blue_2, current_blue_3],
+                red_robots=[current_red_1, current_red_2, current_red_3],
                 calibration_loaded=loaded_saved,
             )
             return (*manual_state[:-1], status)
@@ -10540,12 +10912,24 @@ def create_manual_demo():
                 resolved_regional,
                 highlight_update,
                 status,
+                metadata,
                 _get_page_title_for_match(metadata),
             )
 
         composite_video_input.change(
             fn=handle_manual_video_upload,
-            inputs=[composite_video_input, start_seconds_input, regional_input],
+            inputs=[
+                composite_video_input,
+                start_seconds_input,
+                blue_robot_1,
+                blue_robot_2,
+                blue_robot_3,
+                red_robot_1,
+                red_robot_2,
+                red_robot_3,
+                highlight_ball_robot_dropdown,
+                regional_input,
+            ],
             outputs=[
                 preview_source_video,
                 center_video_input,
@@ -10555,13 +10939,34 @@ def create_manual_demo():
                 calibration_image_size_state,
                 calibration_status,
                 manual_tracks_json,
+                blue_robot_1,
+                blue_robot_2,
+                blue_robot_3,
+                red_robot_1,
+                red_robot_2,
+                red_robot_3,
+                regional_input,
+                highlight_ball_robot_dropdown,
                 video_source_status,
+                video_metadata_state,
+                page_title_state,
             ]
         )
 
         regional_input.change(
-            fn=handle_manual_video_upload,
-            inputs=[composite_video_input, start_seconds_input, regional_input],
+            fn=handle_manual_regional_change,
+            inputs=[
+                composite_video_input,
+                start_seconds_input,
+                regional_input,
+                blue_robot_1,
+                blue_robot_2,
+                blue_robot_3,
+                red_robot_1,
+                red_robot_2,
+                red_robot_3,
+                video_metadata_state,
+            ],
             outputs=[
                 preview_source_video,
                 center_video_input,
@@ -10608,6 +11013,7 @@ def create_manual_demo():
                 regional_input,
                 highlight_ball_robot_dropdown,
                 video_source_status,
+                video_metadata_state,
                 page_title_state,
             ]
         )
@@ -10645,6 +11051,7 @@ def create_manual_demo():
                 regional_input,
                 highlight_ball_robot_dropdown,
                 video_source_status,
+                video_metadata_state,
                 page_title_state,
             ]
         )
@@ -10704,7 +11111,7 @@ def create_manual_demo():
             )
 
         process_btn.click(
-            fn=process_manual_center_video,
+            fn=process_manual_center_video_table_only if limited_mode else process_manual_center_video,
             inputs=[
                 center_video_input,
                 composite_video_input,
@@ -10761,7 +11168,7 @@ def create_demo():
                 gr.Markdown("<div class='panel-title'>Input</div>", elem_classes="input-panel")
                 
                 composite_video_input = gr.Video(
-                    label="Match Video (1920×1080 — auto-splits into 3 cameras)",
+                    label="Match Video (720p or 1080p — auto-splits into 3 cameras)",
                     sources=["upload"],
                 )
                 
@@ -10784,6 +11191,7 @@ def create_demo():
                 blue_video_input = gr.State(None)
                 center_video_input = gr.State(None)
                 red_video_input = gr.State(None)
+                video_metadata_state = gr.State(_blank_match_metadata())
                 
                 # --- Center Camera Calibration ---
                 gr.Markdown("### Center Camera Calibration")
@@ -10894,12 +11302,12 @@ def create_demo():
                 
                 with gr.Row():
                     fps_slider = gr.Slider(
-                        minimum=1,
+                        minimum=10,
                         maximum=30,
-                        value=8,
-                        step=1,
+                        value=30,
+                        step=10,
                         label="Processing FPS",
-                        info="Higher FPS = more API calls & slower processing"
+                        info="Run at 10, 20, or 30 FPS. Higher FPS means more API calls and slower processing."
                     )
                 
                 with gr.Row():
@@ -11020,13 +11428,62 @@ def create_demo():
         
         # --- Calibration Event Wiring ---
         
-        def handle_video_upload(video_path, start_seconds, regional_name):
+        def handle_video_upload(video_path, start_seconds,
+                                current_blue_1, current_blue_2, current_blue_3,
+                                current_red_1, current_red_2, current_red_3,
+                                current_highlight, current_regional):
             """Extract calibration frames and apply any saved regional calibration."""
-            calibration_state = _prepare_composite_video_calibration_state(video_path, start_seconds, regional_name)
+            metadata = _extract_uploaded_video_match_metadata(video_path)
+            merged_blue = _merge_prefilled_robot_numbers(
+                metadata.get("blue_robots", []),
+                [current_blue_1, current_blue_2, current_blue_3],
+            )
+            merged_red = _merge_prefilled_robot_numbers(
+                metadata.get("red_robots", []),
+                [current_red_1, current_red_2, current_red_3],
+            )
+            resolved_regional = _clean_text(metadata.get("regional_name") or current_regional)
+            calibration_state = _prepare_composite_video_calibration_state(video_path, start_seconds, resolved_regional)
             loaded_saved = calibration_state[-1]
+            highlight_update = _update_ball_highlight_dropdown(
+                merged_blue[0], merged_blue[1], merged_blue[2],
+                merged_red[0], merged_red[1], merged_red[2],
+                current_highlight,
+            )
             status = VIDEO_SOURCE_EMPTY_STATUS if video_path is None else _format_video_source_status(
                 "Uploaded video ready.",
+                regional_name=resolved_regional,
+                match_title=metadata.get("match_title", ""),
+                blue_robots=merged_blue,
+                red_robots=merged_red,
+                calibration_loaded=loaded_saved,
+            )
+            resolved_page_title = _get_page_title_for_match(metadata) if _clean_text(metadata.get("match_title") or metadata.get("match_label")) else DEFAULT_PAGE_TITLE
+            return (
+                *calibration_state[:-1],
+                merged_blue[0], merged_blue[1], merged_blue[2],
+                merged_red[0], merged_red[1], merged_red[2],
+                resolved_regional,
+                highlight_update,
+                status,
+                metadata,
+                resolved_page_title,
+            )
+
+        def handle_regional_change(video_path, start_seconds, regional_name,
+                                   current_blue_1, current_blue_2, current_blue_3,
+                                   current_red_1, current_red_2, current_red_3,
+                                   current_metadata):
+            calibration_state = _prepare_composite_video_calibration_state(video_path, start_seconds, regional_name)
+            loaded_saved = calibration_state[-1]
+            metadata = current_metadata if isinstance(current_metadata, dict) else _blank_match_metadata()
+            source_label = "YouTube video ready." if _get_managed_youtube_download_dir(video_path) else "Uploaded video ready."
+            status = VIDEO_SOURCE_EMPTY_STATUS if video_path is None else _format_video_source_status(
+                source_label,
                 regional_name=regional_name,
+                match_title=metadata.get("match_title", ""),
+                blue_robots=[current_blue_1, current_blue_2, current_blue_3],
+                red_robots=[current_red_1, current_red_2, current_red_3],
                 calibration_loaded=loaded_saved,
             )
             return (*calibration_state[:-1], status)
@@ -11069,23 +11526,56 @@ def create_demo():
                 resolved_regional,
                 highlight_update,
                 status,
+                metadata,
                 _get_page_title_for_match(metadata),
             )
         
         composite_video_input.change(
             fn=handle_video_upload,
-            inputs=[composite_video_input, start_seconds_input, regional_input],
+            inputs=[
+                composite_video_input,
+                start_seconds_input,
+                blue_robot_1,
+                blue_robot_2,
+                blue_robot_3,
+                red_robot_1,
+                red_robot_2,
+                red_robot_3,
+                highlight_ball_robot_dropdown,
+                regional_input,
+            ],
             outputs=[
                 calibration_image, calibration_base_image, calibration_points_state, calibration_image_size_state, calibration_status,
                 blue_side_calibration_image, blue_side_base_image, blue_side_box_points_state, blue_side_box_image_size_state, blue_side_status,
                 red_side_calibration_image, red_side_base_image, red_side_box_points_state, red_side_box_image_size_state, red_side_status,
+                blue_robot_1,
+                blue_robot_2,
+                blue_robot_3,
+                red_robot_1,
+                red_robot_2,
+                red_robot_3,
+                regional_input,
+                highlight_ball_robot_dropdown,
                 video_source_status,
+                video_metadata_state,
+                page_title_state,
             ]
         )
 
         regional_input.change(
-            fn=handle_video_upload,
-            inputs=[composite_video_input, start_seconds_input, regional_input],
+            fn=handle_regional_change,
+            inputs=[
+                composite_video_input,
+                start_seconds_input,
+                regional_input,
+                blue_robot_1,
+                blue_robot_2,
+                blue_robot_3,
+                red_robot_1,
+                red_robot_2,
+                red_robot_3,
+                video_metadata_state,
+            ],
             outputs=[
                 calibration_image, calibration_base_image, calibration_points_state, calibration_image_size_state, calibration_status,
                 blue_side_calibration_image, blue_side_base_image, blue_side_box_points_state, blue_side_box_image_size_state, blue_side_status,
@@ -11122,6 +11612,7 @@ def create_demo():
                 regional_input,
                 highlight_ball_robot_dropdown,
                 video_source_status,
+                video_metadata_state,
                 page_title_state,
             ]
         )
@@ -11154,6 +11645,7 @@ def create_demo():
                 regional_input,
                 highlight_ball_robot_dropdown,
                 video_source_status,
+                video_metadata_state,
                 page_title_state,
             ]
         )
@@ -11312,7 +11804,7 @@ def create_demo():
 
 if __name__ == "__main__":
     _cleanup_old_youtube_downloads()
-    demo = create_manual_demo() if MANUAL_ROBOT_TRACKING else create_demo()
+    demo = create_manual_demo(limited_mode=MANUAL_LIMITED_ROBOT_TRACKING) if MANUAL_ROBOT_TRACKING else create_demo()
     demo.launch(
         server_name="0.0.0.0",
         server_port=7860,
