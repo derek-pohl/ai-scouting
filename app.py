@@ -159,7 +159,7 @@ PAGE_TITLE_SYNC_HTML = f"""
 """
 
 TRACKING_FPS_OPTIONS = (10, 20, 30)
-DEFAULT_TRACKING_FPS = 30
+DEFAULT_TRACKING_FPS = 10
 BALL_TRACKER_BASELINE_FPS = 30.0
 
 
@@ -815,6 +815,16 @@ def _serialize_calibration_points(points: list, image_size: tuple) -> list:
     return serialized
 
 
+def _serialize_calibration_polygons(polygons: list, image_size: tuple) -> list:
+    """Persist a list of polygons as normalized coordinate lists."""
+    serialized = []
+    for polygon in list(polygons or []):
+        normalized = _serialize_calibration_points(polygon, image_size)
+        if normalized:
+            serialized.append(normalized)
+    return serialized
+
+
 def _restore_calibration_points(points: list, image_size: tuple) -> list:
     """Restore normalized calibration points into the current image size."""
     if not points or not image_size:
@@ -835,6 +845,16 @@ def _restore_calibration_points(points: list, image_size: tuple) -> list:
         except Exception:
             continue
         restored.append((x, y))
+    return restored
+
+
+def _restore_calibration_polygons(polygons: list, image_size: tuple) -> list:
+    """Restore a list of normalized polygons into the current image size."""
+    restored = []
+    for polygon in list(polygons or []):
+        denormalized = _restore_calibration_points(polygon, image_size)
+        if denormalized:
+            restored.append(denormalized)
     return restored
 
 
@@ -885,20 +905,65 @@ def _persist_regional_calibration(
     entry = cache.get(cache_key, {})
     if not isinstance(entry, dict):
         entry = {}
+    previous_entry = json.loads(json.dumps(entry)) if entry else {}
     entry["regional_name"] = display_name
 
-    updated = False
-    if calibration_points and calibration_image_size and len(calibration_points) >= CALIBRATION_REQUIRED_POINTS:
-        entry["center_points"] = _serialize_calibration_points(calibration_points, calibration_image_size)
-        updated = True
-    if blue_side_box_points and blue_side_box_image_size and len(blue_side_box_points) >= SIDE_CAMERA_BOX_POINT_COUNT:
-        entry["blue_side_points"] = _serialize_calibration_points(blue_side_box_points, blue_side_box_image_size)
-        updated = True
-    if red_side_box_points and red_side_box_image_size and len(red_side_box_points) >= SIDE_CAMERA_BOX_POINT_COUNT:
-        entry["red_side_points"] = _serialize_calibration_points(red_side_box_points, red_side_box_image_size)
-        updated = True
+    if calibration_points is not None:
+        center_points, human_start_polygons, no_scan_polygons = _split_center_calibration_and_exclusion_points(calibration_points)
+        blue_human_points = human_start_polygons.get("blue", [])
+        red_human_points = human_start_polygons.get("red", [])
 
-    if not updated:
+        if calibration_image_size and len(center_points) >= CALIBRATION_REQUIRED_POINTS:
+            entry["center_points"] = _serialize_calibration_points(center_points, calibration_image_size)
+        else:
+            entry.pop("center_points", None)
+
+        if calibration_image_size and len(blue_human_points) >= HUMAN_START_ZONE_POINTS_PER_SIDE:
+            entry["blue_human_start_zone_points"] = _serialize_calibration_points(blue_human_points, calibration_image_size)
+        else:
+            entry.pop("blue_human_start_zone_points", None)
+
+        if calibration_image_size and len(red_human_points) >= HUMAN_START_ZONE_POINTS_PER_SIDE:
+            entry["red_human_start_zone_points"] = _serialize_calibration_points(red_human_points, calibration_image_size)
+        else:
+            entry.pop("red_human_start_zone_points", None)
+
+        if calibration_image_size and no_scan_polygons:
+            entry["center_no_scan_polygons"] = _serialize_calibration_polygons(no_scan_polygons, calibration_image_size)
+        else:
+            entry.pop("center_no_scan_polygons", None)
+
+    if blue_side_box_points is not None:
+        if blue_side_box_image_size and len(blue_side_box_points) >= SIDE_CAMERA_BOX_POINT_COUNT:
+            entry["blue_side_points"] = _serialize_calibration_points(blue_side_box_points, blue_side_box_image_size)
+        else:
+            entry.pop("blue_side_points", None)
+
+    if red_side_box_points is not None:
+        if red_side_box_image_size and len(red_side_box_points) >= SIDE_CAMERA_BOX_POINT_COUNT:
+            entry["red_side_points"] = _serialize_calibration_points(red_side_box_points, red_side_box_image_size)
+        else:
+            entry.pop("red_side_points", None)
+
+    payload_keys = (
+        "center_points",
+        "blue_human_start_zone_points",
+        "red_human_start_zone_points",
+        "center_no_scan_polygons",
+        "blue_side_points",
+        "red_side_points",
+    )
+    has_payload = any(entry.get(key) for key in payload_keys)
+
+    if not has_payload:
+        if cache_key in cache:
+            cache.pop(cache_key, None)
+            _save_field_calibration_cache(cache)
+            print(f"[Calibration Cache] Cleared calibration for {display_name}")
+            return True
+        return False
+
+    if entry == previous_entry:
         return False
 
     cache[cache_key] = entry
@@ -917,6 +982,26 @@ def _get_saved_calibration_points(regional_name: str, center_frame=None, blue_fr
         entry.get("center_points", []),
         center_frame.size if center_frame is not None else None,
     )
+    if any(key in entry for key in ("blue_human_start_zone_points", "red_human_start_zone_points", "center_no_scan_polygons")):
+        restored_center_points = list(center_points[:CALIBRATION_REQUIRED_POINTS])
+        restored_center_points.extend(_restore_calibration_points(
+            entry.get("blue_human_start_zone_points", []),
+            center_frame.size if center_frame is not None else None,
+        ))
+        restored_center_points.extend(_restore_calibration_points(
+            entry.get("red_human_start_zone_points", []),
+            center_frame.size if center_frame is not None else None,
+        ))
+        for polygon in _restore_calibration_polygons(
+            entry.get("center_no_scan_polygons", []),
+            center_frame.size if center_frame is not None else None,
+        ):
+            restored_center_points.extend(polygon)
+        center_points = restored_center_points
+    elif len(center_points) > CALIBRATION_REQUIRED_POINTS:
+        # Legacy flat center-point saves used extra clicks only for no-scan zones.
+        # Truncate here so those old extras do not get reinterpreted as human-start zones.
+        center_points = center_points[:CALIBRATION_REQUIRED_POINTS]
     blue_points = _restore_calibration_points(
         entry.get("blue_side_points", []),
         blue_frame.size if blue_frame is not None else None,
@@ -2600,7 +2685,7 @@ def _apply_ocr_score_correction(stats: dict, center_score_ocr: dict, blue_robots
         }
 
     deduped_shot_events = (
-        list(all_shot_events or [])
+        _normalize_shot_events(all_shot_events or [], blue_robots=blue_robots, red_robots=red_robots)
         if manual_mode else
         _dedupe_shot_events(all_shot_events or [], dedup_window_seconds=MULTI_CAMERA_SHOT_DEDUP_WINDOW_SECONDS)
     )
@@ -2631,15 +2716,35 @@ def _apply_ocr_score_correction(stats: dict, center_score_ocr: dict, blue_robots
         alliance_attempts = sorted(
             [
                 {
-                    "time": float(elapsed),
-                    "label": str(robot_label).strip(),
-                    "made_hint": bool(made),
+                    "time": float(event.get("time", 0.0)),
+                    "label": str(event.get("label", "")).strip(),
+                    "made_hint": bool(event.get("made")),
                     "assigned": False,
                 }
-                for elapsed, robot_label, made in deduped_shot_events
-                if str(robot_label).strip() in participating_labels
+                for event in deduped_shot_events
+                if (
+                    event.get("source_type") == SHOT_SOURCE_ROBOT and
+                    str(event.get("label", "")).strip() in participating_labels
+                )
             ],
             key=lambda attempt: (float(attempt["time"]), str(attempt["label"])),
+        )
+        human_made_attempts = sorted(
+            [
+                {
+                    "time": float(event.get("time", 0.0)),
+                    "label": HUMAN_SHOT_LABEL,
+                    "made_hint": True,
+                    "assigned": False,
+                }
+                for event in deduped_shot_events
+                if (
+                    event.get("source_type") == SHOT_SOURCE_HUMAN and
+                    event.get("alliance") == alliance and
+                    bool(event.get("made"))
+                )
+            ],
+            key=lambda attempt: float(attempt["time"]),
         )
         scaled_makes = {label: 0 for label in participating_labels}
         scaled_period_makes = {
@@ -2649,11 +2754,28 @@ def _apply_ocr_score_correction(stats: dict, center_score_ocr: dict, blue_robots
         unmatched_ocr_total = 0
         ocr_only_total = 0
         allocated_total = 0
+        human_consumed_total = 0
+        ocr_consumed_total = 0
 
         for event_time, delta, _ in positive_ocr_events:
             remaining_budget = delta
             if ocr_total is not None:
-                remaining_budget = min(remaining_budget, max(0, ocr_total - allocated_total))
+                remaining_budget = min(remaining_budget, max(0, ocr_total - ocr_consumed_total))
+            if remaining_budget <= 0:
+                continue
+
+            human_candidate_indices = _select_ocr_attempt_indices(
+                human_made_attempts,
+                event_time,
+                remaining_budget,
+            )
+            for attempt_idx in human_candidate_indices:
+                human_made_attempts[attempt_idx]["assigned"] = True
+            human_allocated = len(human_candidate_indices)
+            if human_allocated > 0:
+                human_consumed_total += human_allocated
+                ocr_consumed_total += human_allocated
+                remaining_budget -= human_allocated
             if remaining_budget <= 0:
                 continue
 
@@ -2679,6 +2801,7 @@ def _apply_ocr_score_correction(stats: dict, center_score_ocr: dict, blue_robots
                 label = attempt["label"]
                 scaled_makes[label] = scaled_makes.get(label, 0) + 1
                 allocated_total += 1
+                ocr_consumed_total += 1
                 period_name = get_match_period_for_elapsed(float(attempt["time"]), match_clock_ocr=match_clock_ocr)
                 if period_name in scaled_period_makes.get(label, {}):
                     scaled_period_makes[label][period_name] += 1
@@ -2689,6 +2812,7 @@ def _apply_ocr_score_correction(stats: dict, center_score_ocr: dict, blue_robots
                 fallback_period = get_match_period_for_elapsed(float(event_time), match_clock_ocr=match_clock_ocr)
                 scaled_makes[fallback_label] = scaled_makes.get(fallback_label, 0) + remaining_budget
                 allocated_total += remaining_budget
+                ocr_consumed_total += remaining_budget
                 ocr_only_total += remaining_budget
                 if fallback_period in scaled_period_makes.get(fallback_label, {}):
                     scaled_period_makes[fallback_label][fallback_period] += remaining_budget
@@ -2700,7 +2824,8 @@ def _apply_ocr_score_correction(stats: dict, center_score_ocr: dict, blue_robots
         print(
             f"[Center Score OCR] {alliance.title()} alliance grounding"
             f"{' (manual)' if manual_mode else ''}: "
-            f"SAM made={sam_total}, OCR made={ocr_total}, attributed={allocated_total}, "
+            f"SAM made={sam_total}, OCR made={ocr_total}, human={human_consumed_total}, "
+            f"attributed={allocated_total}, "
             f"unmatched_ocr={unmatched_ocr_total}, ocr_only={ocr_only_total}, grounded={scaled_makes}"
         )
 
@@ -3413,6 +3538,11 @@ class DisabledTracker:
         return {label: self.get_disabled_status(label) for label in self.robot_data}
 
 
+SHOT_SOURCE_ROBOT = "robot"
+SHOT_SOURCE_HUMAN = "human"
+HUMAN_SHOT_LABEL = "human"
+
+
 class BallTracker:
     """
     Track individual balls across frames, detect shots, and attribute to robots.
@@ -3426,7 +3556,8 @@ class BallTracker:
                  max_frames_lost: int = 30, camera_side: str = "blue",
                  blue_robots: list = None, red_robots: list = None,
                  start_seconds: float = 0.0, ferry_tracker: FerryTracker = None,
-                 frame_width: int = 0, frame_height: int = 0):
+                 frame_width: int = 0, frame_height: int = 0,
+                 human_start_polygons: dict = None):
         """
         Initialize ball tracker.
         
@@ -3443,6 +3574,7 @@ class BallTracker:
             ferry_tracker: FerryTracker instance for counting ferried fuel
             frame_width: Actual video frame width (for polygon scaling)
             frame_height: Actual video frame height (for polygon scaling)
+            human_start_polygons: Optional center-camera blue/red human launch polygons
         """
         self.fps = max(1.0, float(fps))
         # Lower tracking FPS means each observation is farther apart in time, so widen
@@ -3462,6 +3594,10 @@ class BallTracker:
         self.ferry_tracker = ferry_tracker  # Reference to ferry tracker
         self.frame_width = frame_width  # Stored for edge-robot detection
         self.frame_height = frame_height  # Stored for edge-robot detection
+        self.human_start_polygons = {
+            side_name: list((human_start_polygons or {}).get(side_name) or [])
+            for side_name in CENTER_HUMAN_START_ZONE_SIDES
+        }
         self.possession_memory_frames = max(2, int(round(self.fps * 0.30)))
         self.launch_anchor_y_ratio = 0.35
         self.launch_zone_y_ratio = 0.65
@@ -3494,7 +3630,8 @@ class BallTracker:
         # Shot statistics: {robot_label: {'attempts': 0, 'made': 0, 'by_period': {...}}}
         self.robot_stats = {}
         
-        # Shot event log for cross-camera deduplication: [(elapsed_seconds, robot_label, made_bool), ...]
+        # Shot event log for cross-camera deduplication / OCR reconciliation.
+        # Format: [{"time": seconds, "label": str, "made": bool, "source_type": str, "alliance": str}, ...]
         self.shot_events = []
 
         # Per-frame shooting state sampled at ball-tracking FPS.
@@ -3541,7 +3678,28 @@ class BallTracker:
         """Get elapsed match time based on current frame."""
         return self.start_seconds + (self.current_frame / self.fps)
     
-    def _record_shot(self, robot_label: str, made: bool, event_elapsed: float = None):
+    def _infer_shot_alliance(self, shot_label: str = "", fallback: str = None) -> str:
+        """Infer the alliance for a shot label when the caller did not provide it."""
+        label = str(shot_label or "").strip()
+        if label in self.blue_robots:
+            return "blue"
+        if label in self.red_robots:
+            return "red"
+        fallback_label = str(fallback or "").strip().lower()
+        return fallback_label if fallback_label in ("blue", "red") else None
+
+    def _get_human_start_zone_alliance(self, ball_x: float, ball_y: float) -> str:
+        """Return the human-start side when a launch starts inside a calibrated polygon."""
+        if self.camera_side != "center":
+            return None
+        for side_name in CENTER_HUMAN_START_ZONE_SIDES:
+            polygon = self.human_start_polygons.get(side_name) or []
+            if len(polygon) >= 3 and self._is_point_in_polygon(ball_x, ball_y, polygon):
+                return side_name
+        return None
+
+    def _record_shot(self, robot_label: str, made: bool, event_elapsed: float = None,
+                     source_type: str = "robot", alliance: str = None):
         """
         Record a shot attempt for a robot, tracking both total and by period.
         
@@ -3549,16 +3707,30 @@ class BallTracker:
             robot_label: The robot's team number
             made: True if shot was made, False if missed
             event_elapsed: Timestamp of the actual launch event when known
+            source_type: "robot" or "human"
+            alliance: Alliance associated with the shot when known
         """
-        stats = self._get_robot_stats(robot_label)
         try:
             elapsed = float(event_elapsed) if event_elapsed is not None else self._get_elapsed_seconds()
         except (TypeError, ValueError):
             elapsed = self._get_elapsed_seconds()
+        source_type = "human" if str(source_type).strip().lower() == "human" else "robot"
+        shot_alliance = self._infer_shot_alliance(robot_label, fallback=alliance)
+
+        # Log shot event for cross-camera deduplication / OCR reconciliation.
+        self.shot_events.append({
+            "time": elapsed,
+            "label": str(robot_label or "").strip(),
+            "made": bool(made),
+            "source_type": source_type,
+            "alliance": shot_alliance,
+        })
+
+        if source_type != "robot":
+            return
+
+        stats = self._get_robot_stats(robot_label)
         period = get_match_period(elapsed)
-        
-        # Log shot event for cross-camera deduplication
-        self.shot_events.append((elapsed, robot_label, made))
         
         # Update totals
         stats['attempts'] += 1
@@ -4146,6 +4318,7 @@ class BallTracker:
         return launch_progress >= self.min_predicted_make_progress_pixels
 
     def _resolve_shot_result(self, robot_label: str, x: float, y: float,
+                             source_type: str = SHOT_SOURCE_ROBOT, alliance: str = None,
                              was_ever_in_goal: bool = False, prediction: dict = None,
                              shot_origin_pos: tuple = None, trace_visible: bool = False,
                              context: str = "", shot_frame: int = None) -> bool:
@@ -4163,8 +4336,13 @@ class BallTracker:
         )
         if not observed_make and not predicted_make and launch_progress < self.min_shot_progress_pixels:
             suffix = f" ({context})" if context else ""
+            actor = (
+                f"human ({alliance})"
+                if str(source_type).strip().lower() == SHOT_SOURCE_HUMAN else
+                f"robot {robot_label}"
+            )
             print(
-                f"[SHOT DROPPED] Robot {robot_label}{suffix}: "
+                f"[SHOT DROPPED] {actor}{suffix}: "
                 f"only moved {launch_progress:.1f}px from launch point"
             )
             return False
@@ -4177,7 +4355,13 @@ class BallTracker:
             )
         except (TypeError, ValueError, ZeroDivisionError):
             event_elapsed = self._get_elapsed_seconds()
-        self._record_shot(robot_label, made=made, event_elapsed=event_elapsed)
+        self._record_shot(
+            robot_label,
+            made=made,
+            event_elapsed=event_elapsed,
+            source_type=source_type,
+            alliance=alliance,
+        )
 
         period = get_match_period(event_elapsed)
         if raw_observed_make and not trace_visible:
@@ -4195,7 +4379,12 @@ class BallTracker:
             )
         outcome = "SHOT MADE" if made else "SHOT MISSED"
         suffix = f" ({context})" if context else ""
-        print(f"[{outcome}] Robot {robot_label} @ {period}{suffix}: {reason}")
+        actor = (
+            f"Human ({alliance})"
+            if str(source_type).strip().lower() == SHOT_SOURCE_HUMAN else
+            f"Robot {robot_label}"
+        )
+        print(f"[{outcome}] {actor} @ {period}{suffix}: {reason}")
         return made
     
     def get_predicted_positions(self) -> list:
@@ -4429,6 +4618,8 @@ class BallTracker:
                 lost_data['predicted_pos'] = (pred_x, pred_y)
 
             shot_by = ball_data.get('shot_by')
+            shot_source_type = ball_data.get('shot_source_type', SHOT_SOURCE_ROBOT)
+            shot_alliance = ball_data.get('shot_alliance')
             shot_evaluated = ball_data.get('shot_evaluated', False)
             candidate_shot = ball_data.get('candidate_shot')
             shot_origin_pos = ball_data.get('shot_origin_pos')
@@ -4460,6 +4651,8 @@ class BallTracker:
                         shot_by,
                         x,
                         y,
+                        source_type=lost_data['data'].get('shot_source_type', SHOT_SOURCE_ROBOT),
+                        alliance=lost_data['data'].get('shot_alliance'),
                         was_ever_in_goal=lost_data['data'].get('last_seen_in_goal', False),
                         prediction=lost_data['data'].get('candidate_shot'),
                         shot_origin_pos=lost_data['data'].get('shot_origin_pos'),
@@ -4489,6 +4682,8 @@ class BallTracker:
                 
                 # Restore all shot state from the lost ball
                 shot_by = old_data.get('shot_by')
+                shot_source_type = old_data.get('shot_source_type', SHOT_SOURCE_ROBOT)
+                shot_alliance = old_data.get('shot_alliance')
                 shot_time = old_data.get('shot_time')
                 shot_evaluated = old_data.get('shot_evaluated', False)
                 candidate_shot = old_data.get('candidate_shot')
@@ -4518,6 +4713,8 @@ class BallTracker:
                     'pos': (x, y, r),
                     'prev_pos': None,
                     'shot_by': None,
+                    'shot_source_type': None,
+                    'shot_alliance': None,
                     'shot_time': None,
                     'shot_evaluated': False,
                     'overlapping_robot': cur_overlap,
@@ -4547,6 +4744,8 @@ class BallTracker:
                 old_data = self.tracked_balls[ball_id]
                 prev_pos = old_data['pos']
                 shot_by = old_data.get('shot_by')
+                shot_source_type = old_data.get('shot_source_type', SHOT_SOURCE_ROBOT)
+                shot_alliance = old_data.get('shot_alliance')
                 shot_time = old_data.get('shot_time')
                 shot_evaluated = old_data.get('shot_evaluated', False)
                 candidate_shot = old_data.get('candidate_shot')
@@ -4586,8 +4785,24 @@ class BallTracker:
                     window_gain >= self.min_launch_window_gain or
                     rising_steps >= 2
                 )
-                if nearby_robot and launch_detected:
+                human_alliance = self._get_human_start_zone_alliance(x, y) if launch_detected else None
+                if human_alliance:
+                    shot_by = HUMAN_SHOT_LABEL
+                    shot_source_type = SHOT_SOURCE_HUMAN
+                    shot_alliance = human_alliance
+                    shot_time = self.current_frame
+                    shot_evaluated = False
+                    candidate_shot = None
+                    shot_origin_pos = (x, y, r)
+                    print(
+                        f"[SHOT DETECTED] Ball {ball_id} shot by human ({human_alliance}) at "
+                        f"pos=({x:.0f},{y:.0f}), rise={instant_rise:.0f}px, "
+                        f"window_gain={window_gain:.0f}px, steps={rising_steps}"
+                    )
+                elif nearby_robot and launch_detected:
                     shot_by = nearby_robot
+                    shot_source_type = SHOT_SOURCE_ROBOT
+                    shot_alliance = self._infer_shot_alliance(nearby_robot)
                     shot_time = self.current_frame
                     shot_evaluated = False
                     candidate_shot = None
@@ -4623,6 +4838,8 @@ class BallTracker:
                         shot_by,
                         x,
                         y,
+                        source_type=shot_source_type,
+                        alliance=shot_alliance,
                         was_ever_in_goal=was_ever_in_goal,
                         prediction=candidate_shot,
                         shot_origin_pos=shot_origin_pos,
@@ -4638,6 +4855,8 @@ class BallTracker:
                 seconds_since_shot = frames_since_shot / self.fps
                 if seconds_since_shot > self.shot_label_duration:
                     shot_by = None
+                    shot_source_type = None
+                    shot_alliance = None
                     shot_time = None
             
             is_in_goal = self._is_in_goal(x, y)
@@ -4659,6 +4878,8 @@ class BallTracker:
                 'pos': (x, y, r),
                 'prev_pos': prev_pos,
                 'shot_by': shot_by,
+                'shot_source_type': shot_source_type,
+                'shot_alliance': shot_alliance,
                 'shot_time': shot_time,
                 'shot_evaluated': shot_evaluated,
                 'overlapping_robot': cur_overlap,
@@ -4748,6 +4969,8 @@ class BallTracker:
                     shot_by,
                     x,
                     y,
+                    source_type=ball_data.get('shot_source_type', SHOT_SOURCE_ROBOT),
+                    alliance=ball_data.get('shot_alliance'),
                     was_ever_in_goal=ball_data.get('last_seen_in_goal', False),
                     prediction=ball_data.get('candidate_shot'),
                     shot_origin_pos=ball_data.get('shot_origin_pos'),
@@ -4767,6 +4990,8 @@ class BallTracker:
                     shot_by,
                     x,
                     y,
+                    source_type=lost_data['data'].get('shot_source_type', SHOT_SOURCE_ROBOT),
+                    alliance=lost_data['data'].get('shot_alliance'),
                     was_ever_in_goal=lost_data['data'].get('last_seen_in_goal', False),
                     prediction=lost_data['data'].get('candidate_shot'),
                     shot_origin_pos=lost_data['data'].get('shot_origin_pos'),
@@ -5229,6 +5454,10 @@ class CenterCameraCalibrator:
 CALIBRATION_POINT_LABELS = list(CenterCameraCalibrator.REFERENCE_POINTS.keys())
 CALIBRATION_REQUIRED_POINTS = len(CALIBRATION_POINT_LABELS)
 NO_SCAN_POINTS_PER_BOX = 4
+HUMAN_START_ZONE_POINTS_PER_SIDE = 4
+CENTER_HUMAN_START_ZONE_SIDES = ("blue", "red")
+HUMAN_START_ZONE_LABEL_PREFIX = {"blue": "HB", "red": "HR"}
+TOTAL_HUMAN_START_ZONE_POINTS = HUMAN_START_ZONE_POINTS_PER_SIDE * len(CENTER_HUMAN_START_ZONE_SIDES)
 SIDE_CAMERA_BOX_LABELS = {
     "blue": ["MIDDLE", "LEFT", "FAR LEFT"],
     "red": ["MIDDLE", "RIGHT", "FAR RIGHT"],
@@ -5382,7 +5611,7 @@ def _redraw_side_calibration_image(base_image: Image.Image, clicked_points: list
 
 
 def _get_calibration_status_text(num_points: int) -> str:
-    """Return the next-step instruction for calibration / no-scan clicks."""
+    """Return the next-step instruction for calibration / human-zone / no-scan clicks."""
     if num_points <= 0:
         return "**Click point B1** (1 of 8)"
 
@@ -5392,15 +5621,46 @@ def _get_calibration_status_text(num_points: int) -> str:
 
     if num_points == CALIBRATION_REQUIRED_POINTS:
         return (
-            "**Calibration points set!** Optional: click **Z1.1** to start the first "
-            "center-camera no-scan box, or click 'Process Video' now."
+            "**Calibration points set!** Optional: click **HB1** to start the blue "
+            "human-start zone, or click 'Process Video' now."
         )
 
-    extra_points = num_points - CALIBRATION_REQUIRED_POINTS
+    human_zone_limit = CALIBRATION_REQUIRED_POINTS + TOTAL_HUMAN_START_ZONE_POINTS
+    if num_points < human_zone_limit:
+        extra_points = num_points - CALIBRATION_REQUIRED_POINTS
+        next_label = _get_center_calibration_click_label(num_points)
+        current_zone_index = min(
+            len(CENTER_HUMAN_START_ZONE_SIDES) - 1,
+            extra_points // HUMAN_START_ZONE_POINTS_PER_SIDE,
+        )
+        current_zone_side = CENTER_HUMAN_START_ZONE_SIDES[current_zone_index]
+        current_zone_title = "blue" if current_zone_side == "blue" else "red"
+        next_point_in_zone = (extra_points % HUMAN_START_ZONE_POINTS_PER_SIDE) + 1
+
+        if extra_points > 0 and extra_points % HUMAN_START_ZONE_POINTS_PER_SIDE == 0:
+            completed_zones = extra_points // HUMAN_START_ZONE_POINTS_PER_SIDE
+            if completed_zones >= len(CENTER_HUMAN_START_ZONE_SIDES):
+                return (
+                    "**Human-start zones set!** Optional: click **Z1.1** to start the first "
+                    "center-camera no-scan box, or click 'Process Video' now."
+                )
+            next_zone_side = CENTER_HUMAN_START_ZONE_SIDES[completed_zones]
+            next_zone_title = "blue" if next_zone_side == "blue" else "red"
+            return (
+                f"**{completed_zones} human-start zone(s) set!** Optional: click **{next_label}** "
+                f"to start the {next_zone_title} zone, or click 'Process Video' now."
+            )
+
+        return (
+            f"**Click point {next_label}** "
+            f"({current_zone_title} human-start zone, point {next_point_in_zone} of 4)"
+        )
+
+    extra_points = num_points - human_zone_limit
     next_label = _get_center_calibration_click_label(num_points)
     current_box = (extra_points // NO_SCAN_POINTS_PER_BOX) + 1
     next_point_in_box = (extra_points % NO_SCAN_POINTS_PER_BOX) + 1
-    if extra_points % NO_SCAN_POINTS_PER_BOX == 0:
+    if extra_points > 0 and extra_points % NO_SCAN_POINTS_PER_BOX == 0:
         completed_boxes = extra_points // NO_SCAN_POINTS_PER_BOX
         return (
             f"**{completed_boxes} no-scan box(es) set!** Optional: click **{next_label}** "
@@ -5417,25 +5677,38 @@ def _get_center_calibration_click_label(index: int) -> str:
     """Return the UI label for a center-camera calibration / exclusion click."""
     if index < CALIBRATION_REQUIRED_POINTS:
         return CALIBRATION_POINT_LABELS[index]
-    extra_index = index - CALIBRATION_REQUIRED_POINTS
+    human_index = index - CALIBRATION_REQUIRED_POINTS
+    if human_index < TOTAL_HUMAN_START_ZONE_POINTS:
+        zone_index = human_index // HUMAN_START_ZONE_POINTS_PER_SIDE
+        point_index = (human_index % HUMAN_START_ZONE_POINTS_PER_SIDE) + 1
+        side_name = CENTER_HUMAN_START_ZONE_SIDES[zone_index]
+        return f"{HUMAN_START_ZONE_LABEL_PREFIX[side_name]}{point_index}"
+    extra_index = human_index - TOTAL_HUMAN_START_ZONE_POINTS
     box_index = (extra_index // NO_SCAN_POINTS_PER_BOX) + 1
     point_index = (extra_index % NO_SCAN_POINTS_PER_BOX) + 1
     return f"Z{box_index}.{point_index}"
 
 
-def _split_calibration_and_exclusion_points(clicked_points: list) -> tuple:
-    """Split UI clicks into homography points and optional robot no-scan polygons."""
+def _split_center_calibration_and_exclusion_points(clicked_points: list) -> tuple:
+    """Split center-camera UI clicks into homography, human-start, and no-scan polygons."""
     points = list(clicked_points or [])
     calibration_points = points[:CALIBRATION_REQUIRED_POINTS]
     extra_points = points[CALIBRATION_REQUIRED_POINTS:]
 
+    human_start_polygons = {}
+    cursor = 0
+    for side_name in CENTER_HUMAN_START_ZONE_SIDES:
+        human_start_polygons[side_name] = extra_points[cursor:cursor + HUMAN_START_ZONE_POINTS_PER_SIDE]
+        cursor += HUMAN_START_ZONE_POINTS_PER_SIDE
+
+    extra_points = extra_points[cursor:]
     polygons = []
     for idx in range(0, len(extra_points), NO_SCAN_POINTS_PER_BOX):
         polygon = extra_points[idx:idx + NO_SCAN_POINTS_PER_BOX]
         if len(polygon) == NO_SCAN_POINTS_PER_BOX:
             polygons.append(polygon)
 
-    return calibration_points, polygons
+    return calibration_points, human_start_polygons, polygons
 
 
 def _scale_polygon_points(points: list, src_size: tuple, dst_size: tuple) -> list:
@@ -5459,12 +5732,28 @@ def _scale_polygon_points(points: list, src_size: tuple, dst_size: tuple) -> lis
 def _extract_robot_exclusion_polygons(clicked_points: list, image_size: tuple,
                                       frame_width: int, frame_height: int) -> list:
     """Return completed no-scan polygons scaled to the actual video frame."""
-    _, polygons = _split_calibration_and_exclusion_points(clicked_points)
+    _, _, polygons = _split_center_calibration_and_exclusion_points(clicked_points)
     return [
         _scale_polygon_points(poly, image_size, (frame_width, frame_height))
         for poly in polygons
-        if len(poly) == 4
+        if len(poly) == NO_SCAN_POINTS_PER_BOX
     ]
+
+
+def _extract_human_shot_start_polygons(clicked_points: list, image_size: tuple,
+                                       frame_width: int, frame_height: int) -> dict:
+    """Return completed center-camera human-start polygons scaled to the actual video frame."""
+    _, human_start_polygons, _ = _split_center_calibration_and_exclusion_points(clicked_points)
+    scaled_polygons = {}
+    for side_name, polygon in human_start_polygons.items():
+        scaled_polygons[side_name] = (
+            _scale_polygon_points(polygon, image_size, (frame_width, frame_height))
+            if len(polygon) == HUMAN_START_ZONE_POINTS_PER_SIDE else []
+        )
+    return {
+        side_name: scaled_polygons.get(side_name, [])
+        for side_name in CENTER_HUMAN_START_ZONE_SIDES
+    }
 
 
 def _redraw_calibration_image(base_image: Image.Image, clicked_points: list) -> Image.Image:
@@ -5479,14 +5768,25 @@ def _redraw_calibration_image(base_image: Image.Image, clicked_points: list) -> 
     except:
         font = ImageFont.load_default()
     
-    _, exclusion_polygons = _split_calibration_and_exclusion_points(clicked_points)
+    _, human_start_polygons, exclusion_polygons = _split_center_calibration_and_exclusion_points(clicked_points)
+
+    for side_name in CENTER_HUMAN_START_ZONE_SIDES:
+        polygon = human_start_polygons.get(side_name, [])
+        if len(polygon) == HUMAN_START_ZONE_POINTS_PER_SIDE:
+            outline = (0, 200, 255) if side_name == "blue" else (255, 120, 120)
+            draw.line(polygon + [polygon[0]], fill=outline, width=3)
 
     for polygon in exclusion_polygons:
         draw.line(polygon + [polygon[0]], fill=(255, 220, 0), width=3)
 
     for i, (px, py) in enumerate(clicked_points):
         label = _get_center_calibration_click_label(i)
-        color = (0, 200, 255) if label.startswith('B') else (255, 100, 100)
+        if label.startswith("HB") or label.startswith("B"):
+            color = (0, 200, 255)
+        elif label.startswith("HR") or label.startswith("R"):
+            color = (255, 100, 100)
+        else:
+            color = (255, 220, 0)
         radius = 8
         draw.ellipse([px - radius, py - radius, px + radius, py + radius], fill=color, outline=(255, 255, 255), width=2)
         draw.text((px + 12, py - 10), label, fill=color, font=font)
@@ -8032,6 +8332,7 @@ def process_single_video(video_path: str, camera_side: str = "blue", target_fps:
     
     # Disabled tracker for detecting when robots stop moving
     disabled_tracker = DisabledTracker(fps=robot_sample_fps)
+    human_start_polygons = {side_name: [] for side_name in CENTER_HUMAN_START_ZONE_SIDES}
     
     # Ball tracker for shot detection - filtered by camera alliance
     ball_tracker = BallTracker(
@@ -8044,7 +8345,8 @@ def process_single_video(video_path: str, camera_side: str = "blue", target_fps:
         start_seconds=start_seconds,
         ferry_tracker=ferry_tracker,
         frame_width=width,
-        frame_height=height
+        frame_height=height,
+        human_start_polygons=human_start_polygons,
     )
     
     # Center Camera Auto-Calibrator (uses user-clicked points for homography)
@@ -8059,6 +8361,13 @@ def process_single_video(video_path: str, camera_side: str = "blue", target_fps:
         center_calibrator = CenterCameraCalibrator(fps=ball_fps, gather_duration_sec=5.0, display_duration_sec=5.0)
         
         if calibration_points and calibration_image_size:
+            human_start_polygons = _extract_human_shot_start_polygons(
+                calibration_points, calibration_image_size, width, height
+            )
+            ball_tracker.human_start_polygons = {
+                side_name: list(human_start_polygons.get(side_name) or [])
+                for side_name in CENTER_HUMAN_START_ZONE_SIDES
+            }
             robot_exclusion_polygons = _extract_robot_exclusion_polygons(
                 calibration_points, calibration_image_size, width, height
             )
@@ -9025,29 +9334,93 @@ def extract_center_match_clock_ocr(video_path: str, start_seconds: float = 0, en
     return summary
 
 
+def _normalize_single_shot_event(event, blue_robots: list = None, red_robots: list = None) -> dict:
+    """Coerce legacy tuple shot events and newer dict shot events into one schema."""
+    blue_labels = set(_normalize_robot_numbers(blue_robots or []))
+    red_labels = set(_normalize_robot_numbers(red_robots or []))
+
+    if isinstance(event, dict):
+        raw_elapsed = event.get("time", event.get("elapsed", 0.0))
+        label = str(event.get("label", "")).strip()
+        made = bool(event.get("made"))
+        source_type = str(event.get("source_type", SHOT_SOURCE_ROBOT)).strip().lower()
+        alliance = str(event.get("alliance", "")).strip().lower()
+    elif isinstance(event, (list, tuple)) and len(event) >= 3:
+        raw_elapsed = event[0]
+        label = str(event[1] or "").strip()
+        made = bool(event[2])
+        source_type = str(event[3] if len(event) >= 4 else "").strip().lower()
+        alliance = str(event[4] if len(event) >= 5 else "").strip().lower()
+    else:
+        return None
+
+    try:
+        elapsed = float(raw_elapsed)
+    except (TypeError, ValueError):
+        return None
+
+    if source_type not in (SHOT_SOURCE_ROBOT, SHOT_SOURCE_HUMAN):
+        source_type = SHOT_SOURCE_HUMAN if label.lower() == HUMAN_SHOT_LABEL else SHOT_SOURCE_ROBOT
+
+    if alliance not in ("blue", "red"):
+        if label in blue_labels:
+            alliance = "blue"
+        elif label in red_labels:
+            alliance = "red"
+        else:
+            alliance = None
+
+    return {
+        "time": elapsed,
+        "label": label,
+        "made": made,
+        "source_type": source_type,
+        "alliance": alliance,
+    }
+
+
+def _normalize_shot_events(all_shot_events: list, blue_robots: list = None, red_robots: list = None) -> list:
+    """Normalize shot event payloads while dropping malformed entries."""
+    normalized = []
+    for event in list(all_shot_events or []):
+        coerced = _normalize_single_shot_event(event, blue_robots=blue_robots, red_robots=red_robots)
+        if coerced is not None:
+            normalized.append(coerced)
+    return normalized
+
+
 def _dedupe_shot_events(all_shot_events: list, dedup_window_seconds: float = MULTI_CAMERA_SHOT_DEDUP_WINDOW_SECONDS) -> list:
     """Deduplicate shot events within a short time window and keep the best made flag."""
     events_by_robot = {}
-    for elapsed, robot_label, made in all_shot_events:
-        events_by_robot.setdefault(robot_label, []).append((elapsed, made))
+    for event in _normalize_shot_events(all_shot_events):
+        event_key = (
+            event.get("source_type", SHOT_SOURCE_ROBOT),
+            event.get("alliance"),
+            event.get("label", ""),
+        )
+        events_by_robot.setdefault(event_key, []).append(event)
 
     deduped_output = []
-    for robot_label, events in events_by_robot.items():
-        events.sort(key=lambda e: e[0])
+    for (source_type, alliance, robot_label), events in events_by_robot.items():
+        events.sort(key=lambda e: float(e.get("time", 0.0)))
         deduped_events = []
-        for elapsed, made in events:
+        for event in events:
+            elapsed = float(event.get("time", 0.0))
+            made = bool(event.get("made"))
             is_duplicate = False
-            for idx, (prev_elapsed, prev_made) in enumerate(deduped_events):
+            for idx, previous_event in enumerate(deduped_events):
+                prev_elapsed = float(previous_event.get("time", 0.0))
+                prev_made = bool(previous_event.get("made"))
                 if abs(elapsed - prev_elapsed) <= dedup_window_seconds:
                     is_duplicate = True
                     if made and not prev_made:
-                        deduped_events[idx] = (prev_elapsed, True)
+                        previous_event["made"] = True
                     break
             if not is_duplicate:
-                deduped_events.append((elapsed, made))
-        deduped_output.extend((elapsed, robot_label, made) for elapsed, made in deduped_events)
+                deduped_events.append(dict(event))
+        deduped_output.extend(deduped_events)
 
-    deduped_output.sort(key=lambda event: (event[0], str(event[1])))
+    deduped_output.sort(key=lambda event: (float(event.get("time", 0.0)), str(event.get("label", ""))))
     return deduped_output
 
 
@@ -9061,11 +9434,18 @@ def _build_stats_from_shot_events(
     """
     events_by_robot = {}
     if dedup_window_seconds is None:
-        normalized_events = list(all_shot_events or [])
+        normalized_events = _normalize_shot_events(all_shot_events)
     else:
         normalized_events = _dedupe_shot_events(all_shot_events, dedup_window_seconds=dedup_window_seconds)
 
-    for elapsed, robot_label, made in normalized_events:
+    for event in normalized_events:
+        if event.get("source_type") != SHOT_SOURCE_ROBOT:
+            continue
+        elapsed = float(event.get("time", 0.0))
+        robot_label = str(event.get("label", "")).strip()
+        made = bool(event.get("made"))
+        if not robot_label:
+            continue
         events_by_robot.setdefault(robot_label, []).append((elapsed, made))
 
     merged_stats = {}
@@ -9393,7 +9773,7 @@ def process_dual_videos(blue_video_path: str, red_video_path: str, center_video_
         
             # Merge robot stats from all cameras using shot event deduplication
             # Collect shot events from all cameras
-            all_shot_events = []  # List of (elapsed_seconds, robot_label, made_bool)
+            all_shot_events = []  # Normalized robot/human shot event dicts from all cameras.
             for camera in ['blue', 'red', 'center']:
                 camera_events = results.get(camera, {}).get('shot_events', [])
                 all_shot_events.extend(camera_events)
@@ -10775,7 +11155,9 @@ def create_manual_demo(limited_mode: bool = False):
                 gr.Markdown("### Center Camera Calibration")
                 gr.Markdown(
                     "Click the 8 field landmarks in order (B1→B4, R1→R4). "
-                    "Extra clicks after that are grouped into 4-point no-scan polygons."
+                    "Then click 4 corners for the blue human-start zone, 4 corners "
+                    "for the red human-start zone, and any extra clicks after that "
+                    "become 4-point no-scan polygons."
                 )
 
                 calibration_base_image = gr.State(None)
@@ -10809,7 +11191,7 @@ def create_manual_demo(limited_mode: bool = False):
                     fps_slider = gr.Slider(
                         minimum=10,
                         maximum=30,
-                        value=30,
+                        value=10,
                         step=10,
                         label="Tracking FPS",
                         info="Run manual center tracking at 10, 20, or 30 FPS. Lower FPS widens ball-tracking thresholds automatically."
@@ -11152,16 +11534,21 @@ def create_manual_demo(limited_mode: bool = False):
             outputs=[calibration_image, calibration_points_state, calibration_status]
         )
 
-        def handle_undo(base_image, clicked_points):
+        def handle_undo(base_image, clicked_points, regional_name):
             if not clicked_points:
                 return base_image, clicked_points, "No points to undo"
             clicked_points = list(clicked_points)[:-1]
+            _persist_regional_calibration(
+                regional_name,
+                calibration_points=clicked_points,
+                calibration_image_size=(base_image.size if base_image is not None else None),
+            )
             annotated = _redraw_calibration_image(base_image, clicked_points) if clicked_points else base_image
             return annotated, clicked_points, _get_calibration_status_text(len(clicked_points)) + " — Undid last point"
 
         undo_btn.click(
             fn=handle_undo,
-            inputs=[calibration_base_image, calibration_points_state],
+            inputs=[calibration_base_image, calibration_points_state, regional_input],
             outputs=[calibration_image, calibration_points_state, calibration_status]
         )
 
@@ -11273,13 +11660,14 @@ def create_demo():
                 # --- Center Camera Calibration ---
                 gr.Markdown("### Center Camera Calibration")
                 gr.Markdown(
-                    "After the 8 field points, you can optionally click 4 corners per "
-                    "center-camera no-scan box. Keep clicking in groups of 4 to add as "
-                    "many robot exclusion boxes as you want."
+                    "After the 8 field points, click 4 corners for the blue human-start "
+                    "zone and 4 corners for the red human-start zone. "
+                    "Any extra clicks after that are grouped into 4-point center-camera "
+                    "no-scan polygons."
                 )
                 gr.Markdown(
                     "Click the 8 field landmarks in order (B1→B4, R1→R4) on the frame below. "
-                    "Any extra clicks after that are grouped into 4-point no-scan polygons."
+                    "Then click the blue and red human-start zones before any optional no-scan polygons."
                 )
                 
                 calibration_base_image = gr.State(None)  # Original clean frame
@@ -11795,10 +12183,15 @@ def create_demo():
             outputs=[red_side_calibration_image, red_side_box_points_state, red_side_status]
         )
         
-        def handle_undo(base_image, clicked_points):
+        def handle_undo(base_image, clicked_points, regional_name):
             if not clicked_points:
                 return base_image, clicked_points, "No points to undo"
             clicked_points = list(clicked_points)[:-1]
+            _persist_regional_calibration(
+                regional_name,
+                calibration_points=clicked_points,
+                calibration_image_size=(base_image.size if base_image is not None else None),
+            )
             n = len(clicked_points)
             if n == 0:
                 annotated = base_image
@@ -11810,14 +12203,26 @@ def create_demo():
         
         undo_btn.click(
             fn=handle_undo,
-            inputs=[calibration_base_image, calibration_points_state],
+            inputs=[calibration_base_image, calibration_points_state, regional_input],
             outputs=[calibration_image, calibration_points_state, calibration_status]
         )
 
-        def handle_side_undo(base_image, clicked_points, camera_side):
+        def handle_side_undo(base_image, clicked_points, camera_side, regional_name):
             if not clicked_points:
                 return base_image, clicked_points, "No points to undo"
             clicked_points = list(clicked_points)[:-1]
+            if camera_side == "blue":
+                _persist_regional_calibration(
+                    regional_name,
+                    blue_side_box_points=clicked_points,
+                    blue_side_box_image_size=(base_image.size if base_image is not None else None),
+                )
+            else:
+                _persist_regional_calibration(
+                    regional_name,
+                    red_side_box_points=clicked_points,
+                    red_side_box_image_size=(base_image.size if base_image is not None else None),
+                )
             if clicked_points:
                 annotated = _redraw_side_calibration_image(base_image, clicked_points, camera_side)
             else:
@@ -11826,13 +12231,13 @@ def create_demo():
 
         blue_side_undo_btn.click(
             fn=handle_side_undo,
-            inputs=[blue_side_base_image, blue_side_box_points_state, blue_side_name_state],
+            inputs=[blue_side_base_image, blue_side_box_points_state, blue_side_name_state, regional_input],
             outputs=[blue_side_calibration_image, blue_side_box_points_state, blue_side_status]
         )
 
         red_side_undo_btn.click(
             fn=handle_side_undo,
-            inputs=[red_side_base_image, red_side_box_points_state, red_side_name_state],
+            inputs=[red_side_base_image, red_side_box_points_state, red_side_name_state, regional_input],
             outputs=[red_side_calibration_image, red_side_box_points_state, red_side_status]
         )
         
