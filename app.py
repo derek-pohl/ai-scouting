@@ -48,12 +48,13 @@ def _load_app_config() -> dict:
 APP_CONFIG = _load_app_config()
 
 ROBOT_TRACKING_MODE = str(APP_CONFIG.get("robot_tracking_mode", "auto")).strip().lower()
-VALID_ROBOT_TRACKING_MODES = {"auto", "manual", "manual-limited"}
+VALID_ROBOT_TRACKING_MODES = {"auto", "manual", "manual-limited", "ocr"}
 if ROBOT_TRACKING_MODE not in VALID_ROBOT_TRACKING_MODES:
     print(f"Unknown ROBOT_TRACKING_MODE={ROBOT_TRACKING_MODE!r}; defaulting to 'auto'")
     ROBOT_TRACKING_MODE = "auto"
 MANUAL_ROBOT_TRACKING = ROBOT_TRACKING_MODE in {"manual", "manual-limited"}
 MANUAL_LIMITED_ROBOT_TRACKING = ROBOT_TRACKING_MODE == "manual-limited"
+OCR_ONLY_ROBOT_TRACKING = ROBOT_TRACKING_MODE == "ocr"
 
 # YOLO person segmentation model (always loaded - used to exclude humans from bumper color detection)
 YOLO_PERSON_MODEL = None
@@ -177,6 +178,7 @@ PAGE_TITLE_SYNC_HTML = f"""
 
 TRACKING_FPS_OPTIONS = (10, 20, 30)
 DEFAULT_TRACKING_FPS = 10
+OCR_MODE_TRACKING_FPS = 10
 BALL_TRACKER_BASELINE_FPS = 30.0
 
 
@@ -2522,7 +2524,8 @@ def _allocate_proportional_integers(raw_values: dict, target_total: int) -> dict
 
 
 def _get_marked_shooters_for_ocr_event(shooting_snapshots: list, alliance: str, event_time: float,
-                                       max_gap_seconds: float = CENTER_SCORE_OCR_EVENT_WINDOW_SECONDS) -> list:
+                                       max_gap_seconds: float = CENTER_SCORE_OCR_EVENT_WINDOW_SECONDS,
+                                       union_window_labels: bool = False) -> list:
     """Return shooters marked during the plausible pre-OCR launch window."""
     if not shooting_snapshots:
         return []
@@ -2556,6 +2559,18 @@ def _get_marked_shooters_for_ocr_event(shooting_snapshots: list, alliance: str, 
             candidate_indices.append(insert_idx)
     if not candidate_indices:
         return []
+
+    if union_window_labels:
+        merged_labels = []
+        for idx in candidate_indices:
+            snapshot = shooting_snapshots[idx]
+            labels = snapshot[1] if str(alliance).strip().lower() == "blue" else snapshot[2]
+            for label in labels or []:
+                cleaned_label = str(label).strip()
+                if cleaned_label and cleaned_label not in merged_labels:
+                    merged_labels.append(cleaned_label)
+        if merged_labels:
+            return merged_labels
 
     best_snapshot = None
     best_gap = None
@@ -2638,7 +2653,8 @@ def _select_ocr_attempt_indices(attempts: list, event_time: float, target_count:
 
 def _apply_ocr_score_correction(stats: dict, center_score_ocr: dict, blue_robots: list, red_robots: list,
                                 all_shot_events: list = None, shooting_snapshots: list = None,
-                                manual_mode: bool = False, match_clock_ocr: dict = None) -> dict:
+                                manual_mode: bool = False, match_clock_ocr: dict = None,
+                                split_marked_shooters: bool = False) -> dict:
     """
     Ground per-robot makes to the center-score OCR timeline.
 
@@ -2680,7 +2696,7 @@ def _apply_ocr_score_correction(stats: dict, center_score_ocr: dict, blue_robots
 
     deduped_shot_events = (
         _normalize_shot_events(all_shot_events or [], blue_robots=blue_robots, red_robots=red_robots)
-        if manual_mode else
+        if manual_mode or split_marked_shooters else
         _dedupe_shot_events(all_shot_events or [], dedup_window_seconds=MULTI_CAMERA_SHOT_DEDUP_WINDOW_SECONDS)
     )
 
@@ -2778,46 +2794,69 @@ def _apply_ocr_score_correction(stats: dict, center_score_ocr: dict, blue_robots
                     shooting_snapshots,
                     alliance,
                     event_time,
+                    union_window_labels=split_marked_shooters,
                 )
                 if label in participating_labels
             ))
             allowed_labels = set(marked_shooters) if marked_shooters else None
-            candidate_indices = _select_ocr_attempt_indices(
-                alliance_attempts,
-                event_time,
-                remaining_budget,
-                allowed_labels=allowed_labels,
-            )
 
-            for attempt_idx in candidate_indices:
-                attempt = alliance_attempts[attempt_idx]
-                attempt["assigned"] = True
-                label = attempt["label"]
-                scaled_makes[label] = scaled_makes.get(label, 0) + 1
-                allocated_total += 1
-                ocr_consumed_total += 1
-                period_name = get_match_period_for_elapsed(float(attempt["time"]), match_clock_ocr=match_clock_ocr)
-                if period_name in scaled_period_makes.get(label, {}):
-                    scaled_period_makes[label][period_name] += 1
+            if split_marked_shooters:
+                if allowed_labels:
+                    allocation = _allocate_proportional_integers(
+                        {label: 1.0 for label in marked_shooters},
+                        remaining_budget,
+                    )
+                    fallback_period = get_match_period_for_elapsed(float(event_time), match_clock_ocr=match_clock_ocr)
+                    allocated_here = 0
+                    for label, amount in allocation.items():
+                        amount = max(0, int(amount or 0))
+                        if amount <= 0:
+                            continue
+                        scaled_makes[label] = scaled_makes.get(label, 0) + amount
+                        allocated_total += amount
+                        allocated_here += amount
+                        ocr_consumed_total += amount
+                        ocr_only_total += amount
+                        if fallback_period in scaled_period_makes.get(label, {}):
+                            scaled_period_makes[label][fallback_period] += amount
+                    remaining_budget -= allocated_here
+            else:
+                candidate_indices = _select_ocr_attempt_indices(
+                    alliance_attempts,
+                    event_time,
+                    remaining_budget,
+                    allowed_labels=allowed_labels,
+                )
 
-            remaining_budget -= len(candidate_indices)
-            if remaining_budget > 0 and manual_mode and allowed_labels and len(allowed_labels) == 1:
-                fallback_label = next(iter(allowed_labels))
-                fallback_period = get_match_period_for_elapsed(float(event_time), match_clock_ocr=match_clock_ocr)
-                scaled_makes[fallback_label] = scaled_makes.get(fallback_label, 0) + remaining_budget
-                allocated_total += remaining_budget
-                ocr_consumed_total += remaining_budget
-                ocr_only_total += remaining_budget
-                if fallback_period in scaled_period_makes.get(fallback_label, {}):
-                    scaled_period_makes[fallback_label][fallback_period] += remaining_budget
-                remaining_budget = 0
+                for attempt_idx in candidate_indices:
+                    attempt = alliance_attempts[attempt_idx]
+                    attempt["assigned"] = True
+                    label = attempt["label"]
+                    scaled_makes[label] = scaled_makes.get(label, 0) + 1
+                    allocated_total += 1
+                    ocr_consumed_total += 1
+                    period_name = get_match_period_for_elapsed(float(attempt["time"]), match_clock_ocr=match_clock_ocr)
+                    if period_name in scaled_period_makes.get(label, {}):
+                        scaled_period_makes[label][period_name] += 1
+
+                remaining_budget -= len(candidate_indices)
+                if remaining_budget > 0 and manual_mode and allowed_labels and len(allowed_labels) == 1:
+                    fallback_label = next(iter(allowed_labels))
+                    fallback_period = get_match_period_for_elapsed(float(event_time), match_clock_ocr=match_clock_ocr)
+                    scaled_makes[fallback_label] = scaled_makes.get(fallback_label, 0) + remaining_budget
+                    allocated_total += remaining_budget
+                    ocr_consumed_total += remaining_budget
+                    ocr_only_total += remaining_budget
+                    if fallback_period in scaled_period_makes.get(fallback_label, {}):
+                        scaled_period_makes[fallback_label][fallback_period] += remaining_budget
+                    remaining_budget = 0
 
             if remaining_budget > 0:
                 unmatched_ocr_total += remaining_budget
 
         print(
             f"[Center Score OCR] {alliance.title()} alliance grounding"
-            f"{' (manual)' if manual_mode else ''}: "
+            f"{' (manual)' if manual_mode else (' (ocr split)' if split_marked_shooters else '')}: "
             f"SAM made={sam_total}, OCR made={ocr_total}, human={human_consumed_total}, "
             f"attributed={allocated_total}, "
             f"unmatched_ocr={unmatched_ocr_total}, ocr_only={ocr_only_total}, grounded={scaled_makes}"
@@ -8059,6 +8098,155 @@ def _parse_manual_robot_tracks_json(manual_tracks_json: str, blue_robots: list, 
     return parsed_tracks
 
 
+def _dedupe_ocr_shooting_events(events: list) -> list:
+    """Normalize browser-recorded OCR shooting toggle events."""
+    deduped = []
+    for t, shooting in sorted(events, key=lambda item: item[0]):
+        entry = (float(t), bool(shooting))
+        if deduped and abs(entry[0] - deduped[-1][0]) <= 0.05:
+            deduped[-1] = entry
+            continue
+        if deduped and bool(deduped[-1][1]) == bool(entry[1]):
+            continue
+        deduped.append(entry)
+    return deduped
+
+
+def _build_ocr_shooting_snapshots(slot_entries: list, duration_seconds: float,
+                                  sample_fps: float = OCR_MODE_TRACKING_FPS) -> list:
+    """Expand OCR shooting toggle events into fixed-rate shooter snapshots."""
+    if not slot_entries:
+        return []
+
+    try:
+        duration_seconds = max(0.0, float(duration_seconds or 0.0))
+    except (TypeError, ValueError):
+        duration_seconds = 0.0
+
+    sample_fps = max(1.0, float(sample_fps or OCR_MODE_TRACKING_FPS))
+    sample_step = 1.0 / sample_fps
+
+    latest_event_time = 0.0
+    state = {}
+    event_indices = {}
+    ordered_slots = []
+    for entry in list(slot_entries or []):
+        label = str(entry.get("label", "")).strip()
+        alliance = str(entry.get("alliance", "")).strip().lower()
+        events = list(entry.get("events") or [])
+        if not label or alliance not in ("blue", "red"):
+            continue
+        ordered_slots.append((label, alliance, events))
+        state[label] = False
+        event_indices[label] = 0
+        if events:
+            latest_event_time = max(latest_event_time, max(float(event[0]) for event in events))
+
+    if not ordered_slots:
+        return []
+
+    timeline_end = max(duration_seconds, latest_event_time)
+    if timeline_end <= 0:
+        return []
+
+    snapshots = []
+    sample_count = max(1, int(np.ceil(timeline_end / sample_step)) + 1)
+    for sample_idx in range(sample_count):
+        sample_time = min(timeline_end, sample_idx * sample_step)
+        for label, _, events in ordered_slots:
+            event_idx = event_indices[label]
+            while event_idx < len(events) and float(events[event_idx][0]) <= (sample_time + 1e-6):
+                state[label] = bool(events[event_idx][1])
+                event_idx += 1
+            event_indices[label] = event_idx
+
+        blue_active = tuple(
+            label for label, alliance, _ in ordered_slots
+            if alliance == "blue" and bool(state.get(label))
+        )
+        red_active = tuple(
+            label for label, alliance, _ in ordered_slots
+            if alliance == "red" and bool(state.get(label))
+        )
+        snapshots.append((float(sample_time), blue_active, red_active))
+
+    return snapshots
+
+
+def _parse_ocr_shooting_marks_json(ocr_shooting_json: str, blue_robots: list, red_robots: list,
+                                   sample_fps: float = OCR_MODE_TRACKING_FPS) -> list:
+    """
+    Parse the browser-recorded OCR shooting markers into fixed-rate snapshots.
+
+    Returns:
+        List of (elapsed_seconds, active_blue_labels, active_red_labels)
+    """
+    if not ocr_shooting_json or not str(ocr_shooting_json).strip():
+        raise gr.Error("OCR mode is enabled, but no shooting marks were recorded.")
+
+    try:
+        payload = json.loads(parse_json(str(ocr_shooting_json)))
+    except Exception as e:
+        raise gr.Error(f"Could not parse OCR shooting marks: {e}")
+
+    slot_payload = payload.get("slots")
+    if not isinstance(slot_payload, dict):
+        raise gr.Error("OCR shooting marks are missing slot data.")
+
+    video_payload = payload.get("video") if isinstance(payload.get("video"), dict) else {}
+    try:
+        duration_seconds = float(video_payload.get("duration") or 0.0)
+    except (TypeError, ValueError):
+        duration_seconds = 0.0
+
+    slot_entries = []
+    latest_event_time = 0.0
+    any_marked_shooting = False
+
+    for slot_id, label, alliance in _iter_manual_track_slots(blue_robots, red_robots):
+        if not label:
+            continue
+
+        slot_data = slot_payload.get(slot_id, {}) if isinstance(slot_payload.get(slot_id, {}), dict) else {}
+        if slot_data.get("skipped"):
+            continue
+
+        raw_events = slot_data.get("events") or slot_data.get("samples") or []
+        cleaned_events = []
+        for event in raw_events:
+            if not isinstance(event, dict):
+                continue
+            try:
+                t = float(event.get("t"))
+            except (TypeError, ValueError):
+                continue
+            if not np.isfinite(t) or t < 0:
+                continue
+            shooting = bool(event.get("shooting"))
+            cleaned_events.append((t, shooting))
+            latest_event_time = max(latest_event_time, float(t))
+            any_marked_shooting = any_marked_shooting or shooting
+
+        slot_entries.append({
+            "label": label,
+            "alliance": alliance,
+            "events": _dedupe_ocr_shooting_events(cleaned_events),
+        })
+
+    if not slot_entries:
+        raise gr.Error("Configure at least one robot before processing OCR mode.")
+
+    if not any_marked_shooting:
+        print("[OCR Mode] No shooting marks recorded; OCR makes may remain unmatched.")
+
+    duration_seconds = max(duration_seconds, latest_event_time)
+    return _build_ocr_shooting_snapshots(
+        slot_entries,
+        duration_seconds=duration_seconds,
+        sample_fps=sample_fps,
+    )
+
+
 def _manual_track_shooting_active_at_time(
     robot_track: dict,
     target_time: float,
@@ -10147,6 +10335,622 @@ def process_manual_center_video_table_only(center_video_path: str = None, compos
     )
 
 
+def process_ocr_center_video_table_only(center_video_path: str = None, composite_video_path: str = None,
+                                        start_seconds: float = 0, end_seconds: float = 0,
+                                        blue_robot_1: str = "", blue_robot_2: str = "", blue_robot_3: str = "",
+                                        red_robot_1: str = "", red_robot_2: str = "", red_robot_3: str = "",
+                                        calibration_points: list = None, calibration_image_size: tuple = None,
+                                        ocr_shooting_json: str = "", regional_name: str = "",
+                                        use_hsv_human_filtering: bool = True,
+                                        progress=gr.Progress()) -> tuple:
+    """
+    OCR-only center-camera workflow.
+
+    Robot scoring comes from the center score overlay OCR. Human-player throws
+    can be filtered by running HSV fuel tracking at 10 FPS with the saved center
+    calibration and human-start polygons.
+    """
+    managed_youtube_dir = _get_managed_youtube_download_dir(composite_video_path)
+    try:
+        if not center_video_path and composite_video_path:
+            progress(0, desc="Extracting center camera feed...")
+            center_video_path = extract_center_video_from_composite(composite_video_path, progress=progress)
+
+        if not center_video_path:
+            raise gr.Error("Please upload a match video.")
+
+        blue_robots = [blue_robot_1, blue_robot_2, blue_robot_3]
+        red_robots = [red_robot_1, red_robot_2, red_robot_3]
+        shooting_snapshots = _parse_ocr_shooting_marks_json(
+            ocr_shooting_json,
+            blue_robots,
+            red_robots,
+            sample_fps=OCR_MODE_TRACKING_FPS,
+        )
+
+        _persist_regional_calibration(
+            regional_name,
+            calibration_points=calibration_points,
+            calibration_image_size=calibration_image_size,
+        )
+
+        progress(
+            0.05,
+            desc="Running OCR mode with HSV human-shot filtering..."
+            if use_hsv_human_filtering else
+            "Running OCR mode without HSV human-shot filtering..."
+        )
+        _, _, _, _, _, _, ferry_counts, disabled_statuses, shot_events, _, _, center_score_ocr, center_match_clock_ocr = process_single_video(
+            center_video_path,
+            "center",
+            OCR_MODE_TRACKING_FPS,
+            start_seconds,
+            end_seconds,
+            blue_robots,
+            red_robots,
+            False,
+            bool(use_hsv_human_filtering),
+            progress,
+            "Center Camera",
+            enable_person_detection=False,
+            calibration_points=calibration_points,
+            calibration_image_size=calibration_image_size,
+            side_camera_visible_robots=None,
+            show_unlabeled_robots=False,
+            manual_robot_tracks=None,
+            highlight_ball_robot="",
+            render_output_video=False,
+            fuel_detector_mode=FUEL_DETECTOR_HSV,
+        )
+
+        merged_stats = _build_stats_from_shot_events(
+            shot_events,
+            dedup_window_seconds=None,
+            match_clock_ocr=center_match_clock_ocr,
+        )
+        merged_stats = _apply_ocr_score_correction(
+            merged_stats,
+            center_score_ocr,
+            blue_robots,
+            red_robots,
+            all_shot_events=shot_events,
+            shooting_snapshots=shooting_snapshots,
+            manual_mode=False,
+            match_clock_ocr=center_match_clock_ocr,
+            split_marked_shooters=True,
+        )
+
+        all_robot_labels = blue_robots + red_robots
+        robot_stats_markdowns = []
+        for label in all_robot_labels:
+            if label and label.strip():
+                cleaned_label = label.strip()
+                heading = f"### Team {cleaned_label}"
+                body = format_robot_stats_md(merged_stats, cleaned_label, ferry_counts, disabled_statuses)
+                robot_stats_markdowns.append(f"{heading}\n\n{body}")
+            else:
+                robot_stats_markdowns.append("*Robot not configured*")
+
+        while len(robot_stats_markdowns) < 6:
+            robot_stats_markdowns.append("*Robot not configured*")
+
+        progress(1.0, desc="OCR mode processing complete!")
+        return tuple(robot_stats_markdowns[:6])
+    finally:
+        _cleanup_managed_youtube_dir(managed_youtube_dir)
+
+
+OCR_TRACKER_HEAD = rf"""
+<style>
+  .gradio-container {{
+    max-width: min(96vw, 1800px) !important;
+  }}
+  #ocr-preview-source,
+  #ocr-shooting-json {{
+    display: none !important;
+  }}
+  #ocr-center-marker {{
+    border: 1px solid var(--block-border-color, #d7dde8);
+    border-radius: 14px;
+    padding: 14px;
+    background: var(--block-background-fill, #0f172a);
+    color: var(--body-text-color, #e5e7eb);
+  }}
+  #ocr-center-marker p,
+  #ocr-center-marker strong,
+  #ocr-center-marker span,
+  #ocr-center-marker label {{
+    color: inherit;
+  }}
+  .ocr-marker-toolbar {{
+    display: flex;
+    gap: 8px;
+    align-items: center;
+    flex-wrap: wrap;
+    margin-bottom: 10px;
+  }}
+  .ocr-marker-toolbar button,
+  .ocr-slot-toggle,
+  .ocr-slot-clear {{
+    border: 1px solid var(--button-secondary-border-color, transparent);
+    border-radius: 999px;
+    padding: 8px 12px;
+    background: var(--button-secondary-background-fill, #1f2937);
+    color: var(--button-secondary-text-color, #f8fafc);
+    cursor: pointer;
+    font-weight: 600;
+  }}
+  .ocr-marker-toolbar button:hover,
+  .ocr-slot-toggle:hover,
+  .ocr-slot-clear:hover {{
+    background: var(--button-secondary-background-fill-hover, #374151);
+  }}
+  .ocr-marker-toolbar .ocr-marker-readout {{
+    display: inline-flex;
+    align-items: center;
+    padding: 7px 12px;
+    border-radius: 999px;
+    background: var(--input-background-fill, rgba(148, 163, 184, 0.18));
+    color: var(--body-text-color, #e5e7eb);
+    border: 1px solid var(--block-border-color, rgba(148, 163, 184, 0.25));
+    font-weight: 600;
+  }}
+  .ocr-marker-stage {{
+    position: relative;
+    width: 100%;
+    overflow: hidden;
+    border-radius: 12px;
+    background: #0f172a;
+    margin-bottom: 12px;
+    padding: 10px;
+    display: flex;
+    justify-content: center;
+  }}
+  .ocr-marker-video-shell {{
+    position: relative;
+    width: min(100%, 1520px);
+    aspect-ratio: 16 / 9;
+  }}
+  #ocr-marker-video {{
+    width: 100%;
+    height: 100%;
+    display: block;
+    background: #020617;
+    border-radius: 10px;
+  }}
+  .ocr-slot-list {{
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+    gap: 10px;
+  }}
+  .ocr-slot-card {{
+    border: 1px solid rgba(148, 163, 184, 0.22);
+    border-radius: 12px;
+    padding: 12px;
+    background: rgba(15, 23, 42, 0.84);
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+  }}
+  .ocr-slot-header {{
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    gap: 10px;
+  }}
+  .ocr-slot-chip {{
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    min-width: 64px;
+    min-height: 28px;
+    padding: 4px 10px;
+    border-radius: 999px;
+    font-size: 12px;
+    font-weight: 700;
+    color: #f8fafc;
+  }}
+  .ocr-slot-actions {{
+    display: flex;
+    gap: 8px;
+    align-items: center;
+    flex-wrap: wrap;
+  }}
+  .ocr-slot-toggle.active {{
+    background: #f59e0b;
+    color: #111827;
+    border-color: transparent;
+  }}
+  .ocr-slot-meta {{
+    font-size: 13px;
+    color: rgba(226, 232, 240, 0.9);
+  }}
+  #ocr-marker-status {{
+    margin-top: 10px;
+    font-size: 13px;
+    color: rgba(226, 232, 240, 0.92);
+  }}
+  @media (max-width: 900px) {{
+    .ocr-slot-list {{
+      grid-template-columns: 1fr;
+    }}
+  }}
+</style>
+<script>
+(() => {{
+  const OCR_TOGGLE_REPLACE_SECONDS = 0.05;
+  const SLOT_ORDER = [
+    {{ id: "blue_1", selector: "#blue-robot-1-input", color: "#1d4ed8", short: "B1" }},
+    {{ id: "blue_2", selector: "#blue-robot-2-input", color: "#2563eb", short: "B2" }},
+    {{ id: "blue_3", selector: "#blue-robot-3-input", color: "#3b82f6", short: "B3" }},
+    {{ id: "red_1", selector: "#red-robot-1-input", color: "#b91c1c", short: "R1" }},
+    {{ id: "red_2", selector: "#red-robot-2-input", color: "#dc2626", short: "R2" }},
+    {{ id: "red_3", selector: "#red-robot-3-input", color: "#ef4444", short: "R3" }},
+  ];
+
+  function getInputValue(selector, fallback) {{
+    const root = document.querySelector(selector);
+    if (!root) return fallback;
+    const input = root.querySelector("input, textarea");
+    if (!input) return fallback;
+    const value = (input.value || "").trim();
+    return value || fallback;
+  }}
+
+  function initOCRMarker() {{
+    const root = document.getElementById("ocr-center-marker");
+    if (!root || root.dataset.ready === "1") return;
+    root.dataset.ready = "1";
+
+    const video = document.getElementById("ocr-marker-video");
+    const slotList = document.getElementById("ocr-shooting-slot-list");
+    const status = document.getElementById("ocr-marker-status");
+    const timeLabel = document.getElementById("ocr-marker-time");
+    const rateLabel = document.getElementById("ocr-marker-rate");
+    const playBtn = document.getElementById("ocr-marker-play");
+    const restartBtn = document.getElementById("ocr-marker-restart");
+    const slowerBtn = document.getElementById("ocr-marker-slower");
+    const fasterBtn = document.getElementById("ocr-marker-faster");
+    const backBtn = document.getElementById("ocr-marker-back");
+    const forwardBtn = document.getElementById("ocr-marker-forward");
+    const hiddenFieldRoot = document.querySelector("#ocr-shooting-json");
+    const hiddenField = hiddenFieldRoot ? hiddenFieldRoot.querySelector("textarea, input") : null;
+
+    const state = {{
+      sourceSrc: null,
+      playbackRate: 2.0,
+      slots: {{}},
+    }};
+    SLOT_ORDER.forEach((slot) => {{
+      state.slots[slot.id] = {{ shooting: false, skipped: false, events: [] }};
+    }});
+
+    function getSlotTeamNumber(slot) {{
+      return getInputValue(slot.selector, "");
+    }}
+
+    function getSlotDisplayLabel(slot) {{
+      return getSlotTeamNumber(slot) || "Enter team #";
+    }}
+
+    function setPlaybackRate(nextRate) {{
+      state.playbackRate = Math.max(0.25, Math.min(4.0, Number(nextRate) || 2.0));
+      video.playbackRate = state.playbackRate;
+      if (rateLabel) {{
+        rateLabel.textContent = `${{state.playbackRate.toFixed(2).replace(/\\.00$/, "")}}x`;
+      }}
+      updateStatus();
+    }}
+
+    function normalizeEvents(slotState) {{
+      slotState.events.sort((a, b) => a.t - b.t);
+      const normalized = [];
+      slotState.events.forEach((event) => {{
+        const cleaned = {{
+          t: Number((Number(event.t) || 0).toFixed(3)),
+          shooting: !!event.shooting,
+        }};
+        if (normalized.length && Math.abs(cleaned.t - normalized[normalized.length - 1].t) <= OCR_TOGGLE_REPLACE_SECONDS) {{
+          normalized[normalized.length - 1] = cleaned;
+          return;
+        }}
+        if (normalized.length && normalized[normalized.length - 1].shooting === cleaned.shooting) {{
+          return;
+        }}
+        normalized.push(cleaned);
+      }});
+      slotState.events = normalized;
+    }}
+
+    function getSlotShootingAtTime(slotId, rawTime) {{
+      const slotState = state.slots[slotId];
+      if (!slotState || slotState.skipped || !slotState.events.length) return false;
+      const targetTime = Math.max(0, Number(rawTime) || 0);
+      let shooting = false;
+      for (let i = 0; i < slotState.events.length; i += 1) {{
+        const event = slotState.events[i];
+        if (event.t > (targetTime + 1e-6)) break;
+        shooting = !!event.shooting;
+      }}
+      return shooting;
+    }}
+
+    function syncSlotStatesToTime(rawTime) {{
+      SLOT_ORDER.forEach((slot) => {{
+        state.slots[slot.id].shooting = getSlotShootingAtTime(slot.id, rawTime);
+      }});
+    }}
+
+    function toPayload() {{
+      const slotPayload = {{}};
+      SLOT_ORDER.forEach((slot) => {{
+        const slotState = state.slots[slot.id];
+        slotPayload[slot.id] = {{
+          label: getSlotTeamNumber(slot),
+          skipped: !!slotState.skipped,
+          events: slotState.events.map((event) => ({{
+            t: Number(event.t.toFixed(3)),
+            shooting: !!event.shooting,
+          }})),
+        }};
+      }});
+
+      return {{
+        mode: "ocr_only",
+        video: {{
+          width: video.videoWidth || 0,
+          height: video.videoHeight || 0,
+          duration: Number.isFinite(video.duration) ? Number(video.duration.toFixed(3)) : 0,
+        }},
+        slots: slotPayload,
+      }};
+    }}
+
+    function syncHiddenField(force = false) {{
+      const payload = JSON.stringify(toPayload());
+      if (hiddenField && (force || hiddenField.value !== payload)) {{
+        hiddenField.value = payload;
+        hiddenField.dispatchEvent(new Event("input", {{ bubbles: true }}));
+        hiddenField.dispatchEvent(new Event("change", {{ bubbles: true }}));
+      }}
+      return payload;
+    }}
+
+    function updateStatus() {{
+      const markedSlots = SLOT_ORDER.filter((slot) => state.slots[slot.id].events.length > 0 && !state.slots[slot.id].skipped).length;
+      const skipped = SLOT_ORDER.filter((slot) => state.slots[slot.id].skipped).length;
+      const activeNow = SLOT_ORDER.filter((slot) => getSlotShootingAtTime(slot.id, video.currentTime || 0)).length;
+      const durationText = Number.isFinite(video.duration) ? `${{video.duration.toFixed(1)}}s` : "0.0s";
+      if (timeLabel) {{
+        timeLabel.textContent = `${{(video.currentTime || 0).toFixed(1)}}s / ${{durationText}}`;
+      }}
+      status.textContent =
+        `Toggle each robot on only while it is actively shooting. ${{
+          activeNow
+        }} shooting now, ${{
+          markedSlots
+        }} robots marked, ${{
+          skipped
+        }} skipped. Human-player filtering runs with HSV at 10 FPS using the saved calibration.`;
+    }}
+
+    function refreshSlotCards() {{
+      SLOT_ORDER.forEach((slot) => {{
+        const slotState = state.slots[slot.id];
+        const chipNode = slotList.querySelector(`[data-chip="${{slot.id}}"]`);
+        const labelNode = slotList.querySelector(`[data-label="${{slot.id}}"]`);
+        const metaNode = slotList.querySelector(`[data-meta="${{slot.id}}"]`);
+        const toggleNode = slotList.querySelector(`[data-toggle="${{slot.id}}"]`);
+        const skipNode = slotList.querySelector(`[data-skip="${{slot.id}}"]`);
+        const teamNumber = getSlotTeamNumber(slot);
+        const displayLabel = getSlotDisplayLabel(slot);
+        if (chipNode) {{
+          chipNode.textContent = teamNumber || "Team #";
+        }}
+        if (labelNode) {{
+          labelNode.textContent = displayLabel;
+        }}
+        if (metaNode) {{
+          const markCount = slotState.events.filter((event) => !!event.shooting).length;
+          metaNode.textContent = slotState.skipped
+            ? "Skipped"
+            : `${{markCount}} shooting start${{markCount === 1 ? "" : "s"}}${{slotState.shooting ? " | shooting now" : ""}}`;
+        }}
+        if (toggleNode) {{
+          toggleNode.classList.toggle("active", !!slotState.shooting);
+          toggleNode.textContent = slotState.shooting ? "Stop Shooting" : "Start Shooting";
+          toggleNode.style.borderColor = slot.color;
+        }}
+        if (skipNode) {{
+          skipNode.checked = !!slotState.skipped;
+        }}
+      }});
+      updateStatus();
+    }}
+
+    function setSlotShootingState(slotId, nextShooting, rawTime = null) {{
+      const slotState = state.slots[slotId];
+      if (!slotState) return;
+      slotState.skipped = false;
+      const timestamp = Math.max(0, Number(rawTime === null ? (video.currentTime || 0) : rawTime) || 0);
+      slotState.events.push({{ t: timestamp, shooting: !!nextShooting }});
+      normalizeEvents(slotState);
+      syncSlotStatesToTime(video.currentTime || 0);
+      syncHiddenField(true);
+      refreshSlotCards();
+    }}
+
+    function clearSlot(slotId) {{
+      const slotState = state.slots[slotId];
+      if (!slotState) return;
+      slotState.shooting = false;
+      slotState.events = [];
+      syncHiddenField(true);
+      refreshSlotCards();
+    }}
+
+    function resetForNewVideo() {{
+      SLOT_ORDER.forEach((slot) => {{
+        const slotState = state.slots[slot.id];
+        slotState.shooting = false;
+        slotState.events = [];
+      }});
+      syncHiddenField(true);
+      refreshSlotCards();
+    }}
+
+    function syncFromPreview() {{
+      const previewVideo = document.querySelector("#ocr-preview-source video");
+      if (!previewVideo) return;
+      const nextSrc = previewVideo.currentSrc || previewVideo.src || (previewVideo.querySelector("source") ? previewVideo.querySelector("source").src : "");
+      if (nextSrc && nextSrc !== state.sourceSrc) {{
+        state.sourceSrc = nextSrc;
+        video.src = nextSrc;
+        video.load();
+        resetForNewVideo();
+      }}
+    }}
+
+    window.ocrTrackerSync = function () {{
+      syncFromPreview();
+      syncSlotStatesToTime(video.currentTime || 0);
+      return syncHiddenField(true);
+    }};
+
+    SLOT_ORDER.forEach((slot) => {{
+      const card = document.createElement("div");
+      card.className = "ocr-slot-card";
+      card.innerHTML = `
+        <div class="ocr-slot-header">
+          <span class="ocr-slot-chip" data-chip="${{slot.id}}" style="background:${{slot.color}};">Team #</span>
+          <strong data-label="${{slot.id}}">Enter team #</strong>
+        </div>
+        <div class="ocr-slot-meta" data-meta="${{slot.id}}">0 shooting starts</div>
+        <div class="ocr-slot-actions">
+          <button type="button" class="ocr-slot-toggle" data-toggle="${{slot.id}}">Start Shooting</button>
+          <button type="button" class="ocr-slot-clear" data-clear="${{slot.id}}">Clear</button>
+          <label><input type="checkbox" data-skip="${{slot.id}}"> Skip</label>
+        </div>
+      `;
+      slotList.appendChild(card);
+    }});
+
+    slotList.addEventListener("click", (event) => {{
+      const toggle = event.target.closest("[data-toggle]");
+      if (toggle) {{
+        const slotId = toggle.getAttribute("data-toggle");
+        const nextShooting = !getSlotShootingAtTime(slotId, video.currentTime || 0);
+        setSlotShootingState(slotId, nextShooting, video.currentTime || 0);
+        return;
+      }}
+
+      const clear = event.target.closest("[data-clear]");
+      if (clear) {{
+        clearSlot(clear.getAttribute("data-clear"));
+      }}
+    }});
+
+    slotList.addEventListener("change", (event) => {{
+      const skip = event.target.closest("[data-skip]");
+      if (!skip) return;
+      const slotId = skip.getAttribute("data-skip");
+      const slotState = state.slots[slotId];
+      slotState.skipped = !!skip.checked;
+      if (slotState.skipped) {{
+        slotState.shooting = false;
+        slotState.events = [];
+      }}
+      syncHiddenField(true);
+      refreshSlotCards();
+    }});
+
+    playBtn.addEventListener("click", () => {{
+      if (!video.src) return;
+      if (video.paused) {{
+        video.playbackRate = state.playbackRate;
+        video.play();
+      }} else {{
+        video.pause();
+      }}
+    }});
+    restartBtn.addEventListener("click", () => {{
+      if (!video.src) return;
+      video.pause();
+      video.currentTime = 0;
+      syncSlotStatesToTime(0);
+      refreshSlotCards();
+    }});
+    backBtn.addEventListener("click", () => {{
+      video.currentTime = Math.max(0, (video.currentTime || 0) - 5);
+      syncSlotStatesToTime(video.currentTime || 0);
+      refreshSlotCards();
+    }});
+    forwardBtn.addEventListener("click", () => {{
+      const duration = Number.isFinite(video.duration) ? video.duration : 0;
+      video.currentTime = Math.min(duration, (video.currentTime || 0) + 5);
+      syncSlotStatesToTime(video.currentTime || 0);
+      refreshSlotCards();
+    }});
+    slowerBtn.addEventListener("click", () => {{
+      setPlaybackRate(state.playbackRate - 0.25);
+    }});
+    fasterBtn.addEventListener("click", () => {{
+      setPlaybackRate(state.playbackRate + 0.25);
+    }});
+
+    video.addEventListener("loadedmetadata", () => {{
+      setPlaybackRate(state.playbackRate);
+      syncHiddenField(true);
+      refreshSlotCards();
+    }});
+    video.addEventListener("timeupdate", () => {{
+      syncSlotStatesToTime(video.currentTime || 0);
+      refreshSlotCards();
+    }});
+
+    setInterval(syncFromPreview, 800);
+    setInterval(refreshSlotCards, 600);
+    syncHiddenField(true);
+    refreshSlotCards();
+    setPlaybackRate(state.playbackRate);
+  }}
+
+  if (document.readyState === "loading") {{
+    document.addEventListener("DOMContentLoaded", () => setTimeout(initOCRMarker, 0));
+  }} else {{
+    setTimeout(initOCRMarker, 0);
+  }}
+  setInterval(initOCRMarker, 1000);
+}})();
+</script>
+"""
+
+
+OCR_TRACKER_HTML = """
+<div id="ocr-center-marker">
+  <p><strong>OCR Mode</strong> - Watch the center video and toggle each robot on only while it is actively shooting. Every positive score jump found by center-screen OCR is split evenly across the robots marked for that alliance at that time.</p>
+  <p>Calibration still matters here: the saved center calibration and human-start zones are reused so HSV tracking at 10 FPS can filter human-player throws before OCR makes are assigned to robots.</p>
+  <div class="ocr-marker-toolbar">
+    <button type="button" id="ocr-marker-play">Play / Pause</button>
+    <button type="button" id="ocr-marker-restart">Restart</button>
+    <button type="button" id="ocr-marker-slower">Slower</button>
+    <button type="button" id="ocr-marker-faster">Faster</button>
+    <button type="button" id="ocr-marker-back">-5s</button>
+    <button type="button" id="ocr-marker-forward">+5s</button>
+    <span id="ocr-marker-rate" class="ocr-marker-readout">2x</span>
+    <span id="ocr-marker-time">0.0s / 0.0s</span>
+  </div>
+  <div class="ocr-marker-stage">
+    <div class="ocr-marker-video-shell">
+      <video id="ocr-marker-video" playsinline preload="metadata"></video>
+    </div>
+  </div>
+  <div id="ocr-shooting-slot-list" class="ocr-slot-list"></div>
+  <div id="ocr-marker-status">Upload a video to begin.</div>
+</div>
+"""
+
+
 MANUAL_TRACKER_HEAD = r"""
 <style>
   .gradio-container {
@@ -11626,6 +12430,438 @@ def create_manual_demo(limited_mode: bool = False):
     return demo
 
 
+def create_ocr_demo():
+    """Create the center-camera OCR-only interface."""
+
+    page_title = "Robot Scouter - OCR"
+    with gr.Blocks(title=page_title) as demo:
+        with gr.Row():
+            with gr.Column(scale=1):
+                gr.Markdown("<div class='panel-title'>OCR Mode</div>", elem_classes="input-panel")
+                gr.Markdown(
+                    "This mode is enabled by `config.json` with `\"robot_tracking_mode\": \"ocr\"`. "
+                    "Only the center camera is used. Watch the video, toggle robots while they are shooting, "
+                    "and let center-screen OCR split made shots across the robots marked at that moment. "
+                    "HSV fuel tracking still runs at 10 FPS with the saved calibration to filter human throws."
+                )
+
+                composite_video_input = gr.Video(
+                    label="Match Video (720p or 1080p; OCR-only center-camera workflow)",
+                    sources=["upload"],
+                )
+                center_video_input = gr.State(None)
+                video_metadata_state = gr.State(_blank_match_metadata())
+                youtube_url_input = gr.Textbox(
+                    label="YouTube Match URL",
+                    placeholder="https://www.youtube.com/watch?v=...",
+                    max_lines=1,
+                )
+                with gr.Row():
+                    youtube_download_btn = gr.Button("Download YouTube Video")
+                    regional_input = gr.Textbox(
+                        label="Regional / Event",
+                        placeholder="Enter the event name to reuse saved calibration",
+                        max_lines=1,
+                    )
+                video_source_status = gr.Markdown(VIDEO_SOURCE_EMPTY_STATUS)
+                page_title_state = gr.Textbox(value=page_title, visible=False, elem_id="page-title-state")
+
+                preview_source_video = gr.Video(
+                    label="Center Preview Source",
+                    interactive=False,
+                    elem_id="ocr-preview-source",
+                )
+
+                gr.Markdown("### Center Camera Calibration")
+                gr.Markdown(
+                    "Click the 8 field landmarks in order (B1->B4, R1->R4). "
+                    "Then click 4 corners for the blue human-start zone, 4 corners "
+                    "for the red human-start zone, and any extra clicks after that "
+                    "become 4-point no-scan polygons."
+                )
+
+                calibration_base_image = gr.State(None)
+                calibration_points_state = gr.State([])
+                calibration_image_size_state = gr.State(None)
+
+                calibration_image = gr.Image(
+                    label="Click calibration points here",
+                    type="pil",
+                    interactive=False,
+                    height=300,
+                )
+                calibration_status = gr.Markdown("*Upload a video to begin calibration*")
+                with gr.Row():
+                    undo_btn = gr.Button("Undo Last Point", size="sm")
+                    skip_calib_btn = gr.Button("Skip Calibration", size="sm")
+
+                gr.Markdown("### Blue Alliance")
+                with gr.Row():
+                    blue_robot_1 = gr.Textbox(label="Robot 1", value="", placeholder="e.g., 1919", max_lines=1, elem_id="blue-robot-1-input")
+                    blue_robot_2 = gr.Textbox(label="Robot 2", value="", placeholder="e.g., 334", max_lines=1, elem_id="blue-robot-2-input")
+                    blue_robot_3 = gr.Textbox(label="Robot 3", value="", placeholder="e.g., 254", max_lines=1, elem_id="blue-robot-3-input")
+
+                gr.Markdown("### Red Alliance")
+                with gr.Row():
+                    red_robot_1 = gr.Textbox(label="Robot 1", value="", placeholder="e.g., 118", max_lines=1, elem_id="red-robot-1-input")
+                    red_robot_2 = gr.Textbox(label="Robot 2", value="", placeholder="e.g., 973", max_lines=1, elem_id="red-robot-2-input")
+                    red_robot_3 = gr.Textbox(label="Robot 3", value="", placeholder="e.g., 2056", max_lines=1, elem_id="red-robot-3-input")
+
+                with gr.Row():
+                    start_seconds_input = gr.Number(
+                        minimum=0,
+                        value=0,
+                        label="Start Time (seconds)",
+                        info="Start processing at this time (0 = from beginning)"
+                    )
+                    end_seconds_input = gr.Number(
+                        minimum=0,
+                        value=0,
+                        label="End Time (seconds)",
+                        info="Stop processing at this time (0 = process to end)"
+                    )
+
+                use_hsv_human_filtering_checkbox = gr.Checkbox(
+                    label="Use HSV Human-Throw Filtering",
+                    value=True,
+                    info="When off, OCR score increases only count if at least one robot is marked shooting."
+                )
+                gr.Markdown("When enabled, HSV human-shot filtering runs at a fixed 10 FPS in this mode.")
+
+                ocr_shooting_json = gr.Textbox(
+                    label="OCR Shooting Cache",
+                    elem_id="ocr-shooting-json",
+                    lines=2,
+                    value="{}",
+                )
+
+        with gr.Row():
+            gr.HTML(OCR_TRACKER_HTML)
+        gr.HTML(PAGE_TITLE_SYNC_HTML)
+
+        process_btn = gr.Button("Process Video")
+
+        gr.Markdown("<div class='panel-title'>Blue Alliance - OCR Tables</div>")
+        with gr.Row():
+            with gr.Column():
+                blue1_stats = gr.Markdown("*Waiting for processing...*")
+            with gr.Column():
+                blue2_stats = gr.Markdown("*Waiting for processing...*")
+            with gr.Column():
+                blue3_stats = gr.Markdown("*Waiting for processing...*")
+
+        gr.Markdown("<div class='panel-title'>Red Alliance - OCR Tables</div>")
+        with gr.Row():
+            with gr.Column():
+                red1_stats = gr.Markdown("*Waiting for processing...*")
+            with gr.Column():
+                red2_stats = gr.Markdown("*Waiting for processing...*")
+            with gr.Column():
+                red3_stats = gr.Markdown("*Waiting for processing...*")
+
+        def handle_ocr_video_upload(video_path, start_seconds,
+                                    current_blue_1, current_blue_2, current_blue_3,
+                                    current_red_1, current_red_2, current_red_3,
+                                    current_regional):
+            manual_blue = [current_blue_1, current_blue_2, current_blue_3]
+            manual_red = [current_red_1, current_red_2, current_red_3]
+            resolved_regional = _clean_text(current_regional)
+            manual_state = _prepare_manual_video_calibration_state(video_path, start_seconds, resolved_regional)
+            loaded_saved = manual_state[-1]
+            status = VIDEO_SOURCE_EMPTY_STATUS if video_path is None else _format_video_source_status(
+                "Uploaded video ready.",
+                regional_name=resolved_regional,
+                blue_robots=manual_blue,
+                red_robots=manual_red,
+                calibration_loaded=loaded_saved,
+            )
+            metadata = _blank_match_metadata()
+            return (
+                *manual_state[:-1],
+                manual_blue[0], manual_blue[1], manual_blue[2],
+                manual_red[0], manual_red[1], manual_red[2],
+                resolved_regional,
+                status,
+                metadata,
+                page_title,
+            )
+
+        def handle_ocr_regional_change(video_path, start_seconds, regional_name,
+                                       current_blue_1, current_blue_2, current_blue_3,
+                                       current_red_1, current_red_2, current_red_3,
+                                       current_metadata):
+            manual_state = _prepare_manual_video_calibration_state(video_path, start_seconds, regional_name)
+            loaded_saved = manual_state[-1]
+            metadata = current_metadata if isinstance(current_metadata, dict) else _blank_match_metadata()
+            source_label = "YouTube video ready." if _get_managed_youtube_download_dir(video_path) else "Uploaded video ready."
+            status = VIDEO_SOURCE_EMPTY_STATUS if video_path is None else _format_video_source_status(
+                source_label,
+                regional_name=regional_name,
+                match_title=metadata.get("match_title", ""),
+                blue_robots=[current_blue_1, current_blue_2, current_blue_3],
+                red_robots=[current_red_1, current_red_2, current_red_3],
+                calibration_loaded=loaded_saved,
+            )
+            return (*manual_state[:-1], status)
+
+        def handle_ocr_youtube_download(youtube_url, start_seconds,
+                                        current_blue_1, current_blue_2, current_blue_3,
+                                        current_red_1, current_red_2, current_red_3,
+                                        current_regional,
+                                        progress=gr.Progress()):
+            video_path, metadata = _download_youtube_video(youtube_url, progress=progress)
+            manual_blue = [current_blue_1, current_blue_2, current_blue_3]
+            manual_red = [current_red_1, current_red_2, current_red_3]
+            resolved_regional = _clean_text(current_regional)
+            manual_state = _prepare_manual_video_calibration_state(video_path, start_seconds, resolved_regional)
+            loaded_saved = manual_state[-1]
+            status = _format_video_source_status(
+                "YouTube video ready.",
+                regional_name=resolved_regional,
+                match_title=metadata.get("match_title", ""),
+                blue_robots=manual_blue,
+                red_robots=manual_red,
+                calibration_loaded=loaded_saved,
+            )
+            return (
+                video_path,
+                *manual_state[:-1],
+                manual_blue[0], manual_blue[1], manual_blue[2],
+                manual_red[0], manual_red[1], manual_red[2],
+                resolved_regional,
+                status,
+                metadata,
+                _get_page_title_for_match(metadata) if _clean_text(metadata.get("match_title")) else page_title,
+            )
+
+        composite_video_input.change(
+            fn=handle_ocr_video_upload,
+            inputs=[
+                composite_video_input,
+                start_seconds_input,
+                blue_robot_1,
+                blue_robot_2,
+                blue_robot_3,
+                red_robot_1,
+                red_robot_2,
+                red_robot_3,
+                regional_input,
+            ],
+            outputs=[
+                preview_source_video,
+                center_video_input,
+                calibration_image,
+                calibration_base_image,
+                calibration_points_state,
+                calibration_image_size_state,
+                calibration_status,
+                ocr_shooting_json,
+                blue_robot_1,
+                blue_robot_2,
+                blue_robot_3,
+                red_robot_1,
+                red_robot_2,
+                red_robot_3,
+                regional_input,
+                video_source_status,
+                video_metadata_state,
+                page_title_state,
+            ]
+        )
+
+        regional_input.change(
+            fn=handle_ocr_regional_change,
+            inputs=[
+                composite_video_input,
+                start_seconds_input,
+                regional_input,
+                blue_robot_1,
+                blue_robot_2,
+                blue_robot_3,
+                red_robot_1,
+                red_robot_2,
+                red_robot_3,
+                video_metadata_state,
+            ],
+            outputs=[
+                preview_source_video,
+                center_video_input,
+                calibration_image,
+                calibration_base_image,
+                calibration_points_state,
+                calibration_image_size_state,
+                calibration_status,
+                ocr_shooting_json,
+                video_source_status,
+            ]
+        )
+
+        youtube_download_btn.click(
+            fn=handle_ocr_youtube_download,
+            inputs=[
+                youtube_url_input,
+                start_seconds_input,
+                blue_robot_1,
+                blue_robot_2,
+                blue_robot_3,
+                red_robot_1,
+                red_robot_2,
+                red_robot_3,
+                regional_input,
+            ],
+            outputs=[
+                composite_video_input,
+                preview_source_video,
+                center_video_input,
+                calibration_image,
+                calibration_base_image,
+                calibration_points_state,
+                calibration_image_size_state,
+                calibration_status,
+                ocr_shooting_json,
+                blue_robot_1,
+                blue_robot_2,
+                blue_robot_3,
+                red_robot_1,
+                red_robot_2,
+                red_robot_3,
+                regional_input,
+                video_source_status,
+                video_metadata_state,
+                page_title_state,
+            ]
+        )
+
+        youtube_url_input.submit(
+            fn=handle_ocr_youtube_download,
+            inputs=[
+                youtube_url_input,
+                start_seconds_input,
+                blue_robot_1,
+                blue_robot_2,
+                blue_robot_3,
+                red_robot_1,
+                red_robot_2,
+                red_robot_3,
+                regional_input,
+            ],
+            outputs=[
+                composite_video_input,
+                preview_source_video,
+                center_video_input,
+                calibration_image,
+                calibration_base_image,
+                calibration_points_state,
+                calibration_image_size_state,
+                calibration_status,
+                ocr_shooting_json,
+                blue_robot_1,
+                blue_robot_2,
+                blue_robot_3,
+                red_robot_1,
+                red_robot_2,
+                red_robot_3,
+                regional_input,
+                video_source_status,
+                video_metadata_state,
+                page_title_state,
+            ]
+        )
+
+        def handle_image_click(base_image, clicked_points, regional_name, evt: gr.SelectData):
+            if base_image is None:
+                return None, clicked_points, "Upload a video first"
+            x, y = evt.index
+            clicked_points = list(clicked_points) + [(x, y)]
+            _persist_regional_calibration(
+                regional_name,
+                calibration_points=clicked_points,
+                calibration_image_size=base_image.size,
+            )
+            annotated = _redraw_calibration_image(base_image, clicked_points)
+            status = _get_calibration_status_text(len(clicked_points))
+            return annotated, clicked_points, status
+
+        calibration_image.select(
+            fn=handle_image_click,
+            inputs=[calibration_base_image, calibration_points_state, regional_input],
+            outputs=[calibration_image, calibration_points_state, calibration_status]
+        )
+
+        def handle_undo(base_image, clicked_points, regional_name):
+            if not clicked_points:
+                return base_image, clicked_points, "No points to undo"
+            clicked_points = list(clicked_points)[:-1]
+            _persist_regional_calibration(
+                regional_name,
+                calibration_points=clicked_points,
+                calibration_image_size=(base_image.size if base_image is not None else None),
+            )
+            if clicked_points:
+                annotated = _redraw_calibration_image(base_image, clicked_points)
+            else:
+                annotated = base_image
+            return annotated, clicked_points, _get_calibration_status_text(len(clicked_points)) + " - Undid last point"
+
+        undo_btn.click(
+            fn=handle_undo,
+            inputs=[calibration_base_image, calibration_points_state, regional_input],
+            outputs=[calibration_image, calibration_points_state, calibration_status]
+        )
+
+        def handle_skip():
+            return [], "**Calibration skipped** - will use default alignment"
+
+        skip_calib_btn.click(
+            fn=handle_skip,
+            inputs=[],
+            outputs=[calibration_points_state, calibration_status]
+        )
+
+        process_btn.click(
+            fn=process_ocr_center_video_table_only,
+            inputs=[
+                center_video_input,
+                composite_video_input,
+                start_seconds_input,
+                end_seconds_input,
+                blue_robot_1,
+                blue_robot_2,
+                blue_robot_3,
+                red_robot_1,
+                red_robot_2,
+                red_robot_3,
+                calibration_points_state,
+                calibration_image_size_state,
+                ocr_shooting_json,
+                regional_input,
+                use_hsv_human_filtering_checkbox,
+            ],
+            outputs=[
+                blue1_stats,
+                blue2_stats,
+                blue3_stats,
+                red1_stats,
+                red2_stats,
+                red3_stats,
+            ],
+            js="""
+            (centerVideoPath, compositeVideoPath, startSeconds, endSeconds,
+             blue1, blue2, blue3, red1, red2, red3,
+             calibrationPoints, calibrationImageSize, ocrShootingJson, regionalName, useHSVHumanFiltering) => {
+                const synced = window.ocrTrackerSync ? window.ocrTrackerSync() : ocrShootingJson;
+                return [
+                    centerVideoPath, compositeVideoPath, startSeconds, endSeconds,
+                    blue1, blue2, blue3, red1, red2, red3,
+                    calibrationPoints, calibrationImageSize, synced, regionalName, useHSVHumanFiltering
+                ];
+            }
+            """
+        )
+
+    return demo
+
+
 def create_demo():
     """Create and return the Gradio interface."""
     
@@ -12282,10 +13518,15 @@ def create_demo():
 
 if __name__ == "__main__":
     _cleanup_old_youtube_downloads()
-    demo = create_manual_demo(limited_mode=MANUAL_LIMITED_ROBOT_TRACKING) if MANUAL_ROBOT_TRACKING else create_demo()
+    if OCR_ONLY_ROBOT_TRACKING:
+        demo = create_ocr_demo()
+    elif MANUAL_ROBOT_TRACKING:
+        demo = create_manual_demo(limited_mode=MANUAL_LIMITED_ROBOT_TRACKING)
+    else:
+        demo = create_demo()
     demo.launch(
         server_name="0.0.0.0",
         server_port=7860,
         share=False,
-        head=MANUAL_TRACKER_HEAD if MANUAL_ROBOT_TRACKING else None,
+        head=OCR_TRACKER_HEAD if OCR_ONLY_ROBOT_TRACKING else (MANUAL_TRACKER_HEAD if MANUAL_ROBOT_TRACKING else None),
     )
