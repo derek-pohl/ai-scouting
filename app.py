@@ -90,6 +90,23 @@ except ImportError:
 except Exception as e:
     print(f"SAM 3 initialization failed: {e} - using HSV ball detection")
 
+FUEL_DETECTOR_SAM3 = "sam3"
+FUEL_DETECTOR_HSV = "hsv"
+FUEL_DETECTOR_CHOICES = [
+    ("SAM 3", FUEL_DETECTOR_SAM3),
+    ("HSV", FUEL_DETECTOR_HSV),
+]
+
+
+def _normalize_fuel_detector_mode(mode: str) -> str:
+    """Normalize UI/backend detector values to a supported internal mode."""
+    normalized = str(mode or "").strip().lower()
+    if normalized in {"sam 3", "sam3"}:
+        return FUEL_DETECTOR_SAM3
+    if normalized == FUEL_DETECTOR_HSV:
+        return FUEL_DETECTOR_HSV
+    return FUEL_DETECTOR_SAM3
+
 # LMStudio configuration for local LLM team number detection
 LMSTUDIO_URL = str(APP_CONFIG.get("local_llm_url", DEFAULT_CONFIG["local_llm_url"])).strip()
 LMSTUDIO_ENABLED = True  # Set to False to disable LMStudio queries
@@ -8175,7 +8192,7 @@ def build_manual_robot_bboxes_json(manual_robot_tracks: dict, target_time: float
     return json.dumps(detections), frame_tracks
 
 
-def process_single_video(video_path: str, camera_side: str = "blue", target_fps: int = 30, start_seconds: float = 0, end_seconds: float = 0, blue_robots: list = None, red_robots: list = None, enable_robot_detection: bool = True, enable_fuel_detection: bool = True, progress=gr.Progress(), camera_name: str = "Camera", enable_person_detection: bool = True, calibration_points: list = None, calibration_image_size: tuple = None, side_box_points: list = None, side_box_image_size: tuple = None, side_camera_visible_robots: dict = None, show_unlabeled_robots: bool = True, manual_robot_tracks: dict = None, highlight_ball_robot: str = "", render_output_video: bool = True) -> tuple:
+def process_single_video(video_path: str, camera_side: str = "blue", target_fps: int = 30, start_seconds: float = 0, end_seconds: float = 0, blue_robots: list = None, red_robots: list = None, enable_robot_detection: bool = True, enable_fuel_detection: bool = True, progress=gr.Progress(), camera_name: str = "Camera", enable_person_detection: bool = True, calibration_points: list = None, calibration_image_size: tuple = None, side_box_points: list = None, side_box_image_size: tuple = None, side_camera_visible_robots: dict = None, show_unlabeled_robots: bool = True, manual_robot_tracks: dict = None, highlight_ball_robot: str = "", render_output_video: bool = True, fuel_detector_mode: str = FUEL_DETECTOR_SAM3) -> tuple:
     """
     Process a single video, tracking objects at specified FPS.
     Uses bumper color detection for robot identification.
@@ -8196,6 +8213,7 @@ def process_single_video(video_path: str, camera_side: str = "blue", target_fps:
             Format: {'blue': {frame_num: [robot_labels]}, 'red': {frame_num: [robot_labels]}}
         manual_robot_tracks: Optional dict of human-provided center-camera robot tracks.
         highlight_ball_robot: Optional team number whose balls should remain highlighted in output.
+        fuel_detector_mode: Ball detector backend to use (`sam3` or `hsv`).
         
     Returns:
         Tuple of (output_video_path, robot_tracks, tracks_by_frame, width, height, robot_stats,
@@ -8325,6 +8343,16 @@ def process_single_video(video_path: str, camera_side: str = "blue", target_fps:
         frame_height=height,
         human_start_polygons=human_start_polygons,
     )
+    requested_fuel_detector_mode = _normalize_fuel_detector_mode(fuel_detector_mode)
+    use_sam3_fuel_detector = requested_fuel_detector_mode == FUEL_DETECTOR_SAM3 and SAM3_PREDICTOR is not None
+    if enable_fuel_detection:
+        if requested_fuel_detector_mode == FUEL_DETECTOR_SAM3:
+            if use_sam3_fuel_detector:
+                print(f"[Fuel Detection] {camera_name}: using SAM 3")
+            else:
+                print(f"[Fuel Detection] {camera_name}: SAM 3 requested but unavailable; falling back to HSV")
+        else:
+            print(f"[Fuel Detection] {camera_name}: using HSV")
     
     # Center Camera Auto-Calibrator (uses user-clicked points for homography)
     center_calibrator = None
@@ -8696,7 +8724,7 @@ def process_single_video(video_path: str, camera_side: str = "blue", target_fps:
                     should_scan_for_balls = ball_tracker.any_robot_marked_shooting()
 
                 if should_scan_for_balls:
-                    if SAM3_PREDICTOR is not None:
+                    if use_sam3_fuel_detector:
                         fuel_detections = detect_fuel_sam3(frame, SAM3_PREDICTOR,
                                                            min_radius=3, max_radius=30,
                                                            camera_side=camera_side,
@@ -9489,7 +9517,7 @@ def format_robot_stats_md(stats: dict, robot_label: str, ferry_counts: dict, dis
     return f"{disabled_line}\n\n{total}\n\n" + "\n".join(rows)
 
 
-def process_dual_videos(blue_video_path: str, red_video_path: str, center_video_path: str = None, composite_video_path: str = None, target_fps: int = 30, start_seconds: float = 0, end_seconds: float = 0, blue_robot_1: str = "", blue_robot_2: str = "", blue_robot_3: str = "", red_robot_1: str = "", red_robot_2: str = "", red_robot_3: str = "", enable_robot_detection: bool = True, enable_fuel_detection: bool = True, side_ref_image: Image.Image = None, center_ref_image: Image.Image = None, enable_blue_camera: bool = True, enable_center_camera: bool = True, enable_red_camera: bool = True, enable_person_detection: bool = True, calibration_points: list = None, calibration_image_size: tuple = None, blue_side_box_points: list = None, blue_side_box_image_size: tuple = None, red_side_box_points: list = None, red_side_box_image_size: tuple = None, show_unlabeled_robots: bool = True, highlight_ball_robot: str = "", regional_name: str = "", progress=gr.Progress()) -> tuple:
+def process_dual_videos(blue_video_path: str, red_video_path: str, center_video_path: str = None, composite_video_path: str = None, target_fps: int = 30, start_seconds: float = 0, end_seconds: float = 0, blue_robot_1: str = "", blue_robot_2: str = "", blue_robot_3: str = "", red_robot_1: str = "", red_robot_2: str = "", red_robot_3: str = "", enable_robot_detection: bool = True, enable_fuel_detection: bool = True, fuel_detector_mode: str = FUEL_DETECTOR_SAM3, side_ref_image: Image.Image = None, center_ref_image: Image.Image = None, enable_blue_camera: bool = True, enable_center_camera: bool = True, enable_red_camera: bool = True, enable_person_detection: bool = True, calibration_points: list = None, calibration_image_size: tuple = None, blue_side_box_points: list = None, blue_side_box_image_size: tuple = None, red_side_box_points: list = None, red_side_box_image_size: tuple = None, show_unlabeled_robots: bool = True, highlight_ball_robot: str = "", regional_name: str = "", progress=gr.Progress()) -> tuple:
     """
     Process blue, red, and center camera videos using bumper detection.
     
@@ -9505,6 +9533,7 @@ def process_dual_videos(blue_video_path: str, red_video_path: str, center_video_
         enable_robot_detection: Whether to detect robots
         enable_fuel_detection: Whether to detect yellow fuel balls
         highlight_ball_robot: Optional team number whose balls should remain highlighted in output
+        fuel_detector_mode: Ball detector backend to use (`sam3` or `hsv`)
         progress: Gradio progress tracker
         
     Returns:
@@ -9560,6 +9589,7 @@ def process_dual_videos(blue_video_path: str, red_video_path: str, center_video_
                     side_box_points=blue_side_box_points,
                     side_box_image_size=blue_side_box_image_size,
                     highlight_ball_robot=highlight_ball_robot,
+                    fuel_detector_mode=fuel_detector_mode,
                 )
                 results['blue'] = {
                     'output_path': output_path,
@@ -9601,6 +9631,7 @@ def process_dual_videos(blue_video_path: str, red_video_path: str, center_video_
                     side_box_points=red_side_box_points,
                     side_box_image_size=red_side_box_image_size,
                     highlight_ball_robot=highlight_ball_robot,
+                    fuel_detector_mode=fuel_detector_mode,
                 )
                 results['red'] = {
                     'output_path': output_path,
@@ -9648,6 +9679,7 @@ def process_dual_videos(blue_video_path: str, red_video_path: str, center_video_
                     },
                     show_unlabeled_robots=show_unlabeled_robots,
                     highlight_ball_robot=highlight_ball_robot,
+                    fuel_detector_mode=fuel_detector_mode,
                 )
                 results['center'] = {
                     'output_path': output_path,
@@ -9936,7 +9968,7 @@ def process_dual_videos(blue_video_path: str, red_video_path: str, center_video_
         _cleanup_managed_youtube_dir(managed_youtube_dir)
 
 
-def process_manual_center_video(center_video_path: str = None, composite_video_path: str = None, target_fps: int = 30, start_seconds: float = 0, end_seconds: float = 0, blue_robot_1: str = "", blue_robot_2: str = "", blue_robot_3: str = "", red_robot_1: str = "", red_robot_2: str = "", red_robot_3: str = "", enable_fuel_detection: bool = True, calibration_points: list = None, calibration_image_size: tuple = None, manual_tracks_json: str = "", highlight_ball_robot: str = "", regional_name: str = "", progress=gr.Progress(), include_visual_outputs: bool = True, embed_robot_labels_in_stats: bool = False) -> tuple:
+def process_manual_center_video(center_video_path: str = None, composite_video_path: str = None, target_fps: int = 30, start_seconds: float = 0, end_seconds: float = 0, blue_robot_1: str = "", blue_robot_2: str = "", blue_robot_3: str = "", red_robot_1: str = "", red_robot_2: str = "", red_robot_3: str = "", enable_fuel_detection: bool = True, fuel_detector_mode: str = FUEL_DETECTOR_SAM3, calibration_points: list = None, calibration_image_size: tuple = None, manual_tracks_json: str = "", highlight_ball_robot: str = "", regional_name: str = "", progress=gr.Progress(), include_visual_outputs: bool = True, embed_robot_labels_in_stats: bool = False) -> tuple:
     """
     Process only the center camera using human-provided robot tracks and SAM 3 ball detection.
     """
@@ -9981,6 +10013,7 @@ def process_manual_center_video(center_video_path: str = None, composite_video_p
             manual_robot_tracks=manual_robot_tracks,
             highlight_ball_robot=highlight_ball_robot,
             render_output_video=include_visual_outputs,
+            fuel_detector_mode=fuel_detector_mode,
         )
 
         all_robot_labels = blue_robots + red_robots
@@ -10087,7 +10120,7 @@ def process_manual_center_video(center_video_path: str = None, composite_video_p
         _cleanup_managed_youtube_dir(managed_youtube_dir)
 
 
-def process_manual_center_video_table_only(center_video_path: str = None, composite_video_path: str = None, target_fps: int = 30, start_seconds: float = 0, end_seconds: float = 0, blue_robot_1: str = "", blue_robot_2: str = "", blue_robot_3: str = "", red_robot_1: str = "", red_robot_2: str = "", red_robot_3: str = "", enable_fuel_detection: bool = True, calibration_points: list = None, calibration_image_size: tuple = None, manual_tracks_json: str = "", highlight_ball_robot: str = "", regional_name: str = "", progress=gr.Progress()) -> tuple:
+def process_manual_center_video_table_only(center_video_path: str = None, composite_video_path: str = None, target_fps: int = 30, start_seconds: float = 0, end_seconds: float = 0, blue_robot_1: str = "", blue_robot_2: str = "", blue_robot_3: str = "", red_robot_1: str = "", red_robot_2: str = "", red_robot_3: str = "", enable_fuel_detection: bool = True, fuel_detector_mode: str = FUEL_DETECTOR_SAM3, calibration_points: list = None, calibration_image_size: tuple = None, manual_tracks_json: str = "", highlight_ball_robot: str = "", regional_name: str = "", progress=gr.Progress()) -> tuple:
     """Manual mode variant that only returns the scoring tables."""
     return process_manual_center_video(
         center_video_path=center_video_path,
@@ -10107,6 +10140,7 @@ def process_manual_center_video_table_only(center_video_path: str = None, compos
         manual_tracks_json=manual_tracks_json,
         highlight_ball_robot=highlight_ball_robot,
         regional_name=regional_name,
+        fuel_detector_mode=fuel_detector_mode,
         progress=progress,
         include_visual_outputs=False,
         embed_robot_labels_in_stats=True,
@@ -11176,8 +11210,14 @@ def create_manual_demo(limited_mode: bool = False):
                     detect_fuel_checkbox = gr.Checkbox(
                         label="Detect Yellow Fuel",
                         value=True,
-                        info="Run SAM 3 ball detection and shot calculations"
+                        info="Run yellow fuel detection and shot calculations"
                     )
+                fuel_detector_mode_input = gr.Radio(
+                    choices=FUEL_DETECTOR_CHOICES,
+                    value=FUEL_DETECTOR_SAM3,
+                    label="Fuel Detector",
+                    info="Choose the ball detector backend. SAM 3 is the default."
+                )
 
                 with gr.Row():
                     start_seconds_input = gr.Number(
@@ -11552,6 +11592,7 @@ def create_manual_demo(limited_mode: bool = False):
                 red_robot_2,
                 red_robot_3,
                 detect_fuel_checkbox,
+                fuel_detector_mode_input,
                 calibration_points_state,
                 calibration_image_size_state,
                 manual_tracks_json,
@@ -11570,12 +11611,12 @@ def create_manual_demo(limited_mode: bool = False):
             ],
             js="""
             (centerVideoPath, compositeVideoPath, fps, startSeconds, endSeconds,
-             blue1, blue2, blue3, red1, red2, red3, detectFuel,
+             blue1, blue2, blue3, red1, red2, red3, detectFuel, fuelDetectorMode,
              calibrationPoints, calibrationImageSize, manualTracksJson, highlightBallRobot, regionalName) => {
                 const synced = window.manualTrackerSync ? window.manualTrackerSync() : manualTracksJson;
                 return [
                     centerVideoPath, compositeVideoPath, fps, startSeconds, endSeconds,
-                    blue1, blue2, blue3, red1, red2, red3, detectFuel,
+                    blue1, blue2, blue3, red1, red2, red3, detectFuel, fuelDetectorMode,
                     calibrationPoints, calibrationImageSize, synced, highlightBallRobot, regionalName
                 ];
             }
@@ -11779,13 +11820,19 @@ def create_demo():
                     detect_fuel_checkbox = gr.Checkbox(
                         label="Detect Yellow Fuel",
                         value=True,
-                        info="Enable color-based detection of yellow fuel balls (no AI required)"
+                        info="Enable yellow fuel detection and shot calculations"
                     )
                     detect_people_checkbox = gr.Checkbox(
                         label="Detect People",
                         value=True,
                         info="Exclude humans from robot detection using YOLO (center camera)"
                     )
+                fuel_detector_mode_input = gr.Radio(
+                    choices=FUEL_DETECTOR_CHOICES,
+                    value=FUEL_DETECTOR_SAM3,
+                    label="Fuel Detector",
+                    info="Choose the ball detector backend. SAM 3 is the default."
+                )
                 
                 with gr.Row():
                     show_unlabeled_checkbox = gr.Checkbox(
@@ -12218,7 +12265,7 @@ def create_demo():
         # Connect the processing function
         process_btn.click(
             fn=process_dual_videos,
-            inputs=[blue_video_input, red_video_input, center_video_input, composite_video_input, fps_slider, start_seconds_input, end_seconds_input, blue_robot_1, blue_robot_2, blue_robot_3, red_robot_1, red_robot_2, red_robot_3, detect_robots_checkbox, detect_fuel_checkbox, side_ref_image_input, center_ref_image_input, enable_blue_cam, enable_center_cam, enable_red_cam, detect_people_checkbox, calibration_points_state, calibration_image_size_state, blue_side_box_points_state, blue_side_box_image_size_state, red_side_box_points_state, red_side_box_image_size_state, show_unlabeled_checkbox, highlight_ball_robot_dropdown, regional_input],
+            inputs=[blue_video_input, red_video_input, center_video_input, composite_video_input, fps_slider, start_seconds_input, end_seconds_input, blue_robot_1, blue_robot_2, blue_robot_3, red_robot_1, red_robot_2, red_robot_3, detect_robots_checkbox, detect_fuel_checkbox, fuel_detector_mode_input, side_ref_image_input, center_ref_image_input, enable_blue_cam, enable_center_cam, enable_red_cam, detect_people_checkbox, calibration_points_state, calibration_image_size_state, blue_side_box_points_state, blue_side_box_image_size_state, red_side_box_points_state, red_side_box_image_size_state, show_unlabeled_checkbox, highlight_ball_robot_dropdown, regional_input],
             outputs=[
                 blue_video_output, red_video_output, center_video_output, map_video_output,
                 blue1_map, blue1_stats,
