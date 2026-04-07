@@ -121,7 +121,6 @@ if pytesseract is not None:
 YOUTUBE_URL_PATTERN = re.compile(r"(?i)^(https?://)?(www\.)?(youtube\.com|youtu\.be)/")
 VIDEO_SOURCE_EMPTY_STATUS = "*Upload a file or paste a YouTube link to begin.*"
 FIELD_CALIBRATION_CACHE_PATH = Path(__file__).parent / "field_calibration_cache.json"
-YTDLP_COOKIEFILE_PATH = Path(__file__).parent / "cookies.txt"
 VIDEO_FILE_EXTENSIONS = {".mp4", ".mov", ".mkv", ".webm", ".avi", ".m4v"}
 DEFAULT_PAGE_TITLE = "Robot Scouter"
 MANUAL_PREVIEW_TARGET_WIDTH = 1280
@@ -286,17 +285,6 @@ def _cleanup_old_youtube_downloads() -> int:
     return removed
 
 
-def _get_ytdlp_cookiefile_path() -> str:
-    """Return the repo-local yt-dlp cookie file path when present."""
-    try:
-        cookie_path = Path(YTDLP_COOKIEFILE_PATH)
-    except Exception:
-        return ""
-    if cookie_path.exists() and cookie_path.is_file():
-        return str(cookie_path)
-    return ""
-
-
 def _build_youtube_progress_hook(progress, title_hint: str = ""):
     """Create a yt-dlp progress hook that forwards progress into Gradio."""
     title_hint = _clean_text(title_hint)
@@ -337,6 +325,7 @@ def _download_youtube_video(youtube_url: str, progress=None) -> tuple:
 
     try:
         from yt_dlp import YoutubeDL
+        from yt_dlp.utils import DownloadError
     except ImportError as exc:
         raise gr.Error("yt-dlp is not installed. Please reinstall dependencies.") from exc
 
@@ -348,10 +337,6 @@ def _download_youtube_video(youtube_url: str, progress=None) -> tuple:
         "quiet": True,
         "no_warnings": True,
     }
-    cookiefile = _get_ytdlp_cookiefile_path()
-    if cookiefile:
-        base_ydl_opts["cookiefile"] = cookiefile
-        print(f"[YouTube Download] Using yt-dlp cookies from {cookiefile}")
     if ffmpeg_exe:
         base_ydl_opts["ffmpeg_location"] = ffmpeg_exe
 
@@ -366,27 +351,34 @@ def _download_youtube_video(youtube_url: str, progress=None) -> tuple:
     if progress is not None:
         progress(0.05, desc="Fetching YouTube match metadata...")
 
-    with YoutubeDL(metadata_ydl_opts) as ydl:
-        try:
+    try:
+        with YoutubeDL(metadata_ydl_opts) as ydl:
             info = ydl.extract_info(url, download=False)
             metadata = _parse_youtube_match_metadata(
                 info.get("title", ""),
                 info.get("description", ""),
             )
-            if progress is not None:
-                progress(0.12, desc=f"Starting download for {metadata.get('match_title') or 'YouTube match'}...")
-            download_ydl_opts["progress_hooks"] = [_build_youtube_progress_hook(progress, metadata.get("match_label") or metadata.get("match_title") or "YouTube match")]
-        except Exception:
-            _cleanup_managed_youtube_dir(download_dir)
-            raise
+    except DownloadError:
+        _cleanup_managed_youtube_dir(download_dir)
+        raise
+    except Exception:
+        _cleanup_managed_youtube_dir(download_dir)
+        raise
 
-    with YoutubeDL(download_ydl_opts) as ydl:
-        try:
+    if progress is not None:
+        progress(0.12, desc=f"Starting download for {metadata.get('match_title') or 'YouTube match'}...")
+    download_ydl_opts["progress_hooks"] = [_build_youtube_progress_hook(progress, metadata.get("match_label") or metadata.get("match_title") or "YouTube match")]
+
+    try:
+        with YoutubeDL(download_ydl_opts) as ydl:
             info = ydl.extract_info(url, download=True)
             video_path = _resolve_downloaded_video_path(info, download_dir, ydl=ydl)
-        except Exception:
-            _cleanup_managed_youtube_dir(download_dir)
-            raise
+    except DownloadError:
+        _cleanup_managed_youtube_dir(download_dir)
+        raise
+    except Exception:
+        _cleanup_managed_youtube_dir(download_dir)
+        raise
 
     if not video_path:
         _cleanup_managed_youtube_dir(download_dir)

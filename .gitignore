@@ -7,7 +7,6 @@ __pycache__/
 ENV/
 venv/
 .venv/
-cookies.txt
 
 
 # Ignore dataset and runs if desired
