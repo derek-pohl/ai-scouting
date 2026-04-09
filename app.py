@@ -6495,7 +6495,7 @@ def _validate_ball_colors(frame_bgr: np.ndarray, contour: np.ndarray,
 
 
 def detect_fuel(frame_bgr: np.ndarray, min_radius: int = 3, max_radius: int = 30,
-                tracked_positions: list = None) -> list:
+                tracked_positions: list = None, search_regions: list = None) -> list:
     """
     Detect yellow fuel balls using HSV color-based detection with separation of overlapping balls.
     
@@ -6508,6 +6508,7 @@ def detect_fuel(frame_bgr: np.ndarray, min_radius: int = 3, max_radius: int = 30
         min_radius: Minimum radius for fuel detection (pixels) - default 3 for distant balls
         max_radius: Maximum radius for fuel detection (pixels) - default 30 for close balls
         tracked_positions: Optional list of (x, y, radius) from BallTracker.get_predicted_positions()
+        search_regions: Optional list of (x1, y1, x2, y2) regions to scan
         
     Returns:
         List of (x, y, radius) tuples for detected fuel
@@ -6519,6 +6520,50 @@ def detect_fuel(frame_bgr: np.ndarray, min_radius: int = 3, max_radius: int = 30
     RELAXED_RG_RANGE = (0.5, 1.6)    # vs strict (0.6, 1.4)
     RELAXED_STDDEV = 4.0             # vs strict 8.0
     TRACKED_MATCH_DIST = 100         # pixels — how close to a predicted pos to use relaxed mode
+
+    if search_regions:
+        frame_height, frame_width = frame_bgr.shape[:2]
+        merged_regions = _merge_search_regions(search_regions, frame_width, frame_height)
+        region_margin = TRACKED_MATCH_DIST + max_radius
+        detections = []
+
+        for x1, y1, x2, y2 in merged_regions:
+            roi = frame_bgr[y1:y2, x1:x2]
+            if roi.size == 0:
+                continue
+
+            local_tracked_positions = None
+            if tracked_positions:
+                local_tracked_positions = []
+                for tx, ty, tr in tracked_positions:
+                    if (
+                        (x1 - region_margin) <= tx <= (x2 + region_margin)
+                        and (y1 - region_margin) <= ty <= (y2 + region_margin)
+                    ):
+                        local_tracked_positions.append((tx - x1, ty - y1, tr))
+
+            region_detections = detect_fuel(
+                roi,
+                min_radius=min_radius,
+                max_radius=max_radius,
+                tracked_positions=local_tracked_positions,
+                search_regions=None,
+            )
+            for cx, cy, radius in region_detections:
+                detections.append((int(cx + x1), int(cy + y1), int(radius)))
+
+        deduped = []
+        for detection in detections:
+            dx, dy, dr = detection
+            duplicate = False
+            for ex, ey, er in deduped:
+                limit = max(float(dr), float(er), 1.0) * 0.75
+                if ((dx - ex) ** 2 + (dy - ey) ** 2) <= (limit ** 2):
+                    duplicate = True
+                    break
+            if not duplicate:
+                deduped.append(detection)
+        return deduped
 
     # Define yellow-green color range in HSV
     lower_yellow = np.array([15, 60, 40])
@@ -6846,54 +6891,41 @@ def _merge_search_regions(regions: list, frame_width: int, frame_height: int, ga
 
 
 def _build_center_manual_sam3_search_regions(ball_tracker, frame_width: int, frame_height: int) -> list:
-    """Focus manual-mode SAM3 scans around active shooters and already tracked balls."""
+    """Select the fixed center-camera SAM3 regions based on which alliance is shooting."""
     if ball_tracker is None or getattr(ball_tracker, "camera_side", "") != "center":
         return []
 
-    regions = []
-    goal_bounds = {}
-    if len(ball_tracker.goal_polygons) >= 1:
-        goal_bounds["blue"] = _polygon_bounds(ball_tracker.goal_polygons[0])
-    if len(ball_tracker.goal_polygons) >= 2:
-        goal_bounds["red"] = _polygon_bounds(ball_tracker.goal_polygons[1])
+    sx = frame_width / 1918 if frame_width > 0 else 1.0
+    sy = frame_height / 709 if frame_height > 0 else 1.0
+    scaled_regions = {
+        "blue": (
+            int(max(0, min(frame_width, _CENTER_CAM_ROIS[0][0] * sx))),
+            int(max(0, min(frame_height, _CENTER_CAM_ROIS[0][1] * sy))),
+            int(max(0, min(frame_width, _CENTER_CAM_ROIS[0][2] * sx))),
+            int(max(0, min(frame_height, _CENTER_CAM_ROIS[0][3] * sy))),
+        ),
+        "red": (
+            int(max(0, min(frame_width, _CENTER_CAM_ROIS[1][0] * sx))),
+            int(max(0, min(frame_height, _CENTER_CAM_ROIS[1][1] * sy))),
+            int(max(0, min(frame_width, _CENTER_CAM_ROIS[1][2] * sx))),
+            int(max(0, min(frame_height, _CENTER_CAM_ROIS[1][3] * sy))),
+        ),
+    }
 
-    for robot_bbox in list(getattr(ball_tracker, "robot_bboxes", []) or []):
-        if len(robot_bbox) < 7:
-            continue
-        y1, x1, y2, x2, label, is_shooting, has_explicit_shooting = robot_bbox[:7]
-        if not has_explicit_shooting or not is_shooting:
-            continue
+    active = ball_tracker._get_active_shooting_labels()
+    active_blue = bool(active.get("blue"))
+    active_red = bool(active.get("red"))
 
-        alliance = ball_tracker._infer_shot_alliance(label)
-        bbox_w = max(1.0, float(x2 - x1))
-        bbox_h = max(1.0, float(y2 - y1))
-        _, _, zone_x1, zone_y1, zone_x2, zone_y2 = ball_tracker._get_robot_launch_geometry(y1, x1, y2, x2)
-        pad_x = max(36.0, bbox_w * 0.35)
-        pad_y = max(36.0, bbox_h * 0.45)
+    if active_blue and not active_red:
+        return [scaled_regions["blue"]]
+    if active_red and not active_blue:
+        return [scaled_regions["red"]]
+    if active_blue and active_red:
+        return [scaled_regions["blue"], scaled_regions["red"]]
 
-        goal_rect = goal_bounds.get(alliance)
-        if goal_rect is not None:
-            gx1, gy1, gx2, gy2 = goal_rect
-            regions.append((
-                min(zone_x1, gx1) - pad_x,
-                min(zone_y1, gy1) - pad_y,
-                max(zone_x2, gx2) + pad_x,
-                max(zone_y2, gy2) + pad_y,
-            ))
-        else:
-            regions.append((
-                zone_x1 - pad_x,
-                zone_y1 - pad_y,
-                zone_x2 + pad_x,
-                zone_y2 + pad_y,
-            ))
-
-    for pred_x, pred_y, pred_r in ball_tracker.get_predicted_positions():
-        radius = max(8.0, float(pred_r or 0.0))
-        pad = max(52.0, radius * 5.0)
-        regions.append((pred_x - pad, pred_y - pad, pred_x + pad, pred_y + pad))
-
-    return _merge_search_regions(regions, frame_width, frame_height)
+    # If there are no explicit per-alliance shooting labels, fall back to both
+    # scoring-side regions instead of scanning the middle of the field.
+    return [scaled_regions["blue"], scaled_regions["red"]]
 
 
 def detect_fuel_sam3(frame_bgr: np.ndarray, predictor,
@@ -9198,22 +9230,23 @@ def process_single_video(video_path: str, camera_side: str = "blue", target_fps:
                     should_scan_for_balls = ball_tracker.any_robot_marked_shooting()
 
                 if should_scan_for_balls:
+                    center_manual_search_regions = None
+                    if using_manual_robot_tracks and camera_side == "center":
+                        center_manual_search_regions = _build_center_manual_sam3_search_regions(
+                            ball_tracker,
+                            width,
+                            height,
+                        )
                     if use_sam3_fuel_detector:
-                        sam3_search_regions = None
-                        if using_manual_robot_tracks and camera_side == "center":
-                            sam3_search_regions = _build_center_manual_sam3_search_regions(
-                                ball_tracker,
-                                width,
-                                height,
-                            )
                         fuel_detections = detect_fuel_sam3(frame, SAM3_PREDICTOR,
                                                            min_radius=3, max_radius=30,
                                                            camera_side=camera_side,
                                                            exclusion_polygons=robot_exclusion_polygons if camera_side == "center" else None,
-                                                           search_regions=sam3_search_regions)
+                                                           search_regions=center_manual_search_regions)
                     else:
                         fuel_detections = detect_fuel(frame, min_radius=3, max_radius=30,
-                                                      tracked_positions=ball_tracker.get_predicted_positions())
+                                                      tracked_positions=ball_tracker.get_predicted_positions(),
+                                                      search_regions=center_manual_search_regions)
                 else:
                     fuel_detections = []
                 
