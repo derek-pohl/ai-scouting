@@ -183,6 +183,8 @@ TRACKING_FPS_OPTIONS = (10, 20, 30)
 DEFAULT_TRACKING_FPS = 10
 OCR_MODE_TRACKING_FPS = 10
 BALL_TRACKER_BASELINE_FPS = 30.0
+MANUAL_MODE_DEFAULT_TRACKING_FPS = 30
+MANUAL_MODE_DEFAULT_FUEL_DETECTOR = FUEL_DETECTOR_HSV
 
 
 def _clean_text(value: str) -> str:
@@ -10490,7 +10492,7 @@ def process_dual_videos(blue_video_path: str, red_video_path: str, center_video_
         _cleanup_managed_youtube_dir(managed_youtube_dir)
 
 
-def process_manual_center_video(center_video_path: str = None, composite_video_path: str = None, target_fps: int = 30, start_seconds: float = 0, end_seconds: float = 0, blue_robot_1: str = "", blue_robot_2: str = "", blue_robot_3: str = "", red_robot_1: str = "", red_robot_2: str = "", red_robot_3: str = "", enable_fuel_detection: bool = True, fuel_detector_mode: str = FUEL_DETECTOR_SAM3, calibration_points: list = None, calibration_image_size: tuple = None, manual_tracks_json: str = "", highlight_ball_robot: str = "", regional_name: str = "", progress=gr.Progress(), include_visual_outputs: bool = True, embed_robot_labels_in_stats: bool = False) -> tuple:
+def process_manual_center_video(center_video_path: str = None, composite_video_path: str = None, target_fps: int = MANUAL_MODE_DEFAULT_TRACKING_FPS, start_seconds: float = 0, end_seconds: float = 0, blue_robot_1: str = "", blue_robot_2: str = "", blue_robot_3: str = "", red_robot_1: str = "", red_robot_2: str = "", red_robot_3: str = "", enable_fuel_detection: bool = True, fuel_detector_mode: str = MANUAL_MODE_DEFAULT_FUEL_DETECTOR, calibration_points: list = None, calibration_image_size: tuple = None, manual_tracks_json: str = "", highlight_ball_robot: str = "", regional_name: str = "", progress=gr.Progress(), include_visual_outputs: bool = True, embed_robot_labels_in_stats: bool = False) -> tuple:
     """
     Process only the center camera using human-provided robot tracks and SAM 3 ball detection.
     """
@@ -10643,7 +10645,7 @@ def process_manual_center_video(center_video_path: str = None, composite_video_p
         _cleanup_managed_youtube_dir(managed_youtube_dir)
 
 
-def process_manual_center_video_table_only(center_video_path: str = None, composite_video_path: str = None, target_fps: int = 30, start_seconds: float = 0, end_seconds: float = 0, blue_robot_1: str = "", blue_robot_2: str = "", blue_robot_3: str = "", red_robot_1: str = "", red_robot_2: str = "", red_robot_3: str = "", enable_fuel_detection: bool = True, fuel_detector_mode: str = FUEL_DETECTOR_SAM3, calibration_points: list = None, calibration_image_size: tuple = None, manual_tracks_json: str = "", highlight_ball_robot: str = "", regional_name: str = "", progress=gr.Progress()) -> tuple:
+def process_manual_center_video_table_only(center_video_path: str = None, composite_video_path: str = None, target_fps: int = MANUAL_MODE_DEFAULT_TRACKING_FPS, start_seconds: float = 0, end_seconds: float = 0, blue_robot_1: str = "", blue_robot_2: str = "", blue_robot_3: str = "", red_robot_1: str = "", red_robot_2: str = "", red_robot_3: str = "", enable_fuel_detection: bool = True, fuel_detector_mode: str = MANUAL_MODE_DEFAULT_FUEL_DETECTOR, calibration_points: list = None, calibration_image_size: tuple = None, manual_tracks_json: str = "", highlight_ball_robot: str = "", regional_name: str = "", progress=gr.Progress()) -> tuple:
     """Manual mode variant that only returns the scoring tables."""
     return process_manual_center_video(
         center_video_path=center_video_path,
@@ -12342,7 +12344,7 @@ def create_manual_demo(limited_mode: bool = False):
                     fps_slider = gr.Slider(
                         minimum=10,
                         maximum=30,
-                        value=10,
+                        value=MANUAL_MODE_DEFAULT_TRACKING_FPS,
                         step=10,
                         label="Tracking FPS",
                         info="Run manual center tracking at 10, 20, or 30 FPS. Lower FPS widens ball-tracking thresholds automatically."
@@ -12354,9 +12356,9 @@ def create_manual_demo(limited_mode: bool = False):
                     )
                 fuel_detector_mode_input = gr.Radio(
                     choices=FUEL_DETECTOR_CHOICES,
-                    value=FUEL_DETECTOR_SAM3,
+                    value=MANUAL_MODE_DEFAULT_FUEL_DETECTOR,
                     label="Fuel Detector",
-                    info="Choose the ball detector backend. SAM 3 is the default."
+                    info="Choose the ball detector backend. HSV is the default for manual tracking."
                 )
 
                 with gr.Row():
