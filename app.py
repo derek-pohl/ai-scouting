@@ -143,8 +143,8 @@ VIDEO_SOURCE_EMPTY_STATUS = "*Upload a file or paste a YouTube link to begin.*"
 FIELD_CALIBRATION_CACHE_PATH = Path(__file__).parent / "field_calibration_cache.json"
 VIDEO_FILE_EXTENSIONS = {".mp4", ".mov", ".mkv", ".webm", ".avi", ".m4v"}
 DEFAULT_PAGE_TITLE = "Robot Scouter"
-MANUAL_PREVIEW_TARGET_WIDTH = 1280
-MANUAL_PREVIEW_TARGET_HEIGHT = 720
+MANUAL_PREVIEW_TARGET_WIDTH = 1920
+MANUAL_PREVIEW_TARGET_HEIGHT = 1080
 YOUTUBE_DOWNLOAD_DIR_PREFIX = "youtube_match_"
 COMPOSITE_REFERENCE_SIZE = (1920, 1080)
 COMPOSITE_REFERENCE_CROP_RECTS = {
@@ -152,6 +152,9 @@ COMPOSITE_REFERENCE_CROP_RECTS = {
     "blue": (1, 739, 941, 1078),
     "red": (979, 739, 1919, 1078),
 }
+_COMPOSITE_CALIBRATION_FRAME_CACHE = {}
+_CENTER_VIDEO_EXTRACT_CACHE = {}
+_SCALED_VIDEO_PREVIEW_CACHE = {}
 PAGE_TITLE_SYNC_HTML = f"""
 <script>
 (() => {{
@@ -236,6 +239,30 @@ def _ensure_ffmpeg_executable() -> str:
         except ImportError:
             ffmpeg_exe = None
     return ffmpeg_exe
+
+
+def _get_video_cache_signature(video_path: str):
+    """Build a stable cache key for a local video file."""
+    if not video_path:
+        return None
+    try:
+        path = Path(str(video_path)).resolve()
+        stat = path.stat()
+        return str(path), int(stat.st_mtime_ns), int(stat.st_size)
+    except OSError:
+        return os.path.abspath(str(video_path))
+
+
+def _remember_small_cache(cache: dict, key, value, max_entries: int = 8):
+    """Keep a small insertion-ordered cache to avoid redoing expensive video prep."""
+    if key is None:
+        return value
+    if key in cache:
+        cache.pop(key, None)
+    cache[key] = value
+    while len(cache) > max_entries:
+        cache.pop(next(iter(cache)))
+    return value
 
 
 def _build_composite_crop_layout(source_width: int, source_height: int) -> dict:
@@ -726,9 +753,14 @@ def _get_page_title_for_match(metadata: dict) -> str:
 def _create_scaled_video_preview(video_path: str, target_width: int = MANUAL_PREVIEW_TARGET_WIDTH,
                                  target_height: int = MANUAL_PREVIEW_TARGET_HEIGHT,
                                  progress=None) -> str:
-    """Create a lighter-weight 720p preview video for manual playback."""
+    """Create a lighter-weight manual preview video while preserving up to 1080p sources."""
     if not video_path:
         return ""
+
+    cache_key = (_get_video_cache_signature(video_path), int(target_width), int(target_height))
+    cached_path = _SCALED_VIDEO_PREVIEW_CACHE.get(cache_key)
+    if cached_path and os.path.exists(cached_path):
+        return cached_path
 
     cap = cv2.VideoCapture(video_path)
     if not cap.isOpened():
@@ -743,21 +775,29 @@ def _create_scaled_video_preview(video_path: str, target_width: int = MANUAL_PRE
     if source_width <= 0 or source_height <= 0:
         raise gr.Error("Could not determine preview video dimensions.")
     if source_width <= target_width and source_height <= target_height:
+        _remember_small_cache(_SCALED_VIDEO_PREVIEW_CACHE, cache_key, video_path)
         return video_path
 
-    scaled_width = max(2, int(target_width))
-    scaled_height = max(2, int(target_height))
+    scale_ratio = min(float(target_width) / float(source_width), float(target_height) / float(source_height))
+    scaled_width = max(2, int(round(source_width * scale_ratio)))
+    scaled_height = max(2, int(round(source_height * scale_ratio)))
+    if scaled_width % 2 != 0:
+        scaled_width -= 1
+    if scaled_height % 2 != 0:
+        scaled_height -= 1
+    scaled_width = max(2, scaled_width)
+    scaled_height = max(2, scaled_height)
 
     output_path = tempfile.NamedTemporaryFile(suffix="_manual_preview.mp4", delete=False).name
     ffmpeg_exe = _ensure_ffmpeg_executable()
 
     if ffmpeg_exe:
         if progress:
-            progress(0.02, desc="Preparing 720p-class manual preview...")
+            progress(0.02, desc="Preparing manual preview...")
         cmd = [
             ffmpeg_exe, "-y",
             "-i", video_path,
-            "-vf", f"scale={scaled_width}:{scaled_height}:flags=lanczos",
+            "-vf", f"scale={scaled_width}:{scaled_height}:flags=fast_bilinear",
             "-c:v", "libx264", "-preset", "ultrafast", "-crf", "24",
             "-an",
             output_path,
@@ -765,6 +805,7 @@ def _create_scaled_video_preview(video_path: str, target_width: int = MANUAL_PRE
         result = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
         if result.returncode != 0:
             raise gr.Error(f"Preview video creation failed: {result.stderr[-500:]}")
+        _remember_small_cache(_SCALED_VIDEO_PREVIEW_CACHE, cache_key, output_path)
         return output_path
 
     cap = cv2.VideoCapture(video_path)
@@ -790,6 +831,7 @@ def _create_scaled_video_preview(video_path: str, target_width: int = MANUAL_PRE
 
     cap.release()
     out.release()
+    _remember_small_cache(_SCALED_VIDEO_PREVIEW_CACHE, cache_key, output_path)
     return output_path
 
 
@@ -2215,8 +2257,19 @@ def _ocr_center_score_counter(frame_bgr: np.ndarray, alliance: str, return_debug
     parsed_counts = []
 
     try:
-        raw_texts = _ocr_center_roi_text(frame_bgr, rect, "0123456789/")
+        raw_texts = _ocr_center_roi_text(frame_bgr, rect, "0123456789/", variant_mode="single")
         debug_info["raw_texts"] = list(raw_texts or [])
+        for text in debug_info["raw_texts"]:
+            parsed = _parse_center_score_counter_text(text)
+            if parsed is not None:
+                parsed_counts.append(parsed)
+
+        if not parsed_counts:
+            fallback_texts = _ocr_center_roi_text(frame_bgr, rect, "0123456789/")
+            for text in fallback_texts or []:
+                text = str(text)
+                if text not in debug_info["raw_texts"]:
+                    debug_info["raw_texts"].append(text)
     except TesseractNotFoundError as e:
         _CENTER_SCORE_OCR_DISABLED = True
         debug_info["disabled"] = True
@@ -2229,10 +2282,11 @@ def _ocr_center_score_counter(frame_bgr: np.ndarray, alliance: str, return_debug
         debug_info["error"] = str(e)
         return debug_info if return_debug else None
 
-    for text in debug_info["raw_texts"]:
-        parsed = _parse_center_score_counter_text(text)
-        if parsed is not None:
-            parsed_counts.append(parsed)
+    if not parsed_counts:
+        for text in debug_info["raw_texts"]:
+            parsed = _parse_center_score_counter_text(text)
+            if parsed is not None:
+                parsed_counts.append(parsed)
     debug_info["parsed_values"] = list(parsed_counts)
 
     if not parsed_counts:
@@ -5036,6 +5090,102 @@ class BallTracker:
         print(f"[FINAL STATS] {self.robot_stats}")
 
 
+_SIDE_CAMERA_MAP_POINTS = np.array([
+    [695, 574 - 45],    # Trench 1 Blue: (45, 695) -> (695, 529)
+    [694, 574 - 528],   # Trench 2 Blue: (528, 694) -> (694, 46)
+    [903, 574 - 308],   # Climb Blue: (308, 903) -> (903, 266)
+    [62, 574 - 267],    # Climb Red: (267, 62) -> (62, 307)
+    [269, 574 - 46],    # Trench 1 Red: (46, 269) -> (269, 528)
+    [270, 574 - 528],   # Trench 2 Red: (528, 270) -> (270, 46)
+    [483, 574 - 287],   # Center of Field: (287, 483) -> (483, 287)
+], dtype=np.float32)
+
+_SIDE_CAMERA_VIDEO_POINTS = {
+    "blue": np.array([
+        [143, 532],   # Trench 1 Blue
+        [623, 364],   # Trench 2 Blue
+        [801, 496],   # Climb Blue
+        [172, 323],   # Climb Red
+        [23, 370],    # Trench 1 Red
+        [377, 318],   # Trench 2 Red
+        [328, 361],   # Center of Field
+    ], dtype=np.float32),
+    "red": np.array([
+        [377, 318],   # Trench 1 Blue
+        [23, 370],    # Trench 2 Blue
+        [172, 323],   # Climb Blue
+        [801, 496],   # Climb Red
+        [623, 364],   # Trench 1 Red
+        [143, 532],   # Trench 2 Red
+        [328, 361],   # Center of Field
+    ], dtype=np.float32),
+}
+
+_CENTER_CAMERA_VIDEO_POINTS = np.array([
+    [164, 496],    # BlueSide1
+    [310, 366],    # BlueSide2
+    [611, 496],    # BlueSide3
+    [693, 387],    # BlueSide4
+    [1736, 489],   # RedSide1
+    [1636, 376],   # RedSide2
+    [1308, 502],   # RedSide3
+    [1234, 405],   # RedSide4
+], dtype=np.float32)
+
+_CENTER_CAMERA_MAP_POINTS = np.array([
+    [900, 574 - 338],   # BlueSide1: (338, 900) -> (900, 236)
+    [958, 574 - 1],     # BlueSide2: (1, 958)   -> (958, 573)
+    [661, 574 - 327],   # BlueSide3: (327, 661) -> (661, 247)
+    [660, 574 - 92],    # BlueSide4: (92, 660)  -> (660, 482)
+    [61, 574 - 296],    # RedSide1: (296, 61)   -> (61, 278)
+    [3, 574 - 3],       # RedSide2: (3, 3)      -> (3, 571)
+    [302, 574 - 324],   # RedSide3: (324, 302)  -> (302, 250)
+    [304, 574 - 92],    # RedSide4: (92, 304)   -> (304, 482)
+], dtype=np.float32)
+
+
+def _apply_homography_to_point(matrix: np.ndarray, x: float, y: float) -> tuple:
+    """Project a single point without re-allocating OpenCV arrays every call."""
+    if matrix is None:
+        return float(x), float(y)
+
+    denom = (matrix[2, 0] * x) + (matrix[2, 1] * y) + matrix[2, 2]
+    if abs(denom) < 1e-8:
+        return float(x), float(y)
+
+    out_x = ((matrix[0, 0] * x) + (matrix[0, 1] * y) + matrix[0, 2]) / denom
+    out_y = ((matrix[1, 0] * x) + (matrix[1, 1] * y) + matrix[1, 2]) / denom
+    return float(out_x), float(out_y)
+
+
+def _get_side_camera_homography(camera_side: str) -> np.ndarray:
+    """Compute the static side-camera homography once per side."""
+    side_name = "red" if str(camera_side).strip().lower() == "red" else "blue"
+    cached = getattr(_get_side_camera_homography, "_cache", {})
+    if side_name not in cached:
+        try:
+            matrix, _ = cv2.findHomography(_SIDE_CAMERA_VIDEO_POINTS[side_name], _SIDE_CAMERA_MAP_POINTS)
+            cached[side_name] = matrix
+        except Exception as exc:
+            print(f"[Homography] Failed to compute {side_name} side homography: {exc}")
+            cached[side_name] = None
+        _get_side_camera_homography._cache = cached
+    return cached.get(side_name)
+
+
+def _get_center_camera_homography() -> np.ndarray:
+    """Compute the static center-camera homography once."""
+    cached = getattr(_get_center_camera_homography, "_cache", None)
+    if cached is None:
+        try:
+            cached, _ = cv2.findHomography(_CENTER_CAMERA_VIDEO_POINTS, _CENTER_CAMERA_MAP_POINTS, cv2.RANSAC)
+        except Exception as exc:
+            print(f"[Homography] Failed to compute center homography: {exc}")
+            cached = None
+        _get_center_camera_homography._cache = cached
+    return cached
+
+
 def camera_to_map_coords(bbox_center_x: float, bbox_center_y: float, 
                          frame_width: int, frame_height: int,
                          map_width: int, map_height: int,
@@ -5110,20 +5260,16 @@ def camera_to_map_coords(bbox_center_x: float, bbox_center_y: float,
             [328, 361],   # Center of Field
         ], dtype=np.float32)
     
-    # Compute homography matrix
-    homography_matrix, _ = cv2.findHomography(VIDEO_POINTS, MAP_POINTS)
+    # Reuse the static side-camera homography instead of recomputing it per point.
+    homography_matrix = _get_side_camera_homography(camera_side)
+    if homography_matrix is None:
+        return None, None
     
     # Scale input coordinates to reference frame dimensions
     scaled_x = bbox_center_x * REF_VIDEO_WIDTH / frame_width
     scaled_y = bbox_center_y * REF_VIDEO_HEIGHT / frame_height
     
-    # Apply perspective transform
-    point = np.array([[[scaled_x, scaled_y]]], dtype=np.float32)
-    transformed = cv2.perspectiveTransform(point, homography_matrix)
-    
-    # Extract and scale to actual map dimensions
-    map_x_ref = transformed[0][0][0]
-    map_y_ref = transformed[0][0][1]
+    map_x_ref, map_y_ref = _apply_homography_to_point(homography_matrix, scaled_x, scaled_y)
     
     map_x = int(map_x_ref * map_width / REF_MAP_WIDTH)
     map_y = int(map_y_ref * map_height / REF_MAP_HEIGHT)
@@ -5202,7 +5348,9 @@ def center_camera_to_map_coords(bbox_center_x: float, bbox_center_y: float,
         [304, 574 - 92],    # RedSide4: (92, 304)   -> (304, 482)
     ], dtype=np.float32)
     
-    homography_matrix, _ = cv2.findHomography(VIDEO_POINTS, MAP_POINTS, cv2.RANSAC)
+    homography_matrix = _get_center_camera_homography()
+    if homography_matrix is None:
+        return None, None
     
     # Un-shift coordinates using calibration homography if available
     scaled_x = bbox_center_x * REF_VIDEO_WIDTH / frame_width
@@ -5210,18 +5358,9 @@ def center_camera_to_map_coords(bbox_center_x: float, bbox_center_y: float,
     
     H_inv = getattr(center_camera_to_map_coords, 'calibration_homography_inv', None)
     if H_inv is not None:
-        pt = np.array([[[scaled_x, scaled_y]]], dtype=np.float32)
-        unshifted = cv2.perspectiveTransform(pt, H_inv)
-        scaled_x = unshifted[0][0][0]
-        scaled_y = unshifted[0][0][1]
+        scaled_x, scaled_y = _apply_homography_to_point(H_inv, scaled_x, scaled_y)
         
-    # Apply standard perspective transform to the un-shifted base coords
-    point = np.array([[[scaled_x, scaled_y]]], dtype=np.float32)
-    transformed = cv2.perspectiveTransform(point, homography_matrix)
-    
-    # Extract and scale to actual map dimensions
-    map_x_ref = transformed[0][0][0]
-    map_y_ref = transformed[0][0][1]
+    map_x_ref, map_y_ref = _apply_homography_to_point(homography_matrix, scaled_x, scaled_y)
     
     map_x = int(map_x_ref * map_width / REF_MAP_WIDTH)
     map_y = int(map_y_ref * map_height / REF_MAP_HEIGHT)
@@ -5503,6 +5642,11 @@ def _extract_composite_calibration_frames(video_path: str, start_seconds: float 
     if video_path is None:
         return None, None, None
 
+    cache_key = (_get_video_cache_signature(video_path), round(float(start_seconds or 0), 3))
+    cached_frames = _COMPOSITE_CALIBRATION_FRAME_CACHE.get(cache_key)
+    if cached_frames:
+        return tuple(img.copy() if img is not None else None for img in cached_frames)
+
     cap = cv2.VideoCapture(video_path)
     if not cap.isOpened():
         print("[Calibration] Failed to open video for composite preview extraction")
@@ -5530,8 +5674,13 @@ def _extract_composite_calibration_frames(video_path: str, start_seconds: float 
             images[name] = None
             continue
         images[name] = Image.fromarray(cv2.cvtColor(crop, cv2.COLOR_BGR2RGB))
-
-    return images.get("center"), images.get("blue"), images.get("red")
+    result = (images.get("center"), images.get("blue"), images.get("red"))
+    _remember_small_cache(
+        _COMPOSITE_CALIBRATION_FRAME_CACHE,
+        cache_key,
+        tuple(img.copy() if img is not None else None for img in result),
+    )
+    return result
 
 
 def _get_side_box_point_labels(camera_side: str) -> list:
@@ -6554,12 +6703,12 @@ def _run_sam3_on_region(frame_bgr: np.ndarray, predictor,
     Returns:
         List of (x, y, radius) tuples in full-frame coordinates
     """
-    temp_path = tempfile.NamedTemporaryFile(suffix=".jpg", delete=False).name
-    cv2.imwrite(temp_path, frame_bgr)
+    if frame_bgr is None or frame_bgr.size == 0:
+        return []
     
     detections = []
     try:
-        predictor.set_image(temp_path)
+        predictor.set_image(frame_bgr)
         results = predictor(text=["yellow ball"])
         
         for result in results:
@@ -6573,11 +6722,6 @@ def _run_sam3_on_region(frame_bgr: np.ndarray, predictor,
                         detections.append((cx, cy, radius))
     except Exception as e:
         print(f"SAM 3 ball detection error: {e}")
-    finally:
-        try:
-            os.unlink(temp_path)
-        except OSError:
-            pass
     
     return detections
 
@@ -6630,10 +6774,133 @@ _CENTER_CAM_ROIS = [
 ]
 
 
+def _clamp_search_region(rect: tuple, frame_width: int, frame_height: int) -> tuple:
+    """Clamp a search rectangle to valid frame bounds."""
+    if not rect or frame_width <= 0 or frame_height <= 0:
+        return None
+    x1, y1, x2, y2 = rect
+    x1 = max(0, min(frame_width - 1, int(round(x1))))
+    y1 = max(0, min(frame_height - 1, int(round(y1))))
+    x2 = max(x1 + 1, min(frame_width, int(round(x2))))
+    y2 = max(y1 + 1, min(frame_height, int(round(y2))))
+    if x2 <= x1 or y2 <= y1:
+        return None
+    return (x1, y1, x2, y2)
+
+
+def _polygon_bounds(polygon: list) -> tuple:
+    """Return a bounding box for a polygon."""
+    if not polygon:
+        return None
+    xs = [float(point[0]) for point in polygon]
+    ys = [float(point[1]) for point in polygon]
+    if not xs or not ys:
+        return None
+    return min(xs), min(ys), max(xs), max(ys)
+
+
+def _merge_search_regions(regions: list, frame_width: int, frame_height: int, gap: int = 24) -> list:
+    """Merge overlapping search windows so SAM3 runs on as few regions as possible."""
+    pending = [
+        clamped
+        for clamped in (
+            _clamp_search_region(region, frame_width, frame_height)
+            for region in (regions or [])
+        )
+        if clamped is not None
+    ]
+    if not pending:
+        return []
+
+    pending.sort(key=lambda rect: (rect[0], rect[1], rect[2], rect[3]))
+    merged = []
+    for rect in pending:
+        x1, y1, x2, y2 = rect
+        merged_into_existing = False
+        for idx, existing in enumerate(merged):
+            ex1, ey1, ex2, ey2 = existing
+            overlaps = not (
+                x1 > (ex2 + gap) or
+                x2 < (ex1 - gap) or
+                y1 > (ey2 + gap) or
+                y2 < (ey1 - gap)
+            )
+            if overlaps:
+                merged[idx] = (
+                    min(ex1, x1),
+                    min(ey1, y1),
+                    max(ex2, x2),
+                    max(ey2, y2),
+                )
+                merged_into_existing = True
+                break
+        if not merged_into_existing:
+            merged.append(rect)
+
+    final_regions = []
+    for region in merged:
+        clamped = _clamp_search_region(region, frame_width, frame_height)
+        if clamped is not None:
+            final_regions.append(clamped)
+    return final_regions
+
+
+def _build_center_manual_sam3_search_regions(ball_tracker, frame_width: int, frame_height: int) -> list:
+    """Focus manual-mode SAM3 scans around active shooters and already tracked balls."""
+    if ball_tracker is None or getattr(ball_tracker, "camera_side", "") != "center":
+        return []
+
+    regions = []
+    goal_bounds = {}
+    if len(ball_tracker.goal_polygons) >= 1:
+        goal_bounds["blue"] = _polygon_bounds(ball_tracker.goal_polygons[0])
+    if len(ball_tracker.goal_polygons) >= 2:
+        goal_bounds["red"] = _polygon_bounds(ball_tracker.goal_polygons[1])
+
+    for robot_bbox in list(getattr(ball_tracker, "robot_bboxes", []) or []):
+        if len(robot_bbox) < 7:
+            continue
+        y1, x1, y2, x2, label, is_shooting, has_explicit_shooting = robot_bbox[:7]
+        if not has_explicit_shooting or not is_shooting:
+            continue
+
+        alliance = ball_tracker._infer_shot_alliance(label)
+        bbox_w = max(1.0, float(x2 - x1))
+        bbox_h = max(1.0, float(y2 - y1))
+        _, _, zone_x1, zone_y1, zone_x2, zone_y2 = ball_tracker._get_robot_launch_geometry(y1, x1, y2, x2)
+        pad_x = max(36.0, bbox_w * 0.35)
+        pad_y = max(36.0, bbox_h * 0.45)
+
+        goal_rect = goal_bounds.get(alliance)
+        if goal_rect is not None:
+            gx1, gy1, gx2, gy2 = goal_rect
+            regions.append((
+                min(zone_x1, gx1) - pad_x,
+                min(zone_y1, gy1) - pad_y,
+                max(zone_x2, gx2) + pad_x,
+                max(zone_y2, gy2) + pad_y,
+            ))
+        else:
+            regions.append((
+                zone_x1 - pad_x,
+                zone_y1 - pad_y,
+                zone_x2 + pad_x,
+                zone_y2 + pad_y,
+            ))
+
+    for pred_x, pred_y, pred_r in ball_tracker.get_predicted_positions():
+        radius = max(8.0, float(pred_r or 0.0))
+        pad = max(52.0, radius * 5.0)
+        regions.append((pred_x - pad, pred_y - pad, pred_x + pad, pred_y + pad))
+
+    return _merge_search_regions(regions, frame_width, frame_height)
+
+
 def detect_fuel_sam3(frame_bgr: np.ndarray, predictor,
                      min_radius: int = 3, max_radius: int = 30,
                      camera_side: str = "blue",
-                     exclusion_polygons: list = None) -> list:
+                     exclusion_polygons: list = None,
+                     search_regions: list = None) -> list:
     """
     Detect yellow fuel balls using SAM 3 semantic segmentation.
     
@@ -6655,16 +6922,23 @@ def detect_fuel_sam3(frame_bgr: np.ndarray, predictor,
     """
     if camera_side == "center":
         h, w = frame_bgr.shape[:2]
-        sx = w / 1918 if w > 0 else 1.0
-        sy = h / 709 if h > 0 else 1.0
+        if search_regions:
+            regions = _merge_search_regions(search_regions, w, h)
+        else:
+            sx = w / 1918 if w > 0 else 1.0
+            sy = h / 709 if h > 0 else 1.0
+            regions = [
+                (
+                    int(max(0, min(w, rx1 * sx))),
+                    int(max(0, min(h, ry1 * sy))),
+                    int(max(0, min(w, rx2 * sx))),
+                    int(max(0, min(h, ry2 * sy))),
+                )
+                for (rx1, ry1, rx2, ry2) in _CENTER_CAM_ROIS
+            ]
 
         fuel_detections = []
-        for (rx1, ry1, rx2, ry2) in _CENTER_CAM_ROIS:
-            x1 = int(max(0, min(w, rx1 * sx)))
-            y1 = int(max(0, min(h, ry1 * sy)))
-            x2 = int(max(0, min(w, rx2 * sx)))
-            y2 = int(max(0, min(h, ry2 * sy)))
-
+        for (x1, y1, x2, y2) in regions:
             if x2 > x1 and y2 > y1:
                 roi = frame_bgr[y1:y2, x1:x2]
                 roi = _apply_sam3_exclusion_polygons(
@@ -8380,7 +8654,7 @@ def build_manual_robot_bboxes_json(manual_robot_tracks: dict, target_time: float
     return json.dumps(detections), frame_tracks
 
 
-def process_single_video(video_path: str, camera_side: str = "blue", target_fps: int = 30, start_seconds: float = 0, end_seconds: float = 0, blue_robots: list = None, red_robots: list = None, enable_robot_detection: bool = True, enable_fuel_detection: bool = True, progress=gr.Progress(), camera_name: str = "Camera", enable_person_detection: bool = True, calibration_points: list = None, calibration_image_size: tuple = None, side_box_points: list = None, side_box_image_size: tuple = None, side_camera_visible_robots: dict = None, show_unlabeled_robots: bool = True, manual_robot_tracks: dict = None, highlight_ball_robot: str = "", render_output_video: bool = True, fuel_detector_mode: str = FUEL_DETECTOR_SAM3) -> tuple:
+def process_single_video(video_path: str, camera_side: str = "blue", target_fps: int = 30, start_seconds: float = 0, end_seconds: float = 0, blue_robots: list = None, red_robots: list = None, enable_robot_detection: bool = True, enable_fuel_detection: bool = True, progress=gr.Progress(), camera_name: str = "Camera", enable_person_detection: bool = True, calibration_points: list = None, calibration_image_size: tuple = None, side_box_points: list = None, side_box_image_size: tuple = None, side_camera_visible_robots: dict = None, show_unlabeled_robots: bool = True, manual_robot_tracks: dict = None, highlight_ball_robot: str = "", render_output_video: bool = True, fuel_detector_mode: str = FUEL_DETECTOR_SAM3, collect_robot_history: bool = True) -> tuple:
     """
     Process a single video, tracking objects at specified FPS.
     Uses bumper color detection for robot identification.
@@ -8480,8 +8754,13 @@ def process_single_video(video_path: str, camera_side: str = "blue", target_fps:
     ball_frame_stride = _compute_sampling_stride(original_fps, ball_fps)
     next_robot_frame = float(start_frame)
     next_ball_frame = float(start_frame)
-    score_ocr_frame_interval = max(1, round(original_fps / CENTER_SCORE_OCR_SAMPLE_FPS))
-    match_clock_ocr_frame_interval = max(1, round(original_fps / CENTER_MATCH_CLOCK_OCR_SAMPLE_FPS))
+    score_ocr_sample_fps = float(CENTER_SCORE_OCR_SAMPLE_FPS)
+    match_clock_ocr_sample_fps = float(CENTER_MATCH_CLOCK_OCR_SAMPLE_FPS)
+    if camera_side == "center" and (using_manual_robot_tracks or not render_output_video):
+        score_ocr_sample_fps = min(score_ocr_sample_fps, 3.0)
+        match_clock_ocr_sample_fps = min(match_clock_ocr_sample_fps, 1.0)
+    score_ocr_frame_interval = max(1, round(original_fps / score_ocr_sample_fps))
+    match_clock_ocr_frame_interval = max(1, round(original_fps / match_clock_ocr_sample_fps))
     # Person detection at 6fps (independent of robot FPS)
     person_frame_interval = max(1, int(original_fps / 6))
     
@@ -8605,6 +8884,7 @@ def process_single_video(video_path: str, camera_side: str = "blue", target_fps:
 
     # Store latest robot detection for use with ball frames
     current_bboxes_json = "[]"
+    manual_bbox_cache = {"frame": None, "json": "[]", "tracks": {}}
     
     # Pre-compute field pixel mask for bumper detection (center camera only)
     field_pixel_mask = None
@@ -8633,6 +8913,22 @@ def process_single_video(video_path: str, camera_side: str = "blue", target_fps:
     # Use threaded reader/writer to overlap I/O with processing
     reader = ThreadedVideoReader(cap, frame_count, reader_end_frame)
     writer = ThreadedVideoWriter(out) if render_output_video else None
+
+    def _get_manual_frame_payload(target_frame: int) -> tuple:
+        """Cache per-frame manual interpolation because robot and ball passes often align."""
+        if manual_bbox_cache["frame"] != target_frame:
+            video_time = float(target_frame) / max(1.0, original_fps)
+            bbox_json, frame_tracks = build_manual_robot_bboxes_json(
+                manual_robot_tracks,
+                video_time,
+                width,
+                height,
+                camera_side=camera_side,
+            )
+            manual_bbox_cache["frame"] = target_frame
+            manual_bbox_cache["json"] = bbox_json
+            manual_bbox_cache["tracks"] = frame_tracks
+        return manual_bbox_cache["json"], manual_bbox_cache["tracks"]
     
     while True:
         ret, frame, frame_count = reader.read()
@@ -8669,27 +8965,18 @@ def process_single_video(video_path: str, camera_side: str = "blue", target_fps:
                 robot_frame_stride,
             )
         if should_run_robot:
-            # Convert BGR (OpenCV) to RGB (PIL)
-            frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-            pil_frame = Image.fromarray(frame_rgb)
-            
             # Combine robot numbers
             robot_numbers = (blue_robots or []) + (red_robots or [])
             
             if using_manual_robot_tracks:
                 current_bumper_red_mask = None
                 current_bumper_blue_mask = None
-                video_time = frame_count / max(1.0, original_fps)
-                bounding_boxes_json, frame_tracks = build_manual_robot_bboxes_json(
-                    manual_robot_tracks,
-                    video_time,
-                    width,
-                    height,
-                    camera_side=camera_side,
-                )
+                bounding_boxes_json, frame_tracks = _get_manual_frame_payload(frame_count)
             # Bumper detection
             elif camera_side in ("blue", "red"):
                 # Side camera: LLM presence query (no bounding boxes)
+                frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                pil_frame = Image.fromarray(frame_rgb)
                 alliance_robots = blue_robots if camera_side == "blue" else red_robots
                 guided_pil_frame = annotate_side_camera_guides(
                     pil_frame,
@@ -8713,6 +9000,7 @@ def process_single_video(video_path: str, camera_side: str = "blue", target_fps:
                     field_pixel_mask=field_pixel_mask,
                     robot_exclusion_polygons=robot_exclusion_polygons
                 )
+                pil_frame = None
                 
                 # Get frame dimensions for crop clamping
                 img_height, img_width = frame.shape[:2]
@@ -8760,6 +9048,9 @@ def process_single_video(video_path: str, camera_side: str = "blue", target_fps:
                     # Collect crops for robots that need OCR
                     llm_queries = []
                     llm_indices = []
+                    if any(needs_query):
+                        frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                        pil_frame = Image.fromarray(frame_rgb)
                     for i, bbox in enumerate(raw_bboxes):
                         if needs_query[i]:
                             x1, y1, x2, y2 = bbox
@@ -8854,12 +9145,13 @@ def process_single_video(video_path: str, camera_side: str = "blue", target_fps:
             for label, track_data in frame_tracks.items():
                 cx, cy = track_data[0], track_data[1]
                 bbox_area = track_data[3] if len(track_data) >= 4 else None
-                if label not in robot_tracks:
-                    robot_tracks[label] = []
-                if bbox_area is not None:
-                    robot_tracks[label].append((cx, cy, camera_side, bbox_area))
-                else:
-                    robot_tracks[label].append((cx, cy, camera_side))
+                if collect_robot_history:
+                    if label not in robot_tracks:
+                        robot_tracks[label] = []
+                    if bbox_area is not None:
+                        robot_tracks[label].append((cx, cy, camera_side, bbox_area))
+                    else:
+                        robot_tracks[label].append((cx, cy, camera_side))
                 
                 # Update disabled tracker and ferry tracker with map coordinates
                 # Use rotated map dimensions (961x574)
@@ -8868,7 +9160,8 @@ def process_single_video(video_path: str, camera_side: str = "blue", target_fps:
                     disabled_tracker.update_position(label, map_x, map_y)
                     ferry_tracker.update_position(label, map_x, map_y)
             
-            tracks_by_frame.append(frame_tracks)
+            if collect_robot_history:
+                tracks_by_frame.append(frame_tracks)
         
         # Ball detection and output at the requested tracking FPS.
         should_run_ball, next_ball_frame = _consume_frame_schedule(
@@ -8890,14 +9183,7 @@ def process_single_video(video_path: str, camera_side: str = "blue", target_fps:
             
             render_bboxes_json = current_bboxes_json
             if using_manual_robot_tracks and enable_robot_detection:
-                video_time = frame_count / max(1.0, original_fps)
-                render_bboxes_json, _ = build_manual_robot_bboxes_json(
-                    manual_robot_tracks,
-                    video_time,
-                    width,
-                    height,
-                    camera_side=camera_side,
-                )
+                render_bboxes_json, _ = _get_manual_frame_payload(frame_count)
             
             # Update ball tracker with best available robot bboxes (interpolated on non-keyframes)
             # This ensures shot attribution uses accurate robot positions every ball frame,
@@ -8913,10 +9199,18 @@ def process_single_video(video_path: str, camera_side: str = "blue", target_fps:
 
                 if should_scan_for_balls:
                     if use_sam3_fuel_detector:
+                        sam3_search_regions = None
+                        if using_manual_robot_tracks and camera_side == "center":
+                            sam3_search_regions = _build_center_manual_sam3_search_regions(
+                                ball_tracker,
+                                width,
+                                height,
+                            )
                         fuel_detections = detect_fuel_sam3(frame, SAM3_PREDICTOR,
                                                            min_radius=3, max_radius=30,
                                                            camera_side=camera_side,
-                                                           exclusion_polygons=robot_exclusion_polygons if camera_side == "center" else None)
+                                                           exclusion_polygons=robot_exclusion_polygons if camera_side == "center" else None,
+                                                           search_regions=sam3_search_regions)
                     else:
                         fuel_detections = detect_fuel(frame, min_radius=3, max_radius=30,
                                                       tracked_positions=ball_tracker.get_predicted_positions())
@@ -9401,6 +9695,11 @@ def extract_center_video_from_composite(composite_path: str, progress=None) -> s
     if not composite_path:
         raise gr.Error("Please upload a match video.")
 
+    cache_key = _get_video_cache_signature(composite_path)
+    cached_path = _CENTER_VIDEO_EXTRACT_CACHE.get(cache_key)
+    if cached_path and os.path.exists(cached_path):
+        return cached_path
+
     output_path = tempfile.NamedTemporaryFile(suffix="_center.mp4", delete=False).name
     probe = cv2.VideoCapture(composite_path)
     if not probe.isOpened():
@@ -9436,6 +9735,7 @@ def extract_center_video_from_composite(composite_path: str, progress=None) -> s
         result = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
         if result.returncode != 0:
             raise gr.Error(f"FFmpeg center extraction failed: {result.stderr[-500:]}")
+        _remember_small_cache(_CENTER_VIDEO_EXTRACT_CACHE, cache_key, output_path)
         return output_path
 
     cap = cv2.VideoCapture(composite_path)
@@ -9462,6 +9762,7 @@ def extract_center_video_from_composite(composite_path: str, progress=None) -> s
 
     cap.release()
     out.release()
+    _remember_small_cache(_CENTER_VIDEO_EXTRACT_CACHE, cache_key, output_path)
     return output_path
 
 
@@ -10202,6 +10503,7 @@ def process_manual_center_video(center_video_path: str = None, composite_video_p
             highlight_ball_robot=highlight_ball_robot,
             render_output_video=include_visual_outputs,
             fuel_detector_mode=fuel_detector_mode,
+            collect_robot_history=include_visual_outputs,
         )
 
         all_robot_labels = blue_robots + red_robots
@@ -10401,6 +10703,7 @@ def process_ocr_center_video_table_only(center_video_path: str = None, composite
             highlight_ball_robot="",
             render_output_video=False,
             fuel_detector_mode=FUEL_DETECTOR_HSV,
+            collect_robot_history=False,
         )
 
         merged_stats = _build_stats_from_shot_events(
