@@ -10,6 +10,7 @@ import re
 import shutil
 import subprocess
 import tempfile
+import traceback
 from bisect import bisect_left, bisect_right
 from collections import Counter
 import cv2
@@ -10641,6 +10642,12 @@ def process_manual_center_video(center_video_path: str = None, composite_video_p
             gr.update(value=robot_map_paths[4], label=robot_labels[4]), robot_stats_markdowns[4],
             gr.update(value=robot_map_paths[5], label=robot_labels[5]), robot_stats_markdowns[5],
         )
+    except gr.Error:
+        raise
+    except Exception as e:
+        print("Unexpected error in manual center processing:")
+        traceback.print_exc()
+        raise gr.Error(f"Manual center processing failed: {e}")
     finally:
         _cleanup_managed_youtube_dir(managed_youtube_dir)
 
