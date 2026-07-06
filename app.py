@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """
 Gradio Web Interface for Spatial Understanding Object Tracking
-Based on Google Gemini's Spatial Understanding capabilities.
+
 """
 
 import os
